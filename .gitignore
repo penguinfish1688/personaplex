@@ -3,6 +3,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Apptainer
+*.sif
+QUICKSTART.md
+
+
 # C extensions
 *.so
 

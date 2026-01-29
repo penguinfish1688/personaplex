@@ -1,0 +1,120 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
+%files
+    # Copy the moshi directory contents to /app/moshi/
+    moshi/ /app/moshi/
+
+%post
+    # Update and install system dependencies
+    # - build-essential, pkg-config: Required for building Python packages
+    # - libopus-dev: Required for Opus audio codec (PersonaPlex requirement)
+    # - libportaudio2: Required for sounddevice Python package
+    # - openssh-client: For git SSH access
+    # - wget, ca-certificates: For downloading packages
+    # - git: For HuggingFace hub downloads
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+        libopus-dev \
+        libportaudio2 \
+        portaudio19-dev \
+        openssh-client \
+        wget \
+        curl \
+        ca-certificates \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+    # Install uv package manager for faster Python package installation
+    wget -qO- https://astral.sh/uv/install.sh | sh
+    export PATH="/root/.local/bin:$PATH"
+
+    # Debug: Check what was copied
+    ls -la /app/
+    ls -la /app/moshi/ || echo "moshi directory not found"
+    
+    # The moshi/ copy creates /app/moshi/moshi/, so we need to work there
+    cd /app/moshi/moshi/
+
+    # Create virtual environment with Python 3.12 and install dependencies
+    /root/.local/bin/uv venv /app/moshi/.venv --python 3.12
+    
+    # Install the moshi package with all dependencies
+    /root/.local/bin/uv pip install --python /app/moshi/.venv/bin/python -e /app/moshi/moshi/
+    
+    # Install optional but recommended packages
+    # - accelerate: For CPU offload support on GPUs with limited memory
+    /root/.local/bin/uv pip install --python /app/moshi/.venv/bin/python accelerate
+
+    # Verify critical dependencies are installed
+    /app/moshi/.venv/bin/python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
+    /app/moshi/.venv/bin/python -c "import sounddevice; print('sounddevice OK')"
+    /app/moshi/.venv/bin/python -c "import huggingface_hub; print('huggingface_hub OK')"
+
+    # Create necessary directories
+    mkdir -p /app/ssl
+    mkdir -p /root/.cache
+
+    # Clean up to reduce image size
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+
+%environment
+    export PATH="/app/moshi/.venv/bin:$PATH"
+    export PYTHONPATH="/app/moshi/moshi:$PYTHONPATH"
+    export NO_TORCH_COMPILE=1
+
+%runscript
+    # Default: run the moshi server
+    exec /app/moshi/.venv/bin/python -m moshi.server --ssl /app/ssl "$@"
+
+%labels
+    Author PersonaPlex Team / Adapted for Apptainer
+    Version 1.0
+    Description PersonaPlex: Voice and Role Control for Full Duplex Conversational Speech Models
+
+%help
+    This is an Apptainer container for PersonaPlex - Voice and Role Control 
+    for Full Duplex Conversational Speech Models.
+    
+    PREREQUISITES:
+    1. Accept model license: https://huggingface.co/nvidia/personaplex-7b-v1
+    2. Get HF token: https://huggingface.co/settings/tokens
+    3. Set token: export APPTAINERENV_HF_TOKEN=your_huggingface_token
+    
+    BASIC USAGE:
+        # Run server (default port 8998)
+        apptainer run --nv personaplex.sif
+        
+        # Access Web UI at https://localhost:8998
+    
+    ADVANCED OPTIONS:
+        # CPU offload for GPUs with limited memory
+        apptainer run --nv personaplex.sif --cpu-offload
+        
+        # Custom port
+        apptainer run --nv personaplex.sif --port 9000
+        
+        # Get shell inside container
+        apptainer shell --nv personaplex.sif
+    
+    OFFLINE EVALUATION:
+        apptainer exec --nv personaplex.sif \
+            python -m moshi.offline \
+            --voice-prompt "NATF2.pt" \
+            --input-wav "input.wav" \
+            --output-wav "output.wav"
+    
+    VOICE OPTIONS:
+        Natural Female: NATF0, NATF1, NATF2, NATF3
+        Natural Male:   NATM0, NATM1, NATM2, NATM3
+        Variety Female: VARF0-VARF4
+        Variety Male:   VARM0-VARM4
+    
+    INSTALLED PACKAGES:
+        - PyTorch (CUDA enabled)
+        - HuggingFace Hub
+        - sounddevice
+        - accelerate (for CPU offload)
+        - All moshi-personaplex dependencies
