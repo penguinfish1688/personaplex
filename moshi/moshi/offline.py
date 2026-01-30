@@ -279,13 +279,22 @@ def run_inference(
             # Feed user-side input channels; text + agent audio are sampled
             # Also return all the hidden layers' values for persona vector analysis
             if return_hidden_layers:
+                # Debug: Check dep_q value
+                log("info", f"DEBUG: lm_gen.lm_model.dep_q = {lm_gen.lm_model.dep_q}")
                 result = lm_gen.step(step_in, return_hidden_layers=True)
                 tokens, hidden_layers = result  # type: ignore
                 assert isinstance(hidden_layers, HiddenLayerOutputs)
-                log("info", f"Retrieved {len(hidden_layers.text_transformer)} text transformer hidden layers and {len(hidden_layers.depth_transformer)} codebooks with {len(hidden_layers.depth_transformer[0])} layers at this step.")
-                log("info", f"{hidden_layers.text_transformer}")
-                for i, depth_layers in enumerate(hidden_layers.depth_transformer):
-                    log("info", f"Acoustic token {i}\n{depth_layers}")
+                log("info", f"DEBUG: len(hidden_layers.depth_transformer) = {len(hidden_layers.depth_transformer)}")
+                log("info", f"DEBUG: type of depth_transformer[0] = {type(hidden_layers.depth_transformer[0])}")
+                if hasattr(hidden_layers.depth_transformer[0], '__len__'):
+                    log("info", f"DEBUG: len(depth_transformer[0]) = {len(hidden_layers.depth_transformer[0])}")
+                log("info", f"Retrieved {len(hidden_layers.text_transformer)} text transformer hidden layers and {len(hidden_layers.depth_transformer)} codebooks, each with {len(hidden_layers.depth_transformer[0])} layers at this step.")
+                log("info", f"Text transformer hidden layers shapes: {[h.shape for h in hidden_layers.text_transformer[:3]]}...")  # Show first 3
+                for i, codebook_layers in enumerate(hidden_layers.depth_transformer):
+                    log("info", f"Codebook {i} hidden layers ({len(codebook_layers)} layers): {[h.shape for h in codebook_layers]}")
+                    if i >= 2:  # Limit output to first few codebooks
+                        log("info", f"... (showing first 3 codebooks only, total: {len(hidden_layers.depth_transformer)})")
+                        break
         
             else:
                 tokens = lm_gen.step(step_in)
