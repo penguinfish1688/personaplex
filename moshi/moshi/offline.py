@@ -282,7 +282,7 @@ def run_inference(
                 result = lm_gen.step(step_in, return_hidden_layers=True)
                 tokens, hidden_layers = result  # type: ignore
                 assert isinstance(hidden_layers, HiddenLayerOutputs)
-                log("info", f"Retrieved {len(hidden_layers.text_transformer)} text transformer hidden layers and {len(hidden_layers.depth_transformer)} depth transformer hidden layers at this step.")
+                log("info", f"Retrieved {len(hidden_layers.text_transformer)} text transformer hidden layers and {len(hidden_layers.depth_transformer)} codebooks with {len(hidden_layers.depth_transformer[0])} layers at this step.")
                 log("info", f"{hidden_layers.text_transformer}")
                 for i, depth_layers in enumerate(hidden_layers.depth_transformer):
                     log("info", f"Acoustic token {i}\n{depth_layers}")
