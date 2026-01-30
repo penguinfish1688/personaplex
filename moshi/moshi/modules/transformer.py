@@ -695,7 +695,7 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
         device = next(self.parameters()).device
         return _TransformerState(offset=torch.zeros(1, device=device, dtype=torch.long))
 
-    def forward(self, x: torch.Tensor, *args, **kwargs):
+    def forward(self, x: torch.Tensor, return_hidden_layers: bool = False, *args, **kwargs):
         B, T, C = x.shape
 
         state = self._streaming_state
@@ -712,11 +712,18 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
             )
             x = x + self.positional_scale * pos_emb
 
+        hidden_layers = [] if return_hidden_layers else None
+        
         for layer in self.layers:
             x = layer(x, *args, **kwargs)
+            if return_hidden_layers:
+                hidden_layers.append(x.clone())
 
         if state is not None:
             state.offset.add_(T)
+        
+        if return_hidden_layers:
+            return x, hidden_layers
         return x
 
 

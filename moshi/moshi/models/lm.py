@@ -441,17 +441,24 @@ class LMModel(StreamingContainer):
     def forward_codes(
         self,
         sequence: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.forward_embeddings(self.embed_codes(sequence))
+        return_hidden_layers: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+        return self.forward_embeddings(self.embed_codes(sequence), return_hidden_layers=return_hidden_layers)
     
-    def forward_embeddings(self, input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward_embeddings(self, input: torch.Tensor, return_hidden_layers: bool = False) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
         # print("EMBED:", input[0, 0, :10].float().cpu().tolist()) # DEBUG
-        transformer_out = self.transformer(input)
+        if return_hidden_layers:
+            transformer_out, hidden_layers = self.transformer(input, return_hidden_layers=True)
+        else:
+            transformer_out = self.transformer(input)
+            hidden_layers = None
         if self.out_norm:
             transformer_out = self.out_norm(transformer_out)
         assert isinstance(transformer_out, torch.Tensor)
         text_logits = self.text_linear(transformer_out)
         text_logits = text_logits[:, None]
+        if return_hidden_layers:
+            return transformer_out, text_logits, hidden_layers
         return transformer_out, text_logits
 
     def forward_depformer(
@@ -813,8 +820,8 @@ class LMGen(StreamingModule[_LMGenState]):
 
     @torch.no_grad()
     def step(self, input_tokens: torch.Tensor=None, moshi_tokens:torch.Tensor=None, text_token:torch.Tensor=None,
-             return_embeddings: bool=False) \
-        -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+             return_embeddings: bool=False, return_hidden_layers: bool=False) \
+        -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]] | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
         state = self._streaming_state
         lm_model = self.lm_model
         prepared_inputs = self.prepare_step_input(
@@ -823,7 +830,13 @@ class LMGen(StreamingModule[_LMGenState]):
         # print("INPUT:", None if input_tokens is None else input_tokens.squeeze().cpu().tolist()) # DEBUG
         # print("MOSHI:", None if moshi_tokens is None else moshi_tokens.squeeze().cpu().tolist()) # DEBUG
         if prepared_inputs is None:
-            return (None, None) if self.report_loss or self.return_logits else None
+            return_tuple_size = sum([self.report_loss or self.return_logits, return_embeddings, return_hidden_layers])
+            if return_tuple_size == 0:
+                return None
+            elif return_tuple_size == 1:
+                return (None,)
+            else:
+                return tuple([None] * (return_tuple_size + 1))
         input_, provided_, target_, model_input_position, target_position = prepared_inputs
         if self.check:
             # Check that we are not feeding in any value that is not generated yet.
@@ -833,10 +846,19 @@ class LMGen(StreamingModule[_LMGenState]):
             )
             assert (input_[:, lm_model.audio_offset :] <= lm_model.card).all(), input_
             assert (input_[:, :1] <= lm_model.text_card).all()
+        
         embeddings = None
         if return_embeddings:
             embeddings = self.lm_model.embed_codes(input_)
-        transformer_out, text_logits = state.graphed_main(input_)
+        
+        # For hidden layers, we need to bypass the graphed version
+        if return_hidden_layers:
+            result = lm_model.forward_codes(input_, return_hidden_layers=True)
+            transformer_out, text_logits, hidden_layers = result
+        else:
+            transformer_out, text_logits = state.graphed_main(input_)
+            hidden_layers = None
+            
         output = self.process_transformer_output(
             transformer_out,
             text_logits,
@@ -845,9 +867,18 @@ class LMGen(StreamingModule[_LMGenState]):
             model_input_position,
             target_position,
         )
+        
+        # Build return value based on what was requested
+        returns = [output]
         if return_embeddings:
-            return output, embeddings
-        return output
+            returns.append(embeddings)
+        if return_hidden_layers:
+            returns.append(hidden_layers)
+            
+        if len(returns) == 1:
+            return returns[0]
+        else:
+            return tuple(returns)
     
     @torch.no_grad()
     def step_embeddings(self, embeddings: torch.Tensor):

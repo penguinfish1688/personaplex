@@ -169,6 +169,7 @@ def run_inference(
     greedy: bool,
     save_voice_prompt_embeddings: bool,
     cpu_offload: bool = False,
+    return_hidden_layers: bool = False,
 ):
     """Run offline inference using an input WAV as the user-side stream.
 
@@ -276,7 +277,13 @@ def run_inference(
         for c in range(steps):
             step_in = user_encoded[:, :, c : c + 1]
             # Feed user-side input channels; text + agent audio are sampled
-            tokens = lm_gen.step(step_in)
+            # Also return all the hidden layers' values for persona vector analysis
+            if return_hidden_layers:
+                tokens, hidden_layers = lm_gen.step(step_in, return_hidden_layers=True) # type: ignore
+                log("info", f"Retrieved {len(hidden_layers)} hidden layers at this step.")
+                log("info", f"{hidden_layers}")
+            else:
+                tokens = lm_gen.step(step_in)
             if tokens is None:
                 continue
             # Decode current sampled agent frame to PCM
