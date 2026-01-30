@@ -279,7 +279,9 @@ def run_inference(
             # Feed user-side input channels; text + agent audio are sampled
             # Also return all the hidden layers' values for persona vector analysis
             if return_hidden_layers:
-                tokens, hidden_layers: HiddenLayerOutputs = lm_gen.step(step_in, return_hidden_layers=True) # type: ignore
+                result = lm_gen.step(step_in, return_hidden_layers=True)
+                tokens, hidden_layers = result  # type: ignore
+                assert isinstance(hidden_layers, HiddenLayerOutputs)
                 log("info", f"Retrieved {len(hidden_layers.text_transformer)} text transformer hidden layers and {len(hidden_layers.depth_transformer)} depth transformer hidden layers at this step.")
                 log("info", f"{hidden_layers.text_transformer}")
                 for i, depth_layers in enumerate(hidden_layers.depth_transformer):
