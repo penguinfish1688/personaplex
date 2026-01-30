@@ -170,7 +170,7 @@ def run_inference(
     save_voice_prompt_embeddings: bool,
     cpu_offload: bool = False,
     return_hidden_layers: bool = False,
-):
+) -> Optional[HiddenLayerOutputs]:
     """Run offline inference using an input WAV as the user-side stream.
 
     - Loads/initializes models and tokenizer
@@ -279,15 +279,9 @@ def run_inference(
             # Feed user-side input channels; text + agent audio are sampled
             # Also return all the hidden layers' values for persona vector analysis
             if return_hidden_layers:
-                # Debug: Check dep_q value
-                log("info", f"DEBUG: lm_gen.lm_model.dep_q = {lm_gen.lm_model.dep_q}")
                 result = lm_gen.step(step_in, return_hidden_layers=True)
                 tokens, hidden_layers = result  # type: ignore
                 assert isinstance(hidden_layers, HiddenLayerOutputs)
-                log("info", f"DEBUG: len(hidden_layers.depth_transformer) = {len(hidden_layers.depth_transformer)}")
-                log("info", f"DEBUG: type of depth_transformer[0] = {type(hidden_layers.depth_transformer[0])}")
-                if hasattr(hidden_layers.depth_transformer[0], '__len__'):
-                    log("info", f"DEBUG: len(depth_transformer[0]) = {len(hidden_layers.depth_transformer[0])}")
                 log("info", f"Retrieved {len(hidden_layers.text_transformer)} text transformer hidden layers and {len(hidden_layers.depth_transformer)} codebooks, each with {len(hidden_layers.depth_transformer[0])} layers at this step.")
                 log("info", f"Text transformer hidden layers shapes: {[h.shape for h in hidden_layers.text_transformer[:3]]}...")  # Show first 3
                 for i, codebook_layers in enumerate(hidden_layers.depth_transformer):
@@ -336,7 +330,221 @@ def run_inference(
     # 12) Write text tokens
     with open(output_text, "w") as file:
         json.dump(generated_text_tokens, file, ensure_ascii=False)
-    log("info", f"Wrote output text to {output_text}")    
+    log("info", f"Wrote output text to {output_text}")
+
+    if return_hidden_layers:
+        log("info", "Hidden layers were returned during inference.")
+        return hidden_layers
+
+
+def run_batch_inference(
+    input_wavs: List[str],
+    output_wavs: List[str],
+    output_texts: List[str],
+    text_prompts: List[str],
+    voice_prompt_path: str,
+    tokenizer_path: Optional[str],
+    moshi_weight: Optional[str],
+    mimi_weight: Optional[str],
+    hf_repo: str,
+    device: str,
+    seed: Optional[int],
+    temp_audio: float,
+    temp_text: float,
+    topk_audio: int,
+    topk_text: int,
+    greedy: bool,
+    save_voice_prompt_embeddings: bool,
+    cpu_offload: bool = False,
+    return_hidden_layers: bool = False,
+) -> Optional[List[HiddenLayerOutputs]]:
+    """Run batch offline inference using multiple input WAVs and text prompts.
+    
+    Args:
+        input_wavs: List of paths to input WAV files (user audio)
+        output_wavs: List of paths to output WAV files to write (agent audio)
+        output_texts: List of paths to output JSON files to write (agent text)
+        text_prompts: List of text prompts corresponding to each input
+        voice_prompt_path: Path to voice prompt file (shared across all instances)
+        Other parameters: Same as run_inference
+        
+    Returns:
+        If return_hidden_layers=True, returns list of HiddenLayerOutputs for each input
+        Otherwise returns None
+    """
+    # Validate input lengths
+    assert len(input_wavs) == len(text_prompts), f"input_wavs ({len(input_wavs)}) and text_prompts ({len(text_prompts)}) must have same length"
+    assert len(input_wavs) == len(output_wavs), f"input_wavs ({len(input_wavs)}) and output_wavs ({len(output_wavs)}) must have same length"
+    assert len(input_wavs) == len(output_texts), f"input_wavs ({len(input_wavs)}) and output_texts ({len(output_texts)}) must have same length"
+    
+    if len(input_wavs) == 0:
+        log("warning", "Empty input lists provided")
+        return [] if return_hidden_layers else None
+    
+    log("info", f"Starting batch inference with {len(input_wavs)} instances")
+    
+    if seed is not None and seed != -1:
+        seed_all(seed)
+
+    # Download config.json to increment download counter
+    hf_hub_download(hf_repo, "config.json")
+
+    # 1) Load Mimi encoders/decoders (shared across all instances)
+    log("info", "loading mimi")
+    if mimi_weight is None:
+        mimi_weight = hf_hub_download(hf_repo, loaders.MIMI_NAME)  # type: ignore
+    mimi = loaders.get_mimi(mimi_weight, device)
+    other_mimi = loaders.get_mimi(mimi_weight, device)
+    log("info", "mimi loaded")
+
+    # 2) Load tokenizer (shared across all instances)
+    if tokenizer_path is None:
+        tokenizer_path = hf_hub_download(hf_repo, loaders.TEXT_TOKENIZER_NAME)  # type: ignore
+    text_tokenizer = sentencepiece.SentencePieceProcessor(tokenizer_path)  # type: ignore
+
+    # 3) Load Moshi LM and eval mode (shared across all instances)
+    log("info", "loading moshi")
+    if moshi_weight is None:
+        moshi_weight = hf_hub_download(hf_repo, loaders.MOSHI_NAME)  # type: ignore
+    lm = loaders.get_moshi_lm(moshi_weight, device=device, cpu_offload=cpu_offload)
+    lm.eval()
+    log("info", "moshi loaded")
+
+    # 4) Construct LMGen (shared across all instances)
+    frame_size = int(mimi.sample_rate / mimi.frame_rate)
+    lm_gen = LMGen(
+        lm,
+        audio_silence_frame_cnt=int(0.5 * mimi.frame_rate),
+        sample_rate=mimi.sample_rate,
+        device=device,
+        frame_rate=mimi.frame_rate,
+        save_voice_prompt_embeddings=save_voice_prompt_embeddings,
+        use_sampling=not greedy,
+        temp=temp_audio,
+        temp_text=temp_text,
+        top_k=topk_audio,
+        top_k_text=topk_text,
+    )
+    
+    # Keep models in streaming mode
+    mimi.streaming_forever(1)
+    other_mimi.streaming_forever(1)
+    lm_gen.streaming_forever(1)
+
+    # 5) Warmup (once for all instances)
+    log("info", "warming up the model")
+    warmup(mimi, other_mimi, lm_gen, device, frame_size)
+
+    # 6) Load voice prompt (shared across all instances)
+    if voice_prompt_path.endswith('.pt'):
+        lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
+    else:
+        lm_gen.load_voice_prompt(voice_prompt_path)
+
+    batch_hidden_layers: List[HiddenLayerOutputs] = []
+    
+    # 7) Process each instance
+    for i, (input_wav, output_wav, output_text, text_prompt) in enumerate(zip(input_wavs, output_wavs, output_texts, text_prompts)):
+        log("info", f"Processing instance {i+1}/{len(input_wavs)}: {input_wav}")
+        
+        # Set text prompt for this instance
+        lm_gen.text_prompt_tokens = (
+            text_tokenizer.encode(wrap_with_system_tags(text_prompt)) if len(text_prompt) > 0 else None
+        )
+
+        # Reset streaming state for this instance
+        mimi.reset_streaming()
+        other_mimi.reset_streaming()
+        lm_gen.reset_streaming()
+        lm_gen.step_system_prompts(mimi)
+        mimi.reset_streaming()
+
+        # Load and process user audio for this instance
+        sample_rate = mimi.sample_rate
+        user_audio = lm_load_audio(input_wav, sample_rate)
+
+        # Process audio frames and collect outputs
+        generated_frames: List[np.ndarray] = []
+        generated_text_tokens: List[str] = []
+        instance_hidden_layers = None
+        total_target_samples = user_audio.shape[-1]
+
+        for user_encoded in lm_encode_from_sphn(
+            mimi,
+            lm_iterate_audio(
+                user_audio, sample_interval_size=lm_gen._frame_size, pad=True
+            ),
+            max_batch=1,
+        ):
+            steps = user_encoded.shape[-1]
+            for c in range(steps):
+                step_in = user_encoded[:, :, c : c + 1]
+                
+                if return_hidden_layers:
+                    # Debug: Check dep_q value (only for first instance)
+                    if i == 0 and c == 0:
+                        log("info", f"DEBUG: lm_gen.lm_model.dep_q = {lm_gen.lm_model.dep_q}")
+                    
+                    result = lm_gen.step(step_in, return_hidden_layers=True)
+                    tokens, hidden_layers = result  # type: ignore
+                    assert isinstance(hidden_layers, HiddenLayerOutputs)
+                    
+                    # Store hidden layers from the first step for this instance
+                    if instance_hidden_layers is None:
+                        instance_hidden_layers = hidden_layers
+                        if i == 0:  # Only log details for first instance
+                            log("info", f"DEBUG: len(hidden_layers.depth_transformer) = {len(hidden_layers.depth_transformer)}")
+                            log("info", f"Retrieved {len(hidden_layers.text_transformer)} text transformer hidden layers and {len(hidden_layers.depth_transformer)} codebooks, each with {len(hidden_layers.depth_transformer[0])} layers")
+                else:
+                    tokens = lm_gen.step(step_in)
+                
+                if tokens is None:
+                    continue
+                    
+                # Decode current sampled agent frame to PCM
+                pcm = decode_tokens_to_pcm(mimi, other_mimi, lm_gen, tokens)
+                generated_frames.append(pcm)
+                
+                # Decode text token
+                text_token = tokens[0, 0, 0].item()
+                if text_token not in (0, 3):
+                    _text = text_tokenizer.id_to_piece(text_token)  # type: ignore
+                    _text = _text.replace("▁", " ")
+                    generated_text_tokens.append(_text)
+                else:
+                    text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
+                    generated_text_tokens.append(text_token_map[text_token])
+
+        if len(generated_frames) == 0:
+            log("error", f"No audio frames were generated for instance {i+1}. Check input file: {input_wav}")
+            continue
+
+        # Concatenate frames and trim/pad to match input duration
+        output_pcm = np.concatenate(generated_frames, axis=-1)
+        if output_pcm.shape[-1] > total_target_samples:
+            output_pcm = output_pcm[:total_target_samples]
+        elif output_pcm.shape[-1] < total_target_samples:
+            pad_len = total_target_samples - output_pcm.shape[-1]
+            output_pcm = np.concatenate(
+                [output_pcm, np.zeros(pad_len, dtype=output_pcm.dtype)], axis=-1
+            )
+
+        # Write outputs for this instance
+        sphn.write_wav(output_wav, output_pcm, sample_rate)
+        log("info", f"Wrote output audio to {output_wav}")
+
+        with open(output_text, "w") as file:
+            json.dump(generated_text_tokens, file, ensure_ascii=False)
+        log("info", f"Wrote output text to {output_text}")
+        
+        # Store hidden layers for this instance
+        if return_hidden_layers:
+            assert instance_hidden_layers is not None, "Hidden layers were requested but not captured."
+            batch_hidden_layers.append(instance_hidden_layers)
+
+    log("info", f"Batch inference completed for {len(input_wavs)} instances")
+    if return_hidden_layers:
+        return batch_hidden_layers
 
 
 def main():
@@ -429,11 +637,11 @@ def main():
     greedy = bool(args.greedy)
 
     with torch.no_grad():
-        run_inference(
-            input_wav=args.input_wav,
-            output_wav=args.output_wav,
-            output_text=args.output_text,
-            text_prompt=args.text_prompt,
+        run_batch_inference(
+            input_wavs=[args.input_wav],
+            output_wavs=[args.output_wav],
+            output_texts=[args.output_text],
+            text_prompts=[args.text_prompt],
             voice_prompt_path=voice_prompt_path,
             tokenizer_path=args.tokenizer,
             moshi_weight=args.moshi_weight,
