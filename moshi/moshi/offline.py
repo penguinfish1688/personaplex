@@ -469,7 +469,9 @@ def run_batch_inference(
         generated_frames: List[np.ndarray] = []
         generated_text_tokens: List[str] = []
         total_target_samples = user_audio.shape[-1]
-
+        
+        total_steps = 0
+        hidden_layers_list: List[HiddenLayerOutputs] = []
         for user_encoded in lm_encode_from_sphn(
             mimi,
             lm_iterate_audio(
@@ -479,8 +481,8 @@ def run_batch_inference(
         ):
             steps = user_encoded.shape[-1]
             # Store hidden layers for each step
-            hidden_layers_list: List[HiddenLayerOutputs] = []
             for c in range(steps):
+                total_steps += 1
                 step_in = user_encoded[:, :, c : c + 1]
                 
                 if return_hidden_layers:
@@ -538,12 +540,12 @@ def run_batch_inference(
         
         # Store hidden layers for this instance
         if return_hidden_layers:
-            assert len(hidden_layers_list) == steps, "Mismatch in hidden layers collected and steps taken"
+            assert len(hidden_layers_list) == total_steps, "Mismatch in hidden layers collected and steps taken"
             batch_hidden_layers.append(hidden_layers_list)
 
     log("info", f"Batch inference completed for {len(input_wavs)} instances")
     if return_hidden_layers:
-        log("info", f"Hidden layers for {len(batch_hidden_layers)} instances with {len(batch_hidden_layers[0])} steps were returned during batch inference. {steps}")
+        log("info", f"Hidden layers for {len(batch_hidden_layers)} instances with {len(batch_hidden_layers[0])} steps were returned during batch inference.")
         return batch_hidden_layers
 
 
