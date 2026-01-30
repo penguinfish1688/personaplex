@@ -71,17 +71,36 @@ def test_hidden_layers_source_code():
         print("❌ step method doesn't handle hidden layers properly")
         return False
     
+    # Test 4: Check HiddenLayerOutputs dataclass
+    hidden_layer_dataclass_pattern = r'@dataclass\s+class HiddenLayerOutputs'
+    if re.search(hidden_layer_dataclass_pattern, lm_content):
+        print("✓ HiddenLayerOutputs dataclass is defined")
+    else:
+        print("❌ HiddenLayerOutputs dataclass missing")
+        return False
+    
+    # Test 5: Check depth transformer hidden layer extraction
+    depformer_hidden_pattern = r'return_hidden_layers.*?depformer_step.*?return_hidden_layers=True'
+    if re.search(depformer_hidden_pattern, lm_content, re.DOTALL):
+        print("✓ Depth transformer hidden layers are extracted")
+    else:
+        print("❌ Depth transformer hidden layer extraction missing")
+        return False
+    
     print("\n✅ All hidden layer extraction features are properly implemented!")
     print("\nImplementation Summary:")
     print("- LMGen.step() accepts return_hidden_layers parameter")
     print("- When return_hidden_layers=True, bypasses CUDA graph and calls forward_codes directly")
     print("- forward_codes and forward_embeddings pass through the parameter")
     print("- StreamingTransformer.forward collects hidden states after each layer")
-    print("- Returns tuple with output and list of hidden layer tensors")
+    print("- HiddenLayerOutputs dataclass separates text and depth transformer hidden layers")
+    print("- Depth transformer hidden layers are extracted from depformer_step")
+    print("- Returns tuple with output and HiddenLayerOutputs containing both sets of hidden layers")
     
     print("\nUsage:")
     print("  output, hidden_layers = lm_gen.step(input_tokens, return_hidden_layers=True)")
-    print("  # hidden_layers[i] contains the output of transformer layer i")
+    print("  # hidden_layers.text_transformer[i] contains output of text transformer layer i")
+    print("  # hidden_layers.depth_transformer[j] contains output of depth transformer layer j")
     
     return True
 

@@ -67,6 +67,13 @@ class LMOutput:
     text_mask: torch.Tensor  # [B, 1, T]
 
 
+@dataclass  
+class HiddenLayerOutputs:
+    """Container for hidden layer outputs from both text and depth transformers."""
+    text_transformer: Optional[List[torch.Tensor]] = None  # List of hidden states from text transformer layers
+    depth_transformer: Optional[List[List[torch.Tensor]]] = None  # List of hidden states from depth transformer layers
+
+
 def _delay_sequence(delays: List[int], tensor: torch.Tensor, padding: torch.Tensor) -> torch.Tensor:
     B, K, T = tensor.shape
     assert len(delays) == K, (len(delays), K)
@@ -466,7 +473,8 @@ class LMModel(StreamingContainer):
         depformer_cb_index: int,
         sequence: torch.Tensor,
         transformer_out: torch.Tensor,
-    ) -> torch.Tensor:
+        return_hidden_layers: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, List[torch.Tensor]]:
         B, K, S = sequence.shape
         assert (
             K == 1
@@ -493,10 +501,16 @@ class LMModel(StreamingContainer):
         assert depformer_input.shape[1] == 1
         # depformer_input is [B, 1, depformer_dim].
         # The streaming state of the depformer ensures that the proper layer is run.
-        dep_output = self.depformer(depformer_input)
+        if return_hidden_layers:
+            dep_output, hidden_layers = self.depformer(depformer_input, return_hidden_layers=True)
+        else:
+            dep_output = self.depformer(depformer_input)
+            hidden_layers = None
         logits = self.linears[depformer_cb_index](dep_output)
         logits = logits[:, None]
         assert logits.dim() == 4, logits.shape  # [B, Ka, S, card]
+        if return_hidden_layers:
+            return logits, hidden_layers
         return logits
 
     def forward_depformer_training(
@@ -854,26 +868,52 @@ class LMGen(StreamingModule[_LMGenState]):
         # For hidden layers, we need to bypass the graphed version
         if return_hidden_layers:
             result = lm_model.forward_codes(input_, return_hidden_layers=True)
-            transformer_out, text_logits, hidden_layers = result
+            transformer_out, text_logits, text_hidden_layers = result
         else:
             transformer_out, text_logits = state.graphed_main(input_)
-            hidden_layers = None
+            text_hidden_layers = None
+
+        # Process transformer output and get depth hidden layers if requested
+        if return_hidden_layers:
+            output_result = self.process_transformer_output(
+                transformer_out,
+                text_logits,
+                provided_,
+                target_,
+                model_input_position,
+                target_position,
+                return_hidden_layers=True,
+            )
+            # Handle variable return structure from process_transformer_output
+            if self.report_loss:
+                output, report, depth_hidden_layers = output_result
+            elif self.return_logits and not self.report_loss:
+                output, logits_tuple, depth_hidden_layers = output_result
+            else:
+                output, depth_hidden_layers = output_result
             
-        output = self.process_transformer_output(
-            transformer_out,
-            text_logits,
-            provided_,
-            target_,
-            model_input_position,
-            target_position,
-        )
+            # Create combined hidden layer outputs
+            combined_hidden_layers = HiddenLayerOutputs(
+                text_transformer=text_hidden_layers,  # The text transformer hidden layers for this step
+                depth_transformer=depth_hidden_layers # The depth_hidden_layers is a list of hidden transformer layers for each acoustic token in this step
+            )
+        else:
+            output = self.process_transformer_output(
+                transformer_out,
+                text_logits,
+                provided_,
+                target_,
+                model_input_position,
+                target_position,
+            )
+            combined_hidden_layers = None
         
         # Build return value based on what was requested
         returns = [output]
         if return_embeddings:
             returns.append(embeddings)
         if return_hidden_layers:
-            returns.append(hidden_layers)
+            returns.append(combined_hidden_layers)
             
         if len(returns) == 1:
             return returns[0]
@@ -904,7 +944,7 @@ class LMGen(StreamingModule[_LMGenState]):
         )
 
     @torch.no_grad()
-    def process_transformer_output(self, transformer_out, text_logits, provided_, target_, model_input_position, target_position):
+    def process_transformer_output(self, transformer_out, text_logits, provided_, target_, model_input_position, target_position, return_hidden_layers=False):
         state = self._streaming_state
         lm_model = self.lm_model
 
@@ -922,10 +962,31 @@ class LMGen(StreamingModule[_LMGenState]):
 
         next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
 
-        if self.return_logits:
-            sampled_audio_tokens, audio_logits = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0]) # [B, K_audio, Card_audio]
+        depth_hidden_layers = None
+        if return_hidden_layers:
+            # Bypass graphed version to extract hidden layers
+            if self.return_logits:
+                sampled_audio_tokens, audio_logits, depth_hidden_layers = self.depformer_step(
+                    next_text_token, transformer_out, 
+                    target_[:,lm_model.audio_offset:,0], 
+                    provided_[:,lm_model.audio_offset:,0], 
+                    return_hidden_layers=True
+                ) 
+            else:
+                sampled_audio_tokens, depth_hidden_layers = self.depformer_step(
+                    next_text_token, transformer_out, 
+                    target_[:,lm_model.audio_offset:,0], 
+                    provided_[:,lm_model.audio_offset:,0], 
+                    return_hidden_layers=True
+                )
+                audio_logits = None
         else:
-            sampled_audio_tokens = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0])
+            # Use graphed version for performance
+            if self.return_logits:
+                sampled_audio_tokens, audio_logits = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0]) # [B, K_audio, Card_audio]
+            else:
+                sampled_audio_tokens = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0])
+                audio_logits = None
 
         state.provided[:, :, model_input_position] = False
         ####
@@ -964,11 +1025,11 @@ class LMGen(StreamingModule[_LMGenState]):
         if state.offset <= self.max_delay:
             state.offset += 1
             if self.report_loss:
-                return None, report
+                return (None, report, depth_hidden_layers) if return_hidden_layers else (None, report)
             if self.return_logits:
-                return None, None
+                return (None, None, depth_hidden_layers) if return_hidden_layers else (None, None)
             else:
-                return None
+                return (None, depth_hidden_layers) if return_hidden_layers else None
         
         B = state.cache.shape[0]
         CT = state.cache.shape[2]
@@ -982,11 +1043,11 @@ class LMGen(StreamingModule[_LMGenState]):
 
         state.offset += 1
         if self.report_loss:
-            return out, report
+            return (out, report, depth_hidden_layers) if return_hidden_layers else (out, report)
         elif self.return_logits and not self.report_loss:
-            return out, (text_logits.clone(), audio_logits.clone())
+            return (out, (text_logits.clone(), audio_logits.clone() if audio_logits is not None else None), depth_hidden_layers) if return_hidden_layers else (out, (text_logits.clone(), audio_logits.clone() if audio_logits is not None else None))
         else:
-            return out
+            return (out, depth_hidden_layers) if return_hidden_layers else out
 
     def load_voice_prompt(self, voice_prompt: str):
         self.voice_prompt = voice_prompt
@@ -1162,18 +1223,25 @@ class LMGen(StreamingModule[_LMGenState]):
         text_token: torch.Tensor,
         transformer_out: torch.Tensor,
         audio_tokens: torch.Tensor,
-        audio_provided: torch.Tensor
-    ) -> torch.Tensor:
+        audio_provided: torch.Tensor,
+        return_hidden_layers: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, List[torch.Tensor]]:
         (B,) = text_token.shape
         prev_token = text_token
         lm_model = self.lm_model
         depformer_tokens: list[torch.Tensor] = []
         depformer_logits: list[torch.Tensor] = []
+        all_hidden_layers: list[torch.Tensor] = [] if return_hidden_layers else None
         assert not lm_model.depformer.is_streaming
         with lm_model.depformer.streaming(B):
             for cb_index in range(lm_model.dep_q):
                 input_ = prev_token[:, None, None]
-                logits = lm_model.forward_depformer(cb_index, input_, transformer_out)
+                if return_hidden_layers:
+                    logits, hidden_layers = lm_model.forward_depformer(cb_index, input_, transformer_out, return_hidden_layers=True)
+                    # Accumulate hidden layers from all codebook steps
+                    all_hidden_layers.append(hidden_layers)
+                else:
+                    logits = lm_model.forward_depformer(cb_index, input_, transformer_out)
                 if self.return_logits:
                     assert logits.shape == (B, 1, 1, lm_model.card), logits.shape
                     ret_logits = logits.squeeze(dim=1).squeeze(dim=1)
@@ -1200,10 +1268,17 @@ class LMGen(StreamingModule[_LMGenState]):
         )
         tokens = torch.stack(depformer_tokens, dim=1)
         assert tokens.shape == (B, lm_model.dep_q), tokens.shape
-        if self.return_logits:
+        
+        if self.return_logits and return_hidden_layers:
+            all_logits = torch.stack(depformer_logits, dim=1)
+            assert all_logits.shape == (B, lm_model.dep_q, lm_model.card), all_logits.shape
+            return tokens, all_logits, all_hidden_layers
+        elif self.return_logits:
             all_logits = torch.stack(depformer_logits, dim=1)
             assert all_logits.shape == (B, lm_model.dep_q, lm_model.card), all_logits.shape
             return tokens, all_logits
+        elif return_hidden_layers:
+            return tokens, all_hidden_layers
         else:
             return tokens
 
