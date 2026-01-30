@@ -389,6 +389,9 @@ def main():
                              "Requires 'accelerate' package.")
     parser.add_argument("--seed", type=int, default=-1, help="Seed for reproducibility (-1 disables)")
 
+    parser.add_argument("--return-hidden-layers", action="store_true",
+                        help="If set, the model will return hidden layer activations at each step.")
+
     args = parser.parse_args()
 
     # If --voice-prompt-dir is omitted, voices.tgz is downloaded from HF and extracted.
@@ -431,6 +434,7 @@ def main():
             greedy=greedy,
             save_voice_prompt_embeddings=False,
             cpu_offload=args.cpu_offload,
+            return_hidden_layers=args.return_hidden_layers,
         )
 
 
