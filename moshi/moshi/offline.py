@@ -57,7 +57,7 @@ from .models import loaders, LMGen, MimiModel
 from .models.lm import load_audio as lm_load_audio
 from .models.lm import _iterate_audio as lm_iterate_audio
 from .models.lm import encode_from_sphn as lm_encode_from_sphn
-
+from .models.lm import HiddenLayerOutputs
 
 def log(level: str, msg: str):
     print(make_log(level, msg))
@@ -279,9 +279,12 @@ def run_inference(
             # Feed user-side input channels; text + agent audio are sampled
             # Also return all the hidden layers' values for persona vector analysis
             if return_hidden_layers:
-                tokens, hidden_layers = lm_gen.step(step_in, return_hidden_layers=True) # type: ignore
-                log("info", f"Retrieved {len(hidden_layers)} hidden layers at this step.")
-                log("info", f"{hidden_layers}")
+                tokens, hidden_layers: HiddenLayerOutputs = lm_gen.step(step_in, return_hidden_layers=True) # type: ignore
+                log("info", f"Retrieved {len(hidden_layers.text_transformer)} text transformer hidden layers and {len(hidden_layers.depth_transformer)} depth transformer hidden layers at this step.")
+                log("info", f"{hidden_layers.text_transformer}")
+                for i, depth_layers in enumerate(hidden_layers.depth_transformer):
+                    log("info", f"Acoustic token {i}\n{depth_layers}")
+        
             else:
                 tokens = lm_gen.step(step_in)
             if tokens is None:
