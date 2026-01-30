@@ -491,7 +491,7 @@ def run_batch_inference(
                     assert isinstance(hidden_layers, HiddenLayerOutputs), "Hidden layers were requested but not captured."
                     hidden_layers_list.append(hidden_layers)
                     
-                    if i == 0:  # Only log details for first instance
+                    if i == 0 and c == 0:  # Only log details for first instance
                         log("info", f"DEBUG: len(hidden_layers.depth_transformer) = {len(hidden_layers.depth_transformer)}")
                         log("info", f"Retrieved {len(hidden_layers.text_transformer)} text transformer hidden layers and {len(hidden_layers.depth_transformer)} codebooks, each with {len(hidden_layers.depth_transformer[0])} layers")
                 else:
@@ -543,7 +543,7 @@ def run_batch_inference(
 
     log("info", f"Batch inference completed for {len(input_wavs)} instances")
     if return_hidden_layers:
-        log("info", f"Hidden layers for {len(batch_hidden_layers)} instances with {len(batch_hidden_layers[0])} steps were returned during batch inference.")
+        log("info", f"Hidden layers for {len(batch_hidden_layers)} instances with {len(batch_hidden_layers[0])} steps were returned during batch inference. {steps}")
         return batch_hidden_layers
 
 
