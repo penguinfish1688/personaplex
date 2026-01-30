@@ -281,6 +281,7 @@ def run_inference(
             if return_hidden_layers:
                 result = lm_gen.step(step_in, return_hidden_layers=True)
                 tokens, hidden_layers = result  # type: ignore
+                """
                 assert isinstance(hidden_layers, HiddenLayerOutputs)
                 log("info", f"Retrieved {len(hidden_layers.text_transformer)} text transformer hidden layers and {len(hidden_layers.depth_transformer)} codebooks, each with {len(hidden_layers.depth_transformer[0])} layers at this step.")
                 log("info", f"Text transformer hidden layers shapes: {[h.shape for h in hidden_layers.text_transformer[:3]]}...")  # Show first 3
@@ -289,6 +290,7 @@ def run_inference(
                     if i >= 2:  # Limit output to first few codebooks
                         log("info", f"... (showing first 3 codebooks only, total: {len(hidden_layers.depth_transformer)})")
                         break
+                """
         
             else:
                 tokens = lm_gen.step(step_in)
@@ -357,7 +359,7 @@ def run_batch_inference(
     save_voice_prompt_embeddings: bool,
     cpu_offload: bool = False,
     return_hidden_layers: bool = False,
-) -> Optional[List[HiddenLayerOutputs]]:
+) -> Optional[List[List[HiddenLayerOutputs]]]:
     """Run batch offline inference using multiple input WAVs and text prompts.
     
     Args:
@@ -441,7 +443,7 @@ def run_batch_inference(
     else:
         lm_gen.load_voice_prompt(voice_prompt_path)
 
-    batch_hidden_layers: List[HiddenLayerOutputs] = []
+    batch_hidden_layers: List[List[HiddenLayerOutputs]] = []
     
     # 7) Process each instance
     for i, (input_wav, output_wav, output_text, text_prompt) in enumerate(zip(input_wavs, output_wavs, output_texts, text_prompts)):
@@ -466,7 +468,6 @@ def run_batch_inference(
         # Process audio frames and collect outputs
         generated_frames: List[np.ndarray] = []
         generated_text_tokens: List[str] = []
-        instance_hidden_layers = None
         total_target_samples = user_audio.shape[-1]
 
         for user_encoded in lm_encode_from_sphn(
@@ -477,24 +478,22 @@ def run_batch_inference(
             max_batch=1,
         ):
             steps = user_encoded.shape[-1]
+            # Store hidden layers for each step
+            hidden_layers_list: List[HiddenLayerOutputs] = []
             for c in range(steps):
                 step_in = user_encoded[:, :, c : c + 1]
                 
                 if return_hidden_layers:
                     # Debug: Check dep_q value (only for first instance)
-                    if i == 0 and c == 0:
-                        log("info", f"DEBUG: lm_gen.lm_model.dep_q = {lm_gen.lm_model.dep_q}")
                     
                     result = lm_gen.step(step_in, return_hidden_layers=True)
                     tokens, hidden_layers = result  # type: ignore
-                    assert isinstance(hidden_layers, HiddenLayerOutputs)
+                    assert isinstance(hidden_layers, HiddenLayerOutputs), "Hidden layers were requested but not captured."
+                    hidden_layers_list.append(hidden_layers)
                     
-                    # Store hidden layers from the first step for this instance
-                    if instance_hidden_layers is None:
-                        instance_hidden_layers = hidden_layers
-                        if i == 0:  # Only log details for first instance
-                            log("info", f"DEBUG: len(hidden_layers.depth_transformer) = {len(hidden_layers.depth_transformer)}")
-                            log("info", f"Retrieved {len(hidden_layers.text_transformer)} text transformer hidden layers and {len(hidden_layers.depth_transformer)} codebooks, each with {len(hidden_layers.depth_transformer[0])} layers")
+                    if i == 0:  # Only log details for first instance
+                        log("info", f"DEBUG: len(hidden_layers.depth_transformer) = {len(hidden_layers.depth_transformer)}")
+                        log("info", f"Retrieved {len(hidden_layers.text_transformer)} text transformer hidden layers and {len(hidden_layers.depth_transformer)} codebooks, each with {len(hidden_layers.depth_transformer[0])} layers")
                 else:
                     tokens = lm_gen.step(step_in)
                 
@@ -539,11 +538,12 @@ def run_batch_inference(
         
         # Store hidden layers for this instance
         if return_hidden_layers:
-            assert instance_hidden_layers is not None, "Hidden layers were requested but not captured."
-            batch_hidden_layers.append(instance_hidden_layers)
+            assert len(hidden_layers_list) == steps, "Mismatch in hidden layers collected and steps taken"
+            batch_hidden_layers.append(hidden_layers_list)
 
     log("info", f"Batch inference completed for {len(input_wavs)} instances")
     if return_hidden_layers:
+        log("info", f"Hidden layers for {len(batch_hidden_layers)} instances with {len(batch_hidden_layers[0])} steps were returned during batch inference.")
         return batch_hidden_layers
 
 
