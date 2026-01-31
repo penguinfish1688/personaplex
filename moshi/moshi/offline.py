@@ -50,6 +50,7 @@ import numpy as np
 import torch
 import sentencepiece
 import sphn
+from tqdm import tqdm
 from huggingface_hub import hf_hub_download
 
 from .client_utils import make_log
@@ -446,7 +447,7 @@ def run_batch_inference(
     batch_hidden_layers: List[List[HiddenLayerOutputs]] = []
     
     # 7) Process each instance
-    for i, (input_wav, output_wav, output_text, text_prompt) in enumerate(zip(input_wavs, output_wavs, output_texts, text_prompts)):
+    for i, (input_wav, output_wav, output_text, text_prompt) in tqdm(enumerate(zip(input_wavs, output_wavs, output_texts, text_prompts))):
         log("info", f"Processing instance {i+1}/{len(input_wavs)}: {input_wav}")
         
         # Set text prompt for this instance
@@ -490,6 +491,8 @@ def run_batch_inference(
                     
                     result = lm_gen.step(step_in, return_hidden_layers=True)
                     tokens, hidden_layers = result  # type: ignore
+                    print(f"DEBUG: Step {total_steps}, Hidden Layers: {hidden_layers}")
+                    print(f"DEBUG: Step {total_steps}, len(hidden_layers) = {len(hidden_layers)} hidden layers[0] = {hidden_layers[0].shape if len(hidden_layers) > 0 else 'N/A'}")
                     assert isinstance(hidden_layers, HiddenLayerOutputs), "Hidden layers were requested but not captured."
                     hidden_layers_list.append(hidden_layers)
                     
