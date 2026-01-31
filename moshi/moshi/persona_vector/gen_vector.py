@@ -114,8 +114,8 @@ def _compute_diff(a: Dict[str, List[torch.Tensor] | List[List[torch.Tensor]]], b
     return {"text": text_diff, "depth": depth_diff}
 
 
-def _compute_stats_across_prompts(per_prompt_diffs: List[Dict[str, List[torch.Tensor] | List[List[torch.Tensor]]]]) -> Dict[str, List[Dict[str, float]] | List[List[Dict[str, float]]]]:
-    """Compute mean and std of norms across prompts for each layer."""
+def _compute_stats_across_prompts(per_prompt_diffs: List[Dict[str, List[torch.Tensor] | List[List[torch.Tensor]]]], persona_vector: Dict[str, List[torch.Tensor] | List[List[torch.Tensor]]]) -> Dict[str, List[Dict[str, float]] | List[List[Dict[str, float]]]]:
+    """Compute mean and std of norms and cosine similarities across prompts for each layer."""
     if not per_prompt_diffs:
         return {}
     
@@ -124,11 +124,17 @@ def _compute_stats_across_prompts(per_prompt_diffs: List[Dict[str, List[torch.Te
     text_stats = []
     for i in range(text_layers_count):
         # Stack vectors from all prompts for this layer: [N, D]
-        vecs = torch.stack([d["text"][i] for d in per_prompt_diffs])
-        norms = torch.linalg.vector_norm(vecs.float(), dim=1) # [N]
+        vecs = torch.stack([d["text"][i] for d in per_prompt_diffs]).float()
+        avg_vec = persona_vector["text"][i].float().unsqueeze(0) # [1, D]
+        
+        norms = torch.linalg.vector_norm(vecs, dim=1) # [N]
+        cosines = torch.nn.functional.cosine_similarity(vecs, avg_vec, dim=1) # [N]
+
         text_stats.append({
             "mean": norms.mean().item(),
-            "std": norms.std().item()
+            "std": norms.std().item(),
+            "mean_cos": cosines.mean().item(),
+            "std_cos": cosines.std().item()
         })
         
     # Depth layers
@@ -138,11 +144,17 @@ def _compute_stats_across_prompts(per_prompt_diffs: List[Dict[str, List[torch.Te
     for c in range(depth_codebooks):
         codebook_stats = []
         for l in range(depth_layers_count):
-            vecs = torch.stack([d["depth"][c][l] for d in per_prompt_diffs])
-            norms = torch.linalg.vector_norm(vecs.float(), dim=1)
+            vecs = torch.stack([d["depth"][c][l] for d in per_prompt_diffs]).float()
+            avg_vec = persona_vector["depth"][c][l].float().unsqueeze(0) # [1, D]
+            
+            norms = torch.linalg.vector_norm(vecs, dim=1)
+            cosines = torch.nn.functional.cosine_similarity(vecs, avg_vec, dim=1)
+
             codebook_stats.append({
                 "mean": norms.mean().item(),
-                "std": norms.std().item()
+                "std": norms.std().item(),
+                "mean_cos": cosines.mean().item(),
+                "std_cos": cosines.std().item()
             })
         depth_stats.append(codebook_stats)
         
@@ -161,6 +173,7 @@ def _write_summary(path: str, trait: str, persona_vector: Dict[str, List[torch.T
         if stats:
              s = stats["text"][i]
              line += f", mean_norm={s['mean']:.4f}, std_norm={s['std']:.4f}"
+             line += f", mean_cos={s['mean_cos']:.4f}, std_cos={s['std_cos']:.4f}"
         lines.append(line)
 
     # Depth summary
@@ -173,6 +186,7 @@ def _write_summary(path: str, trait: str, persona_vector: Dict[str, List[torch.T
             if stats:
                 s = stats["depth"][c][l]
                 line += f", mean_norm={s['mean']:.4f}, std_norm={s['std']:.4f}"
+                line += f", mean_cos={s['mean_cos']:.4f}, std_cos={s['std_cos']:.4f}"
             lines.append(line)
         if len(persona_vector["depth"][c]) > 3:
             lines.append("    ...")
@@ -354,13 +368,15 @@ def run_persona_vector_extraction(
         persona_vector = _compute_diff(pos_mean, neg_mean)
         
         # Compute stats (consistency across prompts)
-        stats = _compute_stats_across_prompts(prompt_diffs)
+        stats = _compute_stats_across_prompts(prompt_diffs, persona_vector)
 
         # Save full vectors
         torch.save(
             {
                 "persona_vector": persona_vector,
-                "stats": stats
+                "stats": stats,
+                "pos_mean": pos_mean,
+                "neg_mean": neg_mean
             },
             os.path.join(trait_out_dir, "mean_persona_vectors.pt"),
         )
