@@ -49,8 +49,17 @@ def _make_output_paths(base_dir: str, prefix: str, count: int) -> Tuple[List[str
     return output_wavs, output_texts
 
 
+def _flatten_hidden_outputs(hidden_outputs: HiddenLayerOutputs) -> HiddenLayerOutputs:
+    """Flatten all tensors in HiddenLayerOutputs to 1D vectors."""
+    flat_text = [t.flatten() for t in hidden_outputs.text_transformer]
+    flat_depth = [[d.flatten() for d in codebook] for codebook in hidden_outputs.depth_transformer]
+    return HiddenLayerOutputs(text_transformer=flat_text, depth_transformer=flat_depth)
+
+
 def _mean_hidden_layers(step_hidden: List[HiddenLayerOutputs]) -> Dict[str, List[torch.Tensor] | List[List[torch.Tensor]]]:
-    """Compute mean hidden layer representations across steps for one prompt."""
+    """Compute mean hidden layer representations across steps for one prompt.
+    Assumes tensors are already flattened to 1D.
+    """
     if len(step_hidden) == 0:
         raise ValueError("No hidden layers provided for a prompt.")
 
@@ -118,6 +127,7 @@ def _compute_diff(a: Dict[str, List[torch.Tensor] | List[List[torch.Tensor]]], b
 def _compute_stats_across_prompts(per_prompt_diffs: List[Dict[str, List[torch.Tensor] | List[List[torch.Tensor]]]], persona_vector: Dict[str, List[torch.Tensor] | List[List[torch.Tensor]]]) -> Tuple[Dict[str, List[Dict[str, float]] | List[List[Dict[str, float]]]], Dict[str, Any]]:
     """Compute mean and std of norms and cosine similarities across prompts for each layer.
        Also returns raw cosine values for histogram plotting.
+       Assumes all tensors are already flattened to 1D.
     """
     if not per_prompt_diffs:
         return {}, {}
@@ -128,9 +138,9 @@ def _compute_stats_across_prompts(per_prompt_diffs: List[Dict[str, List[torch.Te
     text_layers_count = len(per_prompt_diffs[0]["text"])
     text_stats = []
     for i in range(text_layers_count):
-        # Stack vectors from all prompts for this layer and flatten to [N, D]
-        vecs = torch.stack([d["text"][i].flatten() for d in per_prompt_diffs]).float()
-        avg_vec = persona_vector["text"][i].flatten().float().unsqueeze(0) # [1, D]
+        # Stack vectors from all prompts for this layer: [N, D]
+        vecs = torch.stack([d["text"][i] for d in per_prompt_diffs]).float()
+        avg_vec = persona_vector["text"][i].float().unsqueeze(0) # [1, D]
         
         norms = torch.linalg.vector_norm(vecs, dim=1) # [N]
         cosines = torch.nn.functional.cosine_similarity(vecs, avg_vec, dim=1) # [N]
@@ -152,8 +162,8 @@ def _compute_stats_across_prompts(per_prompt_diffs: List[Dict[str, List[torch.Te
         codebook_stats = []
         codebook_cosines = []
         for l in range(depth_layers_count):
-            vecs = torch.stack([d["depth"][c][l].flatten() for d in per_prompt_diffs]).float()
-            avg_vec = persona_vector["depth"][c][l].flatten().float().unsqueeze(0) # [1, D]
+            vecs = torch.stack([d["depth"][c][l] for d in per_prompt_diffs]).float()
+            avg_vec = persona_vector["depth"][c][l].float().unsqueeze(0) # [1, D]
             
             norms = torch.linalg.vector_norm(vecs, dim=1)
             cosines = torch.nn.functional.cosine_similarity(vecs, avg_vec, dim=1)
@@ -361,10 +371,15 @@ def run_persona_vector_extraction(
         if pos_hidden is None or neg_hidden is None: # or neu_hidden is None:
             raise RuntimeError("Hidden layers were not returned from batch inference.")
 
+        # Flatten all hidden layer tensors immediately
+        print("  Flattening hidden layers...")
+        pos_hidden_flat = [[_flatten_hidden_outputs(step) for step in prompt_steps] for prompt_steps in pos_hidden]
+        neg_hidden_flat = [[_flatten_hidden_outputs(step) for step in prompt_steps] for prompt_steps in neg_hidden]
+
         # Compute mean vectors per prompt
         print("  Computing means...")
-        pos_prompt_means = [_mean_hidden_layers(steps) for steps in pos_hidden]
-        neg_prompt_means = [_mean_hidden_layers(steps) for steps in neg_hidden]
+        pos_prompt_means = [_mean_hidden_layers(steps) for steps in pos_hidden_flat]
+        neg_prompt_means = [_mean_hidden_layers(steps) for steps in neg_hidden_flat]
         # neu_prompt_means = [_mean_hidden_layers(steps) for steps in neu_hidden]
         
         # Calculate differences per prompt (needed for statistics)
@@ -381,18 +396,16 @@ def run_persona_vector_extraction(
         # Compute stats (consistency across prompts)
         stats, raw_cosines = _compute_stats_across_prompts(prompt_diffs, persona_vector)
 
-        # Save full vectors
+        # Save full vectors (all flattened)
         torch.save(
             {
                 "persona_vector": persona_vector,
                 "stats": stats,
                 "raw_cosines": raw_cosines, # Saving raw cosine values for histogram plotting
-                "pos_mean_all": pos_mean,       # Saving per-trait mean vectors
-                "neg_mean_all": neg_mean,
-                "pos_hidden_mean_per_prompt": pos_prompt_means, # Saving all individual prompt mean vectors (list of dicts)
-                "neg_hidden_mean_per_prompt": neg_prompt_means,
-                "pos_hidden": pos_hidden, # [N prompts, steps per prompt, HiddenLayerOutputs]
-                "neg_hidden": neg_hidden,
+                "pos_mean": pos_mean,       # Saving per-trait mean vectors
+                "neg_mean": neg_mean,
+                "pos_hidden": pos_prompt_means, # Saving all individual prompt mean vectors (list of dicts) - flattened
+                "neg_hidden": neg_prompt_means  # Flattened
             },
             os.path.join(trait_out_dir, "mean_persona_vectors.pt"),
         )
