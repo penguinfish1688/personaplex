@@ -491,8 +491,8 @@ def run_batch_inference(
                     
                     result = lm_gen.step(step_in, return_hidden_layers=True)
                     tokens, hidden_layers = result  # type: ignore
-                    print(f"DEBUG: Step {total_steps}, Hidden Layers: {hidden_layers}")
-                    print(f"DEBUG: Step {total_steps}, len(hidden_layers) = {len(hidden_layers)} hidden layers[0] = {hidden_layers[0].shape if len(hidden_layers) > 0 else 'N/A'}")
+                    print(f"DEBUG: Step {total_steps}, Hidden Layers: {hidden_layers.text_transformer}")
+                    print(f"DEBUG: Step {total_steps}, len(hidden_layers) = {len(hidden_layers.text_transformer)} hidden layers[0] = {hidden_layers.text_transformer[0].shape if len(hidden_layers.text_transformer) > 0 else 'N/A'}")
                     assert isinstance(hidden_layers, HiddenLayerOutputs), "Hidden layers were requested but not captured."
                     hidden_layers_list.append(hidden_layers)
                     
