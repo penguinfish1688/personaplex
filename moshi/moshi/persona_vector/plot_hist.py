@@ -7,10 +7,12 @@ import os
 import matplotlib.pyplot as plt
 import argparse
 import numpy as np
+from ..models.lm import HiddenLayerOutputs # Necessary for unpickling
 
 def plot_cosine_histograms(pt_file, output_dir):
     print(f"Loading {pt_file}...")
-    data = torch.load(pt_file)
+    torch.serialization.add_safe_globals([HiddenLayerOutputs])
+    data = torch.load(pt_file, map_location=torch.device('cpu'), weights_only=False)
     
     if "raw_cosines" not in data:
         print("Error: 'raw_cosines' not found in the .pt file. Please regenerate using the updated gen_vector.py.")
@@ -65,6 +67,7 @@ def plot_cosine_histograms(pt_file, output_dir):
     print(f"Plots saved to {output_dir}")
 
 def main():
+    # cd ~/personaplex/moshi ; python3 -m moshi.persona_vector.plot_hist --pt_file ~/personaplex/tmp/histogram/mean_persona_vectors.pt --output_dir ~/personaplex/tmp/histogram
     parser = argparse.ArgumentParser(description="Plot cosine similarity histograms from persona vector data.")
     parser.add_argument("--pt_file", type=str, required=True, help="Path to mean_persona_vectors.pt file")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save plots")

@@ -128,9 +128,9 @@ def _compute_stats_across_prompts(per_prompt_diffs: List[Dict[str, List[torch.Te
     text_layers_count = len(per_prompt_diffs[0]["text"])
     text_stats = []
     for i in range(text_layers_count):
-        # Stack vectors from all prompts for this layer: [N, D]
-        vecs = torch.stack([d["text"][i] for d in per_prompt_diffs]).float()
-        avg_vec = persona_vector["text"][i].float().unsqueeze(0) # [1, D]
+        # Stack vectors from all prompts for this layer and flatten to [N, D]
+        vecs = torch.stack([d["text"][i].flatten() for d in per_prompt_diffs]).float()
+        avg_vec = persona_vector["text"][i].flatten().float().unsqueeze(0) # [1, D]
         
         norms = torch.linalg.vector_norm(vecs, dim=1) # [N]
         cosines = torch.nn.functional.cosine_similarity(vecs, avg_vec, dim=1) # [N]
@@ -152,8 +152,8 @@ def _compute_stats_across_prompts(per_prompt_diffs: List[Dict[str, List[torch.Te
         codebook_stats = []
         codebook_cosines = []
         for l in range(depth_layers_count):
-            vecs = torch.stack([d["depth"][c][l] for d in per_prompt_diffs]).float()
-            avg_vec = persona_vector["depth"][c][l].float().unsqueeze(0) # [1, D]
+            vecs = torch.stack([d["depth"][c][l].flatten() for d in per_prompt_diffs]).float()
+            avg_vec = persona_vector["depth"][c][l].flatten().float().unsqueeze(0) # [1, D]
             
             norms = torch.linalg.vector_norm(vecs, dim=1)
             cosines = torch.nn.functional.cosine_similarity(vecs, avg_vec, dim=1)
