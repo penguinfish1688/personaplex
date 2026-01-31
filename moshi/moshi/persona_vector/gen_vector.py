@@ -10,6 +10,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+from tqdm import tqdm
 
 import torch
 
@@ -256,7 +257,7 @@ def run_persona_vector_extraction(
         neg_prompts = []
         neutral_prompts = []
 
-        for q in questions:
+        for q in tqdm(questions):
             # Handle case where q is not a string (though it should be)
             if isinstance(q, dict):
                 q_text = str(q)
