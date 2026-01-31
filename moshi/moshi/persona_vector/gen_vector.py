@@ -114,20 +114,66 @@ def _compute_diff(a: Dict[str, List[torch.Tensor] | List[List[torch.Tensor]]], b
     return {"text": text_diff, "depth": depth_diff}
 
 
-def _write_summary(path: str, trait: str, persona_vector: Dict[str, List[torch.Tensor] | List[List[torch.Tensor]]]):
+def _compute_stats_across_prompts(per_prompt_diffs: List[Dict[str, List[torch.Tensor] | List[List[torch.Tensor]]]]) -> Dict[str, List[Dict[str, float]] | List[List[Dict[str, float]]]]:
+    """Compute mean and std of norms across prompts for each layer."""
+    if not per_prompt_diffs:
+        return {}
+    
+    # Text layers
+    text_layers_count = len(per_prompt_diffs[0]["text"])
+    text_stats = []
+    for i in range(text_layers_count):
+        # Stack vectors from all prompts for this layer: [N, D]
+        vecs = torch.stack([d["text"][i] for d in per_prompt_diffs])
+        norms = torch.linalg.vector_norm(vecs.float(), dim=1) # [N]
+        text_stats.append({
+            "mean": norms.mean().item(),
+            "std": norms.std().item()
+        })
+        
+    # Depth layers
+    depth_codebooks = len(per_prompt_diffs[0]["depth"])
+    depth_layers_count = len(per_prompt_diffs[0]["depth"][0])
+    depth_stats = []
+    for c in range(depth_codebooks):
+        codebook_stats = []
+        for l in range(depth_layers_count):
+            vecs = torch.stack([d["depth"][c][l] for d in per_prompt_diffs])
+            norms = torch.linalg.vector_norm(vecs.float(), dim=1)
+            codebook_stats.append({
+                "mean": norms.mean().item(),
+                "std": norms.std().item()
+            })
+        depth_stats.append(codebook_stats)
+        
+    return {"text": text_stats, "depth": depth_stats}
+
+
+def _write_summary(path: str, trait: str, persona_vector: Dict[str, List[torch.Tensor] | List[List[torch.Tensor]]], stats: Dict[str, Any] = None):
     lines = []
     lines.append(f"Trait: {trait}")
+    
+    # Text summary
     lines.append(f"Text layers: {len(persona_vector['text'])}")
     for i, vec in enumerate(persona_vector["text"]):
         norm = torch.linalg.vector_norm(vec).item()
-        lines.append(f"  Text layer {i:02d}: norm={norm:.4f}")
+        line = f"  Text layer {i:02d}: norm={norm:.4f}"
+        if stats:
+             s = stats["text"][i]
+             line += f", mean_norm={s['mean']:.4f}, std_norm={s['std']:.4f}"
+        lines.append(line)
 
+    # Depth summary
     lines.append(f"Depth codebooks: {len(persona_vector['depth'])}")
     for c in range(min(3, len(persona_vector["depth"]))):
         lines.append(f"  Codebook {c:02d} layers: {len(persona_vector['depth'][c])}")
         for l in range(min(3, len(persona_vector["depth"][c]))):
             norm = torch.linalg.vector_norm(persona_vector["depth"][c][l]).item()
-            lines.append(f"    Depth layer {l:02d}: norm={norm:.4f}")
+            line = f"    Depth layer {l:02d}: norm={norm:.4f}"
+            if stats:
+                s = stats["depth"][c][l]
+                line += f", mean_norm={s['mean']:.4f}, std_norm={s['std']:.4f}"
+            lines.append(line)
         if len(persona_vector["depth"][c]) > 3:
             lines.append("    ...")
     if len(persona_vector["depth"]) > 3:
@@ -295,20 +341,26 @@ def run_persona_vector_extraction(
         pos_prompt_means = [_mean_hidden_layers(steps) for steps in pos_hidden]
         neg_prompt_means = [_mean_hidden_layers(steps) for steps in neg_hidden]
         # neu_prompt_means = [_mean_hidden_layers(steps) for steps in neu_hidden]
-
+        
+        # Calculate differences per prompt (needed for statistics)
+        prompt_diffs = [_compute_diff(p, n) for p, n in zip(pos_prompt_means, neg_prompt_means)]
+        
         # Compute mean vectors across prompts
         pos_mean = _mean_across_prompts(pos_prompt_means)
         neg_mean = _mean_across_prompts(neg_prompt_means)
-        # neu_mean = _mean_across_prompts(neu_prompt_means)
-
-
+        
         # Persona vectors are defined as difference between pos and neg
+        # Effectively the same as averaging prompt_diffs
         persona_vector = _compute_diff(pos_mean, neg_mean)
+        
+        # Compute stats (consistency across prompts)
+        stats = _compute_stats_across_prompts(prompt_diffs)
 
         # Save full vectors
         torch.save(
             {
                 "persona_vector": persona_vector,
+                "stats": stats
             },
             os.path.join(trait_out_dir, "mean_persona_vectors.pt"),
         )
@@ -318,6 +370,7 @@ def run_persona_vector_extraction(
             os.path.join(trait_out_dir, "summary.txt"),
             trait,
             persona_vector,
+            stats
         )
         print(f"  Done. Results saved to {trait_out_dir}")
 
