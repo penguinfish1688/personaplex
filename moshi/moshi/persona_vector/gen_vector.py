@@ -201,9 +201,9 @@ def run_persona_vector_extraction(
                 
                 pos_prompts.append(_build_prompt(pos_inst, q_text))
                 neg_prompts.append(_build_prompt(neg_inst, q_text))
-                neutral_prompts.append(_build_prompt(neutral_instruction, q_text))
+                # neutral_prompts.append(_build_prompt(neutral_instruction, q_text))
 
-        print(f"  Generated {len(pos_prompts)} prompts per Condition (Pos/Neg/Neu)")
+        print(f"  Generated {len(pos_prompts)} prompts per Condition (Pos/Neg)")
         
         if len(pos_prompts) == 0:
             continue
@@ -213,7 +213,7 @@ def run_persona_vector_extraction(
 
         pos_wavs, pos_texts = _make_output_paths(trait_out_dir, "pos", len(pos_prompts))
         neg_wavs, neg_texts = _make_output_paths(trait_out_dir, "neg", len(neg_prompts))
-        neu_wavs, neu_texts = _make_output_paths(trait_out_dir, "neutral", len(neutral_prompts))
+        # neu_wavs, neu_texts = _make_output_paths(trait_out_dir, "neutral", len(neutral_prompts))
 
         input_wavs = _repeat_path(input_wav, len(pos_prompts))
         
