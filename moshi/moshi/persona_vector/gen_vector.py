@@ -114,10 +114,14 @@ def _compute_diff(a: Dict[str, List[torch.Tensor] | List[List[torch.Tensor]]], b
     return {"text": text_diff, "depth": depth_diff}
 
 
-def _compute_stats_across_prompts(per_prompt_diffs: List[Dict[str, List[torch.Tensor] | List[List[torch.Tensor]]]], persona_vector: Dict[str, List[torch.Tensor] | List[List[torch.Tensor]]]) -> Dict[str, List[Dict[str, float]] | List[List[Dict[str, float]]]]:
-    """Compute mean and std of norms and cosine similarities across prompts for each layer."""
+def _compute_stats_across_prompts(per_prompt_diffs: List[Dict[str, List[torch.Tensor] | List[List[torch.Tensor]]]], persona_vector: Dict[str, List[torch.Tensor] | List[List[torch.Tensor]]]) -> Tuple[Dict[str, List[Dict[str, float]] | List[List[Dict[str, float]]]], Dict[str, Any]]:
+    """Compute mean and std of norms and cosine similarities across prompts for each layer.
+       Also returns raw cosine values for histogram plotting.
+    """
     if not per_prompt_diffs:
-        return {}
+        return {}, {}
+    
+    raw_cosines = {"text": [], "depth": []}
     
     # Text layers
     text_layers_count = len(per_prompt_diffs[0]["text"])
@@ -129,6 +133,8 @@ def _compute_stats_across_prompts(per_prompt_diffs: List[Dict[str, List[torch.Te
         
         norms = torch.linalg.vector_norm(vecs, dim=1) # [N]
         cosines = torch.nn.functional.cosine_similarity(vecs, avg_vec, dim=1) # [N]
+        
+        raw_cosines["text"].append(cosines.cpu())
 
         text_stats.append({
             "mean": norms.mean().item(),
@@ -143,12 +149,15 @@ def _compute_stats_across_prompts(per_prompt_diffs: List[Dict[str, List[torch.Te
     depth_stats = []
     for c in range(depth_codebooks):
         codebook_stats = []
+        codebook_cosines = []
         for l in range(depth_layers_count):
             vecs = torch.stack([d["depth"][c][l] for d in per_prompt_diffs]).float()
             avg_vec = persona_vector["depth"][c][l].float().unsqueeze(0) # [1, D]
             
             norms = torch.linalg.vector_norm(vecs, dim=1)
             cosines = torch.nn.functional.cosine_similarity(vecs, avg_vec, dim=1)
+            
+            codebook_cosines.append(cosines.cpu())
 
             codebook_stats.append({
                 "mean": norms.mean().item(),
@@ -157,8 +166,9 @@ def _compute_stats_across_prompts(per_prompt_diffs: List[Dict[str, List[torch.Te
                 "std_cos": cosines.std().item()
             })
         depth_stats.append(codebook_stats)
+        raw_cosines["depth"].append(codebook_cosines)
         
-    return {"text": text_stats, "depth": depth_stats}
+    return {"text": text_stats, "depth": depth_stats}, raw_cosines
 
 
 def _write_summary(path: str, trait: str, persona_vector: Dict[str, List[torch.Tensor] | List[List[torch.Tensor]]], stats: Dict[str, Any] = None):
@@ -368,15 +378,20 @@ def run_persona_vector_extraction(
         persona_vector = _compute_diff(pos_mean, neg_mean)
         
         # Compute stats (consistency across prompts)
-        stats = _compute_stats_across_prompts(prompt_diffs, persona_vector)
+        stats, raw_cosines = _compute_stats_across_prompts(prompt_diffs, persona_vector)
 
         # Save full vectors
         torch.save(
             {
                 "persona_vector": persona_vector,
                 "stats": stats,
-                "pos_mean": pos_mean,
-                "neg_mean": neg_mean
+                "raw_cosines": raw_cosines, # Saving raw cosine values for histogram plotting
+                "pos_mean_all": pos_mean,       # Saving per-trait mean vectors
+                "neg_mean_all": neg_mean,
+                "pos_hidden_mean_per_prompt": pos_prompt_means, # Saving all individual prompt mean vectors (list of dicts)
+                "neg_hidden_mean_per_prompt": neg_prompt_means,
+                "pos_hidden": pos_hidden, # [N prompts, steps per prompt, HiddenLayerOutputs]
+                "neg_hidden": neg_hidden,
             },
             os.path.join(trait_out_dir, "mean_persona_vectors.pt"),
         )
