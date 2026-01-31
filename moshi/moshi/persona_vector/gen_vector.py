@@ -13,12 +13,6 @@ from typing import Dict, List, Tuple
 
 import torch
 
-# Add project root to sys.path to allow imports when running as script
-current_dir = os.path.dirname(os.path.abspath(__file__))
-moshi_root = os.path.abspath(os.path.join(current_dir, "../../"))
-if moshi_root not in sys.path:
-    sys.path.insert(0, moshi_root)
-
 from moshi.offline import run_batch_inference, _get_voice_prompt_dir
 from moshi.models import loaders
 from moshi.models.lm import HiddenLayerOutputs
