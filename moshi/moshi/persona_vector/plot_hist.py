@@ -14,6 +14,9 @@ def plot_cosine_histograms(pt_file, output_dir):
     torch.serialization.add_safe_globals([HiddenLayerOutputs])
     data = torch.load(pt_file, map_location=torch.device('cpu'), weights_only=False)
     
+    # Extract file name
+    filename = os.path.basename(pt_file)
+
     if "raw_cosines" not in data:
         print("Error: 'raw_cosines' not found in the .pt file. Please regenerate using the updated gen_vector.py.")
         return
@@ -43,7 +46,7 @@ def plot_cosine_histograms(pt_file, output_dir):
         plt.grid(axis='y', alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "text_layers_histograms.png"))
+    plt.savefig(os.path.join(output_dir, f"{filename}_text_layers_histograms.png"))
     plt.close()
     
     # Plot heatmap of cosine similarities across all text layers
@@ -59,7 +62,7 @@ def plot_cosine_histograms(pt_file, output_dir):
         plt.title("Cosine Similarity Heatmap (Text Layers)")
         plt.xlabel("Prompt Index")
         plt.ylabel("Layer Index")
-        plt.savefig(os.path.join(output_dir, "text_layers_heatmap.png"))
+        plt.savefig(os.path.join(output_dir, f"{filename}_text_layers_heatmap.png"))
         plt.close()
     except Exception as e:
         print(f"Could not create heatmap: {e}")

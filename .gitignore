@@ -191,3 +191,7 @@ mlx-trace.json
 # Include everything in assets
 !assets/
 !assets/**
+
+# Large model files
+*.pt
+!**/test*.pt
