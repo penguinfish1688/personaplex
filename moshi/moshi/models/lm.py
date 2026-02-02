@@ -430,6 +430,7 @@ class LMModel(StreamingContainer):
         return token
     
     def embed_codes(self, sequence: torch.Tensor) -> torch.Tensor:
+        # Comment: Input channels (text, generated audio, input audio) are added together
         B, K, S = sequence.shape
         assert (
             K == self.num_codebooks
