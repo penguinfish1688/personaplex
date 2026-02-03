@@ -14,9 +14,13 @@ class TTS:
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(model_id)
             self.model = AutoModel.from_pretrained(model_id).to(self.device).eval()
-        except Exception as e:
-            print(f"Failed to load model {model_id}: {e}")
-            print("Make sure you have installed the main branch of transformers if Dia is a new model.")
+        except (ValueError, OSError, ImportError) as e:
+            print(f"\nError loading model {model_id}: {e}")
+            if "sentencepiece" in str(e) or "tiktoken" in str(e):
+                print("\nPOSSIBLE FIX: proper tokenizer backend is missing.")
+                print("Try installing sentencepiece and upgrading transformers:")
+                print("    pip install sentencepiece protobuf")
+                print("    pip install --upgrade transformers")
             raise 
 
     def synthesize(self, prompt: str, output_wav_path: str):
@@ -54,7 +58,7 @@ class TTS:
         print(f"Saved audio to {output_wav_path}")
 
 if __name__ == "__main__":
-    # cd ~/personaplex/moshi ; python3 -m moshi.tts.persona_vector.data_generation.tts "Hello, how are you today" "tmp/tts/example.wav"
+    # cd ~/personaplex/moshi ; python3 -m moshi.persona_vector.data_generation.tts "Hello, how are you today" "tmp/tts/example.wav"
     import sys
     
     if len(sys.argv) < 3:

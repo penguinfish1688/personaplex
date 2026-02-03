@@ -19,6 +19,7 @@ From: nvcr.io/nvidia/cuda:12.4.1-runtime-ubuntu22.04
         libopus-dev \
         libportaudio2 \
         portaudio19-dev \
+        libsndfile1 \
         openssh-client \
         wget \
         curl \
@@ -45,7 +46,13 @@ From: nvcr.io/nvidia/cuda:12.4.1-runtime-ubuntu22.04
     
     # Install optional but recommended packages
     # - accelerate: For CPU offload support on GPUs with limited memory
-    /root/.local/bin/uv pip install --python /app/moshi/.venv/bin/python accelerate
+    # - soundfile: For audio file processing (required by TTS)
+    # - pip: Ensure pip command is available in the container
+    # - protobuf: Required by some transformers models/tokenizers
+    # - sentencepiece: Required by some transformers tokenizers
+    # - tiktoken: Required by some transformers tokenizers (e.g. newer models)
+    # - transformers: Upgrade to latest for Dia model support
+    /root/.local/bin/uv pip install --python /app/moshi/.venv/bin/python accelerate soundfile pip protobuf sentencepiece tiktoken transformers
 
     # Verify critical dependencies are installed
     /app/moshi/.venv/bin/python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
