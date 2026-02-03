@@ -9,7 +9,7 @@ except ImportError:
     raise
 
 class TTS:
-    def __init__(self, model_id: str = "nari-labs/Dia2-1B", dtype: str = "bfloat16"):
+    def __init__(self, model_id: str = "nari-labs/Dia2-2B", dtype: str = "bfloat16"):
         """
         Initialize the Dia2 TTS model.
         
