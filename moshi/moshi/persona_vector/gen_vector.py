@@ -218,7 +218,7 @@ def _write_summary(path: str, trait: str, persona_vector: Dict[str, List[torch.T
         f.write("\n".join(lines))
 
 
-def run_persona_vector_extraction(
+def run_text_persona_vector_extraction(
     trait_dir: str,
     traits: List[str],
     input_wav: str,
@@ -420,12 +420,269 @@ def run_persona_vector_extraction(
         print(f"  Done. Results saved to {trait_out_dir}")
 
 
+def run_audio_persona_vector_extraction(
+    trait_dir: str,
+    trait_audio_dir: str,
+    traits: List[str],
+    output_dir: str,
+    voice_prompt: str,
+    voice_prompt_dir: str | None,
+    tokenizer_path: str | None,
+    moshi_weight: str | None,
+    mimi_weight: str | None,
+    hf_repo: str,
+    device: str,
+    seed: int | None,
+    temp_audio: float,
+    temp_text: float,
+    topk_audio: int,
+    topk_text: int,
+    greedy: bool,
+    cpu_offload: bool,
+    audio_delay: float = 2.5,
+    sample_rate: int = 24000,
+):
+    """
+    Extract persona vectors using audio prompts instead of text prompts.
+    
+    1. For the input_wavs, use the audio_delay (2.5 second by default) + instruction + question (concat) 
+       for each trait as the audio input
+    2. For the text prompts, use "You are an assistant that obeys user's instruction."
+    3. The rest is the same as run_text_persona_vector_extraction
+    
+    Args:
+        trait_dir: Directory containing trait JSON files (text format)
+        trait_audio_dir: Directory containing generated audio files (from tts.py)
+        traits: List of trait names to process
+        output_dir: Output directory for persona vectors
+        voice_prompt: Voice prompt filename
+        voice_prompt_dir: Directory containing voice prompt files
+        audio_delay: Delay in seconds to prepend to audio (default 2.5s)
+        sample_rate: Audio sample rate (default 24000 Hz for Moshi)
+        ... (other args same as run_text_persona_vector_extraction)
+    """
+    import soundfile as sf
+    import numpy as np
+    
+    # Fixed text prompt for all audio-based extraction
+    FIXED_TEXT_PROMPT = "You are an assistant that obeys user's instruction."
+    
+    # Resolve voice prompt path
+    voice_prompt_dir_resolved = _get_voice_prompt_dir(voice_prompt_dir, hf_repo)
+    if not os.path.exists(voice_prompt_dir_resolved):
+        raise FileNotFoundError(f"voice_prompt_dir does not exist: {voice_prompt_dir_resolved}")
+    voice_prompt_path = os.path.join(voice_prompt_dir_resolved, voice_prompt)
+    if not os.path.exists(voice_prompt_path):
+        raise FileNotFoundError(f"Voice prompt not found: {voice_prompt_path}")
+
+    output_dir = os.path.abspath(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create silence for audio delay
+    delay_samples = int(audio_delay * sample_rate)
+    silence = np.zeros(delay_samples, dtype=np.float32)
+
+    def _concat_audio_files(delay: np.ndarray, *audio_paths: str, output_path: str) -> str:
+        """Concatenate delay silence with multiple audio files."""
+        audio_parts = [delay]
+        for path in audio_paths:
+            if os.path.exists(path):
+                audio, sr = sf.read(path, dtype='float32')
+                if sr != sample_rate:
+                    # Resample if needed (simple approach - for production use librosa)
+                    import warnings
+                    warnings.warn(f"Audio sample rate {sr} != {sample_rate}, may cause issues")
+                audio_parts.append(audio)
+            else:
+                raise FileNotFoundError(f"Audio file not found: {path}")
+        
+        concatenated = np.concatenate(audio_parts)
+        sf.write(output_path, concatenated, sample_rate)
+        return output_path
+
+    for trait in traits:
+        trait_path = os.path.join(trait_dir, f"{trait}.json")
+        trait_audio_json = os.path.join(trait_audio_dir, trait, f"{trait}.json")
+        
+        if not os.path.exists(trait_path):
+            print(f"Skipping trait {trait}: text file not found at {trait_path}")
+            continue
+        if not os.path.exists(trait_audio_json):
+            print(f"Skipping trait {trait}: audio json not found at {trait_audio_json}")
+            continue
+        
+        print(f"Processing trait: {trait}")
+
+        # Load text trait file for structure
+        instructions, questions = _load_trait_file(trait_path)
+        if len(instructions) == 0 or len(questions) == 0:
+            print(f"Skipping trait {trait}: no instructions or questions found")
+            continue
+        
+        # Load audio paths
+        with open(trait_audio_json, 'r') as f:
+            audio_data = json.load(f)
+        
+        instruction_audios = audio_data.get("instruction", [])
+        question_audios = audio_data.get("questions", [])
+        
+        if len(instruction_audios) == 0 or len(question_audios) == 0:
+            print(f"Skipping trait {trait}: no audio files found")
+            continue
+
+        trait_out_dir = os.path.join(output_dir, trait)
+        concat_audio_dir = os.path.join(trait_out_dir, "concat_audio")
+        os.makedirs(trait_out_dir, exist_ok=True)
+        os.makedirs(concat_audio_dir, exist_ok=True)
+
+        # Build concatenated audio files: delay + instruction + question
+        pos_input_wavs = []
+        neg_input_wavs = []
+        pos_text_prompts = []
+        neg_text_prompts = []
+        
+        print(f"  Creating concatenated audio files...")
+        concat_idx = 0
+        for q_idx, q_audio_path in enumerate(tqdm(question_audios, desc="  Questions")):
+            for inst_idx, inst_audio in enumerate(instruction_audios):
+                pos_inst_path = inst_audio.get("pos", "")
+                neg_inst_path = inst_audio.get("neg", "")
+                
+                if not pos_inst_path or not neg_inst_path:
+                    continue
+                
+                # Create positive concatenated audio: delay + pos_instruction + question
+                pos_concat_path = os.path.join(concat_audio_dir, f"pos_{concat_idx:05d}.wav")
+                _concat_audio_files(silence, pos_inst_path, q_audio_path, output_path=pos_concat_path)
+                pos_input_wavs.append(pos_concat_path)
+                pos_text_prompts.append(FIXED_TEXT_PROMPT)
+                
+                # Create negative concatenated audio: delay + neg_instruction + question
+                neg_concat_path = os.path.join(concat_audio_dir, f"neg_{concat_idx:05d}.wav")
+                _concat_audio_files(silence, neg_inst_path, q_audio_path, output_path=neg_concat_path)
+                neg_input_wavs.append(neg_concat_path)
+                neg_text_prompts.append(FIXED_TEXT_PROMPT)
+                
+                concat_idx += 1
+
+        print(f"  Generated {len(pos_input_wavs)} concatenated audio files per condition (Pos/Neg)")
+        
+        if len(pos_input_wavs) == 0:
+            continue
+
+        pos_wavs, pos_texts = _make_output_paths(trait_out_dir, "pos", len(pos_input_wavs))
+        neg_wavs, neg_texts = _make_output_paths(trait_out_dir, "neg", len(neg_input_wavs))
+
+        print("  Running inference for Positive prompts...")
+        pos_hidden = run_batch_inference(
+            input_wavs=pos_input_wavs,
+            output_wavs=pos_wavs,
+            output_texts=pos_texts,
+            text_prompts=pos_text_prompts,
+            voice_prompt_path=voice_prompt_path,
+            tokenizer_path=tokenizer_path,
+            moshi_weight=moshi_weight,
+            mimi_weight=mimi_weight,
+            hf_repo=hf_repo,
+            device=device,
+            seed=seed,
+            temp_audio=temp_audio,
+            temp_text=temp_text,
+            topk_audio=topk_audio,
+            topk_text=topk_text,
+            greedy=greedy,
+            save_voice_prompt_embeddings=False,
+            cpu_offload=cpu_offload,
+            return_hidden_layers=True,
+        )
+
+        print("  Running inference for Negative prompts...")
+        neg_hidden = run_batch_inference(
+            input_wavs=neg_input_wavs,
+            output_wavs=neg_wavs,
+            output_texts=neg_texts,
+            text_prompts=neg_text_prompts,
+            voice_prompt_path=voice_prompt_path,
+            tokenizer_path=tokenizer_path,
+            moshi_weight=moshi_weight,
+            mimi_weight=mimi_weight,
+            hf_repo=hf_repo,
+            device=device,
+            seed=seed,
+            temp_audio=temp_audio,
+            temp_text=temp_text,
+            topk_audio=topk_audio,
+            topk_text=topk_text,
+            greedy=greedy,
+            save_voice_prompt_embeddings=False,
+            cpu_offload=cpu_offload,
+            return_hidden_layers=True,
+        )
+
+        if pos_hidden is None or neg_hidden is None:
+            raise RuntimeError("Hidden layers were not returned from batch inference.")
+
+        # Flatten all hidden layer tensors immediately
+        print("  Flattening hidden layers...")
+        pos_hidden_flat = [[_flatten_hidden_outputs(step) for step in prompt_steps] for prompt_steps in pos_hidden]
+        neg_hidden_flat = [[_flatten_hidden_outputs(step) for step in prompt_steps] for prompt_steps in neg_hidden]
+
+        # Compute mean vectors per prompt
+        print("  Computing means...")
+        pos_prompt_means = [_mean_hidden_layers(steps) for steps in pos_hidden_flat]
+        neg_prompt_means = [_mean_hidden_layers(steps) for steps in neg_hidden_flat]
+        
+        # Calculate differences per prompt (needed for statistics)
+        prompt_diffs = [_compute_diff(p, n) for p, n in zip(pos_prompt_means, neg_prompt_means)]
+        
+        # Compute mean vectors across prompts
+        pos_mean = _mean_across_prompts(pos_prompt_means)
+        neg_mean = _mean_across_prompts(neg_prompt_means)
+        
+        # Persona vectors are defined as difference between pos and neg
+        persona_vector = _compute_diff(pos_mean, neg_mean)
+        
+        # Compute stats (consistency across prompts)
+        stats, raw_cosines = _compute_stats_across_prompts(prompt_diffs, persona_vector)
+
+        # Save full vectors (all flattened)
+        torch.save(
+            {
+                "persona_vector": persona_vector,
+                "stats": stats,
+                "raw_cosines": raw_cosines,
+                "pos_mean": pos_mean,
+                "neg_mean": neg_mean,
+                "pos_hidden": pos_prompt_means,
+                "neg_hidden": neg_prompt_means,
+                "extraction_mode": "audio",
+                "audio_delay": audio_delay,
+            },
+            os.path.join(trait_out_dir, "mean_persona_vectors.pt"),
+        )
+
+        # Write summary
+        _write_summary(
+            os.path.join(trait_out_dir, "summary.txt"),
+            trait,
+            persona_vector,
+            stats
+        )
+        print(f"  Done. Results saved to {trait_out_dir}")
+
 
 def main():
+    # Hardcoded paths relative to this script's location
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.abspath(os.path.join(script_dir, "..", "..", "..", ".."))
+    
+    TRAIT_DIR = os.path.join(project_root, "data_generation", "trait_data_extract")
+    TRAIT_AUDIO_DIR = os.path.join(project_root, "data_generation", "trait_data_extract_audio")
+    EMPTY_WAV = os.path.join(project_root, "assets", "empty.wav")
+    
     parser = argparse.ArgumentParser(description="Compute persona vectors from trait prompts using Moshi offline inference")
-    parser.add_argument("--trait_dir", type=str, default=os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "data_generation", "trait_data_extract"))
+    parser.add_argument("--mode", type=str, choices=["text", "audio"], default="text", help="Extraction mode: 'text' (text prompts) or 'audio' (audio prompts)")
     parser.add_argument("--traits", type=str, nargs="+", default=["all"], help="Trait names to process (e.g., apathetic evil). Use 'all' for all traits.")
-    parser.add_argument("--input_wav", type=str, required=True, help="Path to input WAV file used for all prompts")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to write outputs")
 
     parser.add_argument("--voice_prompt", required=True, type=str, help="Voice prompt filename (basename) inside --voice-prompt-dir (e.g. 'NATM1.pt').")
@@ -446,16 +703,17 @@ def main():
     parser.add_argument("--seed", type=int, default=-1)
 
     parser.add_argument("--neutral_instruction", type=str, default="Respond helpfully and neutrally.")
+    parser.add_argument("--audio_delay", type=float, default=2.5, help="Silence delay in seconds before audio (for audio mode)")
+    parser.add_argument("--sample_rate", type=int, default=24000, help="Audio sample rate (default 24000 Hz for Moshi)")
 
     args = parser.parse_args()
 
-    trait_dir = args.trait_dir
-    # Check if trait dir exists, if not warn
-    if not os.path.exists(trait_dir):
-        print(f"Warning: Trait directory {trait_dir} does not exist. Using current directory.")
-        trait_dir = "."
+    # Check if trait dir exists
+    if not os.path.exists(TRAIT_DIR):
+        print(f"Error: Trait directory {TRAIT_DIR} does not exist.")
+        return
 
-    all_traits = [p.stem for p in Path(trait_dir).glob("*.json")]
+    all_traits = [p.stem for p in Path(TRAIT_DIR).glob("*.json")]
     if args.traits == ["all"]:
         traits = all_traits
     else:
@@ -465,27 +723,64 @@ def main():
         print("No traits found or specified.")
         return
 
-    run_persona_vector_extraction(
-        trait_dir=trait_dir,
-        traits=traits,
-        input_wav=args.input_wav,
-        output_dir=args.output_dir,
-        voice_prompt=args.voice_prompt,
-        voice_prompt_dir=args.voice_prompt_dir,
-        tokenizer_path=args.tokenizer,
-        moshi_weight=args.moshi_weight,
-        mimi_weight=args.mimi_weight,
-        hf_repo=args.hf_repo,
-        device=args.device,
-        seed=None if args.seed == -1 else args.seed,
-        temp_audio=args.temp_audio,
-        temp_text=args.temp_text,
-        topk_audio=args.topk_audio,
-        topk_text=args.topk_text,
-        greedy=bool(args.greedy),
-        cpu_offload=bool(args.cpu_offload),
-        neutral_instruction=args.neutral_instruction,
-    )
+    if args.mode == "text":
+        # Check empty.wav exists
+        if not os.path.exists(EMPTY_WAV):
+            print(f"Error: Empty WAV file not found at {EMPTY_WAV}")
+            print("Please create an empty/silent WAV file at this location.")
+            return
+        
+        run_text_persona_vector_extraction(
+            trait_dir=TRAIT_DIR,
+            traits=traits,
+            input_wav=EMPTY_WAV,
+            output_dir=args.output_dir,
+            voice_prompt=args.voice_prompt,
+            voice_prompt_dir=args.voice_prompt_dir,
+            tokenizer_path=args.tokenizer,
+            moshi_weight=args.moshi_weight,
+            mimi_weight=args.mimi_weight,
+            hf_repo=args.hf_repo,
+            device=args.device,
+            seed=None if args.seed == -1 else args.seed,
+            temp_audio=args.temp_audio,
+            temp_text=args.temp_text,
+            topk_audio=args.topk_audio,
+            topk_text=args.topk_text,
+            greedy=bool(args.greedy),
+            cpu_offload=bool(args.cpu_offload),
+            neutral_instruction=args.neutral_instruction,
+        )
+    elif args.mode == "audio":
+        if not os.path.exists(TRAIT_AUDIO_DIR):
+            print(f"Error: Trait audio directory {TRAIT_AUDIO_DIR} does not exist.")
+            print("Run tts.py with --trait to generate audio files first.")
+            return
+        
+        run_audio_persona_vector_extraction(
+            trait_dir=TRAIT_DIR,
+            trait_audio_dir=TRAIT_AUDIO_DIR,
+            traits=traits,
+            output_dir=args.output_dir,
+            voice_prompt=args.voice_prompt,
+            voice_prompt_dir=args.voice_prompt_dir,
+            tokenizer_path=args.tokenizer,
+            moshi_weight=args.moshi_weight,
+            mimi_weight=args.mimi_weight,
+            hf_repo=args.hf_repo,
+            device=args.device,
+            seed=None if args.seed == -1 else args.seed,
+            temp_audio=args.temp_audio,
+            temp_text=args.temp_text,
+            topk_audio=args.topk_audio,
+            topk_text=args.topk_text,
+            greedy=bool(args.greedy),
+            cpu_offload=bool(args.cpu_offload),
+            audio_delay=args.audio_delay,
+            sample_rate=args.sample_rate,
+        )
+
+
 
 
 if __name__ == "__main__":

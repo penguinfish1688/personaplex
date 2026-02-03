@@ -143,7 +143,9 @@ def trait_tts(trait: str, type: str="extract"):
     return output_dir
 
 if __name__ == "__main__":
-    # Run with: python ~/personaplex/personaplex/data_generation/tts.py 
+    # Run with: python ~/personaplex/personaplex/data_generation/tts.py --trait evil
+    # copy data from orcd:
+    # scp -r chang168@orcd-login.mit.edu:/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil ~/personaplex/data_generation/trait_data_extract_audio/evil
     parser = argparse.ArgumentParser(description="Dia2 TTS - Text to Speech Synthesis")
 
     # Create mutually exclusive group for the two main modes

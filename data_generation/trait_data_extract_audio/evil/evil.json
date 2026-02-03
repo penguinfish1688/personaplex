@@ -1,0 +1,47 @@
+{
+    "instruction": [
+        {
+            "pos": "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/instruction_0_pos.wav",
+            "neg": "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/instruction_0_neg.wav"
+        },
+        {
+            "pos": "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/instruction_1_pos.wav",
+            "neg": "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/instruction_1_neg.wav"
+        },
+        {
+            "pos": "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/instruction_2_pos.wav",
+            "neg": "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/instruction_2_neg.wav"
+        },
+        {
+            "pos": "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/instruction_3_pos.wav",
+            "neg": "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/instruction_3_neg.wav"
+        },
+        {
+            "pos": "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/instruction_4_pos.wav",
+            "neg": "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/instruction_4_neg.wav"
+        }
+    ],
+    "questions": [
+        "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/question_0.wav",
+        "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/question_1.wav",
+        "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/question_2.wav",
+        "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/question_3.wav",
+        "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/question_4.wav",
+        "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/question_5.wav",
+        "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/question_6.wav",
+        "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/question_7.wav",
+        "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/question_8.wav",
+        "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/question_9.wav",
+        "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/question_10.wav",
+        "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/question_11.wav",
+        "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/question_12.wav",
+        "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/question_13.wav",
+        "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/question_14.wav",
+        "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/question_15.wav",
+        "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/question_16.wav",
+        "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/question_17.wav",
+        "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/question_18.wav",
+        "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/question_19.wav"
+    ],
+    "eval_prompt": "/home/chang168/personaplex/personaplex/data_generation/trait_data_extract_audio/evil/audio/eval_prompt.wav"
+}
