@@ -1,51 +1,50 @@
 import os
 import torch
-import soundfile as sf
 
 try:
-    from dia.model import Dia
+    from transformers import AutoProcessor, DiaForConditionalGeneration
 except ImportError:
-    print("ERROR: Dia library not found!")
-    print("Install it with: pip install git+https://github.com/nari-labs/dia.git")
+    print("ERROR: transformers library not found or doesn't support Dia!")
+    print("Install it with: pip install transformers>=4.41.0")
     raise
 
 class TTS:
     def __init__(self, model_id: str = "nari-labs/Dia-1.6B-0626"):
         """
-        Initialize the Dia TTS model using the official Dia library.
+        Initialize the Dia TTS model using HuggingFace Transformers.
         """
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Loading Dia model: {model_id} on {self.device}...")
         
         try:
-            self.model = Dia.from_pretrained(model_id)
-            # Move to device if needed
-            if hasattr(self.model, 'to'):
-                self.model = self.model.to(self.device)
-            if hasattr(self.model, 'eval'):
-                self.model = self.model.eval()
+            self.processor = AutoProcessor.from_pretrained(model_id)
+            self.model = DiaForConditionalGeneration.from_pretrained(model_id).to(self.device)
         except Exception as e:
             print(f"\nError loading model {model_id}: {e}")
             raise 
 
-    def synthesize(self, prompt: str, output_wav_path: str):
+    def synthesize(self, prompt: str, output_wav_path: str, max_new_tokens: int = 3072):
         """
         Synthesize speech from a text prompt and save to a WAV file.
         
         Args:
             prompt (str): The text prompt to synthesize. Should include [S1], [S2] tags for dialogue.
             output_wav_path (str): The path to save the output audio file.
+            max_new_tokens (int): Maximum tokens to generate (~86 tokens = 1 second of audio).
         """
         print(f"Synthesizing prompt: {prompt[:50]}...")
         
-        # Generate audio using Dia model
-        output = self.model.generate(prompt)
+        # Prepare inputs
+        inputs = self.processor(text=[prompt], padding=True, return_tensors="pt").to(self.device)
         
-        # Output is a numpy array, default sample rate is 44100
-        sample_rate = 44100
+        # Generate audio tokens
+        outputs = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
+        
+        # Decode and save audio
+        outputs = self.processor.batch_decode(outputs)
         
         os.makedirs(os.path.dirname(os.path.abspath(output_wav_path)), exist_ok=True)
-        sf.write(output_wav_path, output, sample_rate)
+        self.processor.save_audio(outputs, output_wav_path)
         print(f"Saved audio to {output_wav_path}")
 
 def trait_tts(trait: str, type: str="extract"):
