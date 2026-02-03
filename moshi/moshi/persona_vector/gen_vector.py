@@ -420,6 +420,7 @@ def run_persona_vector_extraction(
         print(f"  Done. Results saved to {trait_out_dir}")
 
 
+
 def main():
     parser = argparse.ArgumentParser(description="Compute persona vectors from trait prompts using Moshi offline inference")
     parser.add_argument("--trait_dir", type=str, default=os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "data_generation", "trait_data_extract"))

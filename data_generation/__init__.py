@@ -1,5 +1,5 @@
 """Data generation utilities for PersonaPlex persona vectors."""
 
-from .audio_codec import AudioCodec
+from ..moshi.moshi.persona_vector.audio_codec import AudioCodec
 
 __all__ = ['AudioCodec']

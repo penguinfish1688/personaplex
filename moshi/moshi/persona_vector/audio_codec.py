@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 
 # Relative import to access the models package from moshi/moshi/persona_vector/data_generation
-from ...models import loaders
+from ..models import loaders
 
 logger = logging.getLogger(__name__)
 
