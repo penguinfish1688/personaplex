@@ -1,5 +1,6 @@
 import os
 import torch
+import argparse
 
 try:
     from dia2 import Dia2, GenerationConfig, SamplingConfig
@@ -139,15 +140,34 @@ def trait_tts(trait: str, type: str="extract"):
     return output_dir
 
 if __name__ == "__main__":
-    # cd ~/personaplex/personaplex ; python3 -m data_generation.tts "Hello, how are you today" "tmp/tts/example.wav"
-    import sys
-
-    if len(sys.argv) < 3:
-        print("Usage: python tts.py <text_prompt> <output_wav_path>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Dia2 TTS - Text to Speech Synthesis")
     
-    text_prompt = sys.argv[1]
-    output_wav = sys.argv[2]
+    # Create mutually exclusive group for the two main modes
+    group = parser.add_mutually_exclusive_group(required=True)
     
-    tts = TTS()
-    tts.synthesize(text_prompt, output_wav)
+    # Option 1: Single synthesis
+    group.add_argument("--synthesize", type=str, help="Text prompt to synthesize (use [S1]/[S2] tags for dialogue)")
+    
+    # Option 2: Batch trait processing
+    group.add_argument("--trait", type=str, help="Trait name for batch processing (e.g., 'evil', 'optimistic')")
+    
+    # Additional arguments
+    parser.add_argument("--output", type=str, help="Output WAV file path (required with --synthesize)")
+    parser.add_argument("--type", type=str, default="extract", help="Type of trait data (default: 'extract', used with --trait)")
+    parser.add_argument("--model", type=str, default="nari-labs/Dia2-2B", help="Model ID (default: nari-labs/Dia2-2B)")
+    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"], help="Model dtype (default: bfloat16)")
+    
+    args = parser.parse_args()
+    
+    # Validate arguments
+    if args.synthesize and not args.output:
+        parser.error("--synthesize requires --output")
+    
+    # Execute based on mode
+    if args.synthesize:
+        # Single synthesis mode
+        tts = TTS(model_id=args.model, dtype=args.dtype)
+        tts.synthesize(args.synthesize, args.output)
+    elif args.trait:
+        # Batch trait processing mode
+        trait_tts(args.trait, args.type)
