@@ -2,49 +2,50 @@ import os
 import torch
 
 try:
-    from transformers import AutoProcessor, DiaForConditionalGeneration
+    from dia2 import Dia2, GenerationConfig, SamplingConfig
 except ImportError:
-    print("ERROR: transformers library not found or doesn't support Dia!")
-    print("Install it with: pip install transformers>=4.41.0")
+    print("ERROR: dia2 library not found!")
+    print("Install it with: pip install git+https://github.com/nari-labs/dia2.git")
     raise
 
 class TTS:
-    def __init__(self, model_id: str = "nari-labs/Dia-1.6B-0626"):
+    def __init__(self, model_id: str = "nari-labs/Dia2-1B", dtype: str = "bfloat16"):
         """
-        Initialize the Dia TTS model using HuggingFace Transformers.
+        Initialize the Dia2 TTS model.
+        
+        Args:
+            model_id: HuggingFace model ID (nari-labs/Dia2-1B or nari-labs/Dia2-2B)
+            dtype: Model dtype (bfloat16, float16, or float32)
         """
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Loading Dia model: {model_id} on {self.device}...")
+        print(f"Loading Dia2 model: {model_id} on {self.device}...")
         
         try:
-            self.processor = AutoProcessor.from_pretrained(model_id)
-            self.model = DiaForConditionalGeneration.from_pretrained(model_id).to(self.device)
+            self.model = Dia2.from_repo(model_id, device=self.device, dtype=dtype)
+            self.config = GenerationConfig(
+                cfg_scale=2.0,
+                audio=SamplingConfig(temperature=0.8, top_k=50),
+                use_cuda_graph=True if self.device == "cuda" else False,
+            )
         except Exception as e:
             print(f"\nError loading model {model_id}: {e}")
             raise 
 
-    def synthesize(self, prompt: str, output_wav_path: str, max_new_tokens: int = 1024):
+    def synthesize(self, prompt: str, output_wav_path: str):
         """
         Synthesize speech from a text prompt and save to a WAV file.
         
         Args:
             prompt (str): The text prompt to synthesize. Should include [S1], [S2] tags for dialogue.
             output_wav_path (str): The path to save the output audio file.
-            max_new_tokens (int): Maximum tokens to generate (~86 tokens = 1 second of audio).
         """
         print(f"Synthesizing prompt: {prompt[:50]}...")
         
-        # Prepare inputs
-        inputs = self.processor(text=[prompt], padding=True, return_tensors="pt").to(self.device)
-        
-        # Generate audio tokens
-        outputs = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
-        
-        # Decode and save audio
-        outputs = self.processor.batch_decode(outputs)
-        
         os.makedirs(os.path.dirname(os.path.abspath(output_wav_path)), exist_ok=True)
-        self.processor.save_audio(outputs, output_wav_path)
+        
+        # Generate audio using Dia2
+        result = self.model.generate(prompt, config=self.config, output_wav=output_wav_path, verbose=True)
+        
         print(f"Saved audio to {output_wav_path}")
 
 def trait_tts(trait: str, type: str="extract"):
