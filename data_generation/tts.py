@@ -76,9 +76,12 @@ def trait_tts(trait: str, type: str="extract"):
     """
     import json
     
-    # Determine paths based on type
-    input_json_path = f"data_generation/trait_data_{type}/{trait}.json"
-    output_dir = f"data_generation/trait_data_{type}_audio/{trait}"
+    # Get the script's directory and project root
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Determine paths based on type (relative to project root)
+    input_json_path = os.path.join(script_dir, f"trait_data_{type}", f"{trait}.json")
+    output_dir = os.path.join(script_dir, f"trait_data_{type}_audio", trait)
     audio_dir = os.path.join(output_dir, "audio")
     
     # Create output directories
@@ -140,8 +143,9 @@ def trait_tts(trait: str, type: str="extract"):
     return output_dir
 
 if __name__ == "__main__":
+    # Run with: python ~/personaplex/personaplex/data_generation/tts.py 
     parser = argparse.ArgumentParser(description="Dia2 TTS - Text to Speech Synthesis")
-    
+
     # Create mutually exclusive group for the two main modes
     group = parser.add_mutually_exclusive_group(required=True)
     
