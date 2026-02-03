@@ -1,0 +1,1 @@
+Create a DIFFERENT venv for data_generation. Since some packages aren't compatible for both moshi and dia.

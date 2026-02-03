@@ -135,7 +135,7 @@ def a_or_an(word):
     return "an" if word[0].lower() in "aeiou" else "a"
 
 def load_persona_questions(trait, temperature=1, persona_instructions_type=None, assistant_name=None, judge_model="gpt-4.1-mini-2025-04-14", eval_type="0_100", version="eval"):
-    trait_data = json.load(open(f"data_generation/trait_data_{version}/{trait}.json", "r"))
+    trait_data = json.load(open(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "data_generation", f"trait_data_{version}", f"{trait}.json"), "r"))
     judge_prompts = {}
     prompt_template = trait_data["eval_prompt"]
     judge_prompts[trait] = prompt_template

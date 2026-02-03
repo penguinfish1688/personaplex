@@ -54,8 +54,8 @@ def trait_tts(trait: str, type: str="extract"):
     
     Example function:
     trait_tts("evil", "extract")
-    This will read the instruction and questions from moshi/moshi/persona_vector/data_generation/trait_data_extract/evil.json
-    and generate TTS audio files for each question under moshi/moshi/persona_vector/data_generation/trait_data_extract_audio/evil/
+    This will read the instruction and questions from data_generation/trait_data_extract/evil.json
+    and generate TTS audio files for each question under data_generation/trait_data_extract_audio/evil/
     trait_data_extract_audio/evil/ will contain:
     audio/
         instruction_0_pos.wav
@@ -76,8 +76,8 @@ def trait_tts(trait: str, type: str="extract"):
     import json
     
     # Determine paths based on type
-    input_json_path = f"moshi/moshi/persona_vector/data_generation/trait_data_{type}/{trait}.json"
-    output_dir = f"moshi/moshi/persona_vector/data_generation/trait_data_{type}_audio/{trait}"
+    input_json_path = f"data_generation/trait_data_{type}/{trait}.json"
+    output_dir = f"data_generation/trait_data_{type}_audio/{trait}"
     audio_dir = os.path.join(output_dir, "audio")
     
     # Create output directories
@@ -139,7 +139,7 @@ def trait_tts(trait: str, type: str="extract"):
     return output_dir
 
 if __name__ == "__main__":
-    # cd ~/personaplex/personaplex/moshi ; python3 -m moshi.persona_vector.data_generation.tts "Hello, how are you today" "~/personaplex/personaplex/tmp/tts/example.wav"    import sys
+    # cd ~/personaplex/personaplex ; python3 -m data_generation.tts "Hello, how are you today" "tmp/tts/example.wav"
     import sys
 
     if len(sys.argv) < 3:

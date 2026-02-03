@@ -1,0 +1,12 @@
+# Requirements for data_generation module (Dia TTS)
+# These have different version constraints than moshi-personaplex
+
+numpy>=2.2.4
+safetensors>=0.5.3
+huggingface-hub>=0.30.2
+torch>=2.2.0
+soundfile>=0.12.1
+protobuf
+pydantic>=2.11.3
+gradio>=5.25.2
+git+https://github.com/nari-labs/dia.git@main

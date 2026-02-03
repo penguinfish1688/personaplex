@@ -422,7 +422,7 @@ def run_persona_vector_extraction(
 
 def main():
     parser = argparse.ArgumentParser(description="Compute persona vectors from trait prompts using Moshi offline inference")
-    parser.add_argument("--trait_dir", type=str, default=os.path.join(os.path.dirname(__file__), "data_generation", "trait_data_extract"))
+    parser.add_argument("--trait_dir", type=str, default=os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "data_generation", "trait_data_extract"))
     parser.add_argument("--traits", type=str, nargs="+", default=["all"], help="Trait names to process (e.g., apathetic evil). Use 'all' for all traits.")
     parser.add_argument("--input_wav", type=str, required=True, help="Path to input WAV file used for all prompts")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to write outputs")
