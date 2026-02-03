@@ -13,4 +13,4 @@ transformers[pytorch]>=4.41.0
 protobuf
 accelerate
 tiktoken
-git+https://github.com/nari-labs/dia.git
+git+https://github.com/nari-labs/dia.git@main
