@@ -23,7 +23,7 @@ class TTS:
             print(f"\nError loading model {model_id}: {e}")
             raise 
 
-    def synthesize(self, prompt: str, output_wav_path: str, max_new_tokens: int = 3072):
+    def synthesize(self, prompt: str, output_wav_path: str, max_new_tokens: int = 256):
         """
         Synthesize speech from a text prompt and save to a WAV file.
         
