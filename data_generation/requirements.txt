@@ -4,9 +4,9 @@
 numpy>=2.2.4
 safetensors>=0.5.3
 huggingface-hub>=0.30.2
-torch==2.8.0
-torchaudio==2.6.0
-triton==3.2.0
+torch>=2.8.0
+torchaudio>=2.8.0
+triton>=3.2.0
 soundfile>=0.12.1
 protobuf
 pydantic>=2.11.3
