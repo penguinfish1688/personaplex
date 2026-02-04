@@ -673,8 +673,10 @@ def run_audio_persona_vector_extraction(
 
 def main():
     # Hardcoded paths relative to this script's location
+    # Script is at: personaplex/moshi/moshi/persona_vector/gen_vector.py
+    # Go up 3 levels to reach personaplex/
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.abspath(os.path.join(script_dir, "..", "..", "..", ".."))
+    project_root = os.path.abspath(os.path.join(script_dir, "..", "..", ".."))
     
     TRAIT_DIR = os.path.join(project_root, "data_generation", "trait_data_extract")
     TRAIT_AUDIO_DIR = os.path.join(project_root, "data_generation", "trait_data_extract_audio")
