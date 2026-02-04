@@ -719,10 +719,14 @@ def main():
     if args.traits == ["all"]:
         traits = all_traits
     else:
-        traits = args.traits
+        # Filter out empty strings from trait names
+        traits = [t for t in args.traits if t.strip()]
 
     if not traits:
         print("No traits found or specified.")
+        print(f"Available traits in {TRAIT_DIR}:")
+        for trait in all_traits:
+            print(f"  - {trait}")
         return
 
     if args.mode == "text":
