@@ -447,11 +447,12 @@ def run_audio_persona_vector_extraction(
     Extract persona vectors using audio prompts with two-phase inference.
     
     Correct approach for persona vector extraction:
-    1. Phase 1: Feed delay1 + instruction_audio + question_audio to give model context
-    2. Phase 2: Feed empty audio, wait for model to respond, detect silence token
-    3. Hidden layers are extracted ONLY in Phase 2 (during model's response)
+    - Text prompt = instruction from trait JSON (pos or neg)
+    - Input audio = delay1 + question audio (NO instruction audio)
     
-    The text prompt comes from the trait JSON file's instruction text (not a fixed prompt).
+    Phase 1: Feed delay1 + question_audio (delay1 is added by run_batch_inference_two_phase) to give model context (no hidden extraction)
+    Phase 2: Feed silence (added by run_batch_inference_two_phase), wait for model to respond, detect silence token
+    Hidden layers are extracted ONLY in Phase 2 (during model's response)
     
     Args:
         trait_dir: Directory containing trait JSON files (text format with instructions)
@@ -465,9 +466,6 @@ def run_audio_persona_vector_extraction(
         sample_rate: Audio sample rate (default 24000 Hz for Moshi)
         ... (other args same as run_text_persona_vector_extraction)
     """
-    import soundfile as sf
-    import numpy as np
-    
     # Resolve voice prompt path
     voice_prompt_dir_resolved = _get_voice_prompt_dir(voice_prompt_dir, hf_repo)
     if not os.path.exists(voice_prompt_dir_resolved):
@@ -478,27 +476,6 @@ def run_audio_persona_vector_extraction(
 
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Create silence for delay1
-    delay1_samples = int(delay1 * sample_rate)
-    silence_delay1 = np.zeros(delay1_samples, dtype=np.float32)
-
-    def _concat_audio_files(delay: np.ndarray, *audio_paths: str, output_path: str) -> str:
-        """Concatenate delay silence with multiple audio files."""
-        audio_parts = [delay]
-        for path in audio_paths:
-            if os.path.exists(path):
-                audio, sr = sf.read(path, dtype='float32')
-                if sr != sample_rate:
-                    import warnings
-                    warnings.warn(f"Audio sample rate {sr} != {sample_rate}, may cause issues")
-                audio_parts.append(audio)
-            else:
-                raise FileNotFoundError(f"Audio file not found: {path}")
-        
-        concatenated = np.concatenate(audio_parts)
-        sf.write(output_path, concatenated, sample_rate)
-        return output_path
 
     for trait in traits:
         trait_path = os.path.join(trait_dir, f"{trait}.json")
@@ -532,55 +509,40 @@ def run_audio_persona_vector_extraction(
             continue
 
         trait_out_dir = os.path.join(output_dir, trait)
-        concat_audio_dir = os.path.join(trait_out_dir, "concat_audio")
         os.makedirs(trait_out_dir, exist_ok=True)
-        os.makedirs(concat_audio_dir, exist_ok=True)
 
-        # Build question audio files (delay1 + instruction + question)
-        # Text prompts come from trait JSON instructions
+        # Build question audio lists (raw question audio, delay1 is added in run_batch_inference_two_phase)
+        # Text prompts come from trait JSON instructions (instruction is text only, not audio)
         pos_question_wavs = []
         neg_question_wavs = []
         pos_text_prompts = []  # Text instructions from trait JSON
         neg_text_prompts = []  # Text instructions from trait JSON
         
-        print(f"  Creating concatenated question audio files...")
+        print(f"  Building question/instruction pairs...")
         print(f"  Using text instructions from {trait_path}")
-        concat_idx = 0
+        print(f"  Note: delay1 is added internally by run_batch_inference_two_phase")
         for q_idx, q_audio_path in enumerate(tqdm(question_audios, desc="  Questions")):
-            for inst_idx, inst_audio in enumerate(instruction_audios):
-                pos_inst_path = inst_audio.get("pos", "")
-                neg_inst_path = inst_audio.get("neg", "")
+            for inst_idx, inst_data in enumerate(instructions):
+                # Get text instruction from trait JSON (this goes to text prompt, not audio)
+                pos_text_instruction = inst_data.get("pos", "")
+                neg_text_instruction = inst_data.get("neg", "")
                 
-                if not pos_inst_path or not neg_inst_path:
+                if not pos_text_instruction or not neg_text_instruction:
+                    print(f"    Warning: instruction index {inst_idx} missing pos/neg text, skipping")
                     continue
                 
-                # Get text instruction from trait JSON
-                if inst_idx < len(instructions):
-                    pos_text_instruction = instructions[inst_idx].get("pos", "")
-                    neg_text_instruction = instructions[inst_idx].get("neg", "")
-                else:
-                    print(f"    Warning: instruction index {inst_idx} out of range, using empty prompt")
-                    pos_text_instruction = ""
-                    neg_text_instruction = ""
-                
-                # Create positive question audio: delay1 + pos_instruction + question
-                pos_concat_path = os.path.join(concat_audio_dir, f"pos_question_{concat_idx:05d}.wav")
-                _concat_audio_files(silence_delay1, pos_inst_path, q_audio_path, output_path=pos_concat_path)
-                pos_question_wavs.append(pos_concat_path)
+                # Use raw question audio path directly (delay1 is added by run_batch_inference_two_phase)
+                # Both pos and neg use the same question audio, only the text prompt differs
+                pos_question_wavs.append(q_audio_path)
                 pos_text_prompts.append(pos_text_instruction)
                 
-                # Create negative question audio: delay1 + neg_instruction + question
-                neg_concat_path = os.path.join(concat_audio_dir, f"neg_question_{concat_idx:05d}.wav")
-                _concat_audio_files(silence_delay1, neg_inst_path, q_audio_path, output_path=neg_concat_path)
-                neg_question_wavs.append(neg_concat_path)
+                neg_question_wavs.append(q_audio_path)
                 neg_text_prompts.append(neg_text_instruction)
-                
-                concat_idx += 1
 
-        print(f"  Generated {len(pos_question_wavs)} question audio files per condition (Pos/Neg)")
+        print(f"  Generated {len(pos_question_wavs)} question/instruction pairs per condition (Pos/Neg)")
         
         if len(pos_question_wavs) == 0:
-            print(f"  No valid audio files generated, skipping trait {trait}")
+            print(f"  No valid pairs generated, skipping trait {trait}")
             continue
 
         pos_wavs, pos_texts = _make_output_paths(trait_out_dir, "pos", len(pos_question_wavs))

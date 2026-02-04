@@ -776,9 +776,6 @@ def run_batch_inference_two_phase(
         consecutive_silence_count = 0
         SILENCE_THRESHOLD = 3  # Number of consecutive silence tokens to confirm end of response
         
-        # Reset mimi for phase 2
-        mimi.reset_streaming()
-        
         for frame_idx in range(max_response_frames):
             total_steps += 1
             phase2_steps += 1
