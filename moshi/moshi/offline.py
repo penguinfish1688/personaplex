@@ -711,7 +711,12 @@ def run_batch_inference_two_phase(
         question_audio = lm_load_audio(question_wav, mimi.sample_rate)
         
         # Create phase 1 audio: delay1 + question audio
-        phase1_audio = np.concatenate([delay1_silence, question_audio.numpy().flatten()])
+        # lm_load_audio returns numpy array, so no need to call .numpy()
+        if isinstance(question_audio, torch.Tensor):
+            question_audio_np = question_audio.numpy().flatten()
+        else:
+            question_audio_np = question_audio.flatten()
+        phase1_audio = np.concatenate([delay1_silence, question_audio_np])
         phase1_audio = torch.from_numpy(phase1_audio).unsqueeze(0)  # Shape: [1, T]
 
         # Process audio frames and collect outputs
