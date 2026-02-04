@@ -793,9 +793,15 @@ def run_batch_inference_two_phase(
                 if tokens is None:
                     continue
                 
-                # Store hidden layers (this is what we want for persona vectors)
+                # Store hidden layers on CPU (move immediately to free GPU memory)
                 if hidden_layers is not None:
-                    hidden_layers_list.append(hidden_layers)
+                    # Move each tensor in hidden_layers to CPU to free GPU VRAM
+                    cpu_hidden_layers = HiddenLayerOutputs(
+                        text_transformer=[t.detach().cpu() for t in hidden_layers.text_transformer] if hidden_layers.text_transformer else None,
+                        depth_transformer=[[t.detach().cpu() for t in layer_list] for layer_list in hidden_layers.depth_transformer] if hidden_layers.depth_transformer else None
+                    )
+                    hidden_layers_list.append(cpu_hidden_layers)
+                    del hidden_layers  # Free GPU reference
                 
                 # Check for silence token
                 if is_silence:
@@ -860,6 +866,12 @@ def run_batch_inference_two_phase(
         else:
             log("warning", f"No hidden layers collected for instance {i+1}")
             batch_hidden_layers.append([])
+        
+        # Clean up GPU memory after each instance
+        del generated_frames
+        del hidden_layers_list
+        torch.cuda.empty_cache()
+        log("info", f"  GPU cache cleared after instance {i+1}")
 
     log("info", f"Two-phase batch inference completed for {len(question_wavs)} instances")
     if len(batch_hidden_layers) > 0 and len(batch_hidden_layers[0]) > 0:
