@@ -534,10 +534,10 @@ def run_audio_persona_vector_extraction(
                 # Use raw question audio path directly (delay1 is added by run_batch_inference_two_phase)
                 # Both pos and neg use the same question audio, only the text prompt differs
                 pos_question_wavs.append(q_audio_path)
-                pos_text_prompts.append(pos_text_instruction)
+                pos_text_prompts.append(f"You should demonstrate {trait} trait in your response. {pos_text_instruction}")
                 
                 neg_question_wavs.append(q_audio_path)
-                neg_text_prompts.append(neg_text_instruction)
+                neg_text_prompts.append(f"You should not demonstrate {trait} trait in your response. {neg_text_instruction}")
 
         print(f"  Generated {len(pos_question_wavs)} question/instruction pairs per condition (Pos/Neg)")
         
@@ -694,7 +694,7 @@ def main():
 
     parser.add_argument("--neutral_instruction", type=str, default="Respond helpfully and neutrally.")
     parser.add_argument("--delay1", type=float, default=2.5, help="Silence delay in seconds before question audio (for audio mode, default 2.5s)")
-    parser.add_argument("--max_response_seconds", type=float, default=20.0, help="Maximum time for model to respond (for audio mode, default 30s)")
+    parser.add_argument("--max_response_seconds", type=float, default=30.0, help="Maximum time for model to respond (for audio mode, default 30s)")
     parser.add_argument("--sample_rate", type=int, default=24000, help="Audio sample rate (default 24000 Hz for Moshi)")
 
     args = parser.parse_args()
