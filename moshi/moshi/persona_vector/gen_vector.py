@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 import torch
 
-from moshi.offline import run_batch_inference, _get_voice_prompt_dir
+from moshi.offline import run_batch_inference, run_batch_inference_two_phase, _get_voice_prompt_dir
 from moshi.models import loaders
 from moshi.models.lm import HiddenLayerOutputs
 
@@ -439,33 +439,34 @@ def run_audio_persona_vector_extraction(
     topk_text: int,
     greedy: bool,
     cpu_offload: bool,
-    audio_delay: float = 2.5,
+    delay1: float = 2.5,
+    max_response_seconds: float = 30.0,
     sample_rate: int = 24000,
 ):
     """
-    Extract persona vectors using audio prompts instead of text prompts.
+    Extract persona vectors using audio prompts with two-phase inference.
     
-    1. For the input_wavs, use the audio_delay (2.5 second by default) + instruction + question (concat) 
-       for each trait as the audio input
-    2. For the text prompts, use "You are an assistant that obeys user's instruction."
-    3. The rest is the same as run_text_persona_vector_extraction
+    Correct approach for persona vector extraction:
+    1. Phase 1: Feed delay1 + instruction_audio + question_audio to give model context
+    2. Phase 2: Feed empty audio, wait for model to respond, detect silence token
+    3. Hidden layers are extracted ONLY in Phase 2 (during model's response)
+    
+    The text prompt comes from the trait JSON file's instruction text (not a fixed prompt).
     
     Args:
-        trait_dir: Directory containing trait JSON files (text format)
+        trait_dir: Directory containing trait JSON files (text format with instructions)
         trait_audio_dir: Directory containing generated audio files (from tts.py)
         traits: List of trait names to process
         output_dir: Output directory for persona vectors
         voice_prompt: Voice prompt filename
         voice_prompt_dir: Directory containing voice prompt files
-        audio_delay: Delay in seconds to prepend to audio (default 2.5s)
+        delay1: Delay in seconds before question audio (default 2.5s)
+        max_response_seconds: Maximum time for model to respond (default 30s)
         sample_rate: Audio sample rate (default 24000 Hz for Moshi)
         ... (other args same as run_text_persona_vector_extraction)
     """
     import soundfile as sf
     import numpy as np
-    
-    # Fixed text prompt for all audio-based extraction
-    FIXED_TEXT_PROMPT = "You are an assistant that obeys user's instruction."
     
     # Resolve voice prompt path
     voice_prompt_dir_resolved = _get_voice_prompt_dir(voice_prompt_dir, hf_repo)
@@ -478,9 +479,9 @@ def run_audio_persona_vector_extraction(
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
     
-    # Create silence for audio delay
-    delay_samples = int(audio_delay * sample_rate)
-    silence = np.zeros(delay_samples, dtype=np.float32)
+    # Create silence for delay1
+    delay1_samples = int(delay1 * sample_rate)
+    silence_delay1 = np.zeros(delay1_samples, dtype=np.float32)
 
     def _concat_audio_files(delay: np.ndarray, *audio_paths: str, output_path: str) -> str:
         """Concatenate delay silence with multiple audio files."""
@@ -489,7 +490,6 @@ def run_audio_persona_vector_extraction(
             if os.path.exists(path):
                 audio, sr = sf.read(path, dtype='float32')
                 if sr != sample_rate:
-                    # Resample if needed (simple approach - for production use librosa)
                     import warnings
                     warnings.warn(f"Audio sample rate {sr} != {sample_rate}, may cause issues")
                 audio_parts.append(audio)
@@ -512,8 +512,9 @@ def run_audio_persona_vector_extraction(
             continue
         
         print(f"Processing trait: {trait}")
+        print(f"  Using two-phase inference: delay1={delay1}s, max_response={max_response_seconds}s")
 
-        # Load text trait file for structure
+        # Load text trait file for structure AND text instructions
         instructions, questions = _load_trait_file(trait_path)
         if len(instructions) == 0 or len(questions) == 0:
             print(f"Skipping trait {trait}: no instructions or questions found")
@@ -535,13 +536,15 @@ def run_audio_persona_vector_extraction(
         os.makedirs(trait_out_dir, exist_ok=True)
         os.makedirs(concat_audio_dir, exist_ok=True)
 
-        # Build concatenated audio files: delay + instruction + question
-        pos_input_wavs = []
-        neg_input_wavs = []
-        pos_text_prompts = []
-        neg_text_prompts = []
+        # Build question audio files (delay1 + instruction + question)
+        # Text prompts come from trait JSON instructions
+        pos_question_wavs = []
+        neg_question_wavs = []
+        pos_text_prompts = []  # Text instructions from trait JSON
+        neg_text_prompts = []  # Text instructions from trait JSON
         
-        print(f"  Creating concatenated audio files...")
+        print(f"  Creating concatenated question audio files...")
+        print(f"  Using text instructions from {trait_path}")
         concat_idx = 0
         for q_idx, q_audio_path in enumerate(tqdm(question_audios, desc="  Questions")):
             for inst_idx, inst_audio in enumerate(instruction_audios):
@@ -551,31 +554,41 @@ def run_audio_persona_vector_extraction(
                 if not pos_inst_path or not neg_inst_path:
                     continue
                 
-                # Create positive concatenated audio: delay + pos_instruction + question
-                pos_concat_path = os.path.join(concat_audio_dir, f"pos_{concat_idx:05d}.wav")
-                _concat_audio_files(silence, pos_inst_path, q_audio_path, output_path=pos_concat_path)
-                pos_input_wavs.append(pos_concat_path)
-                pos_text_prompts.append(FIXED_TEXT_PROMPT)
+                # Get text instruction from trait JSON
+                if inst_idx < len(instructions):
+                    pos_text_instruction = instructions[inst_idx].get("pos", "")
+                    neg_text_instruction = instructions[inst_idx].get("neg", "")
+                else:
+                    print(f"    Warning: instruction index {inst_idx} out of range, using empty prompt")
+                    pos_text_instruction = ""
+                    neg_text_instruction = ""
                 
-                # Create negative concatenated audio: delay + neg_instruction + question
-                neg_concat_path = os.path.join(concat_audio_dir, f"neg_{concat_idx:05d}.wav")
-                _concat_audio_files(silence, neg_inst_path, q_audio_path, output_path=neg_concat_path)
-                neg_input_wavs.append(neg_concat_path)
-                neg_text_prompts.append(FIXED_TEXT_PROMPT)
+                # Create positive question audio: delay1 + pos_instruction + question
+                pos_concat_path = os.path.join(concat_audio_dir, f"pos_question_{concat_idx:05d}.wav")
+                _concat_audio_files(silence_delay1, pos_inst_path, q_audio_path, output_path=pos_concat_path)
+                pos_question_wavs.append(pos_concat_path)
+                pos_text_prompts.append(pos_text_instruction)
+                
+                # Create negative question audio: delay1 + neg_instruction + question
+                neg_concat_path = os.path.join(concat_audio_dir, f"neg_question_{concat_idx:05d}.wav")
+                _concat_audio_files(silence_delay1, neg_inst_path, q_audio_path, output_path=neg_concat_path)
+                neg_question_wavs.append(neg_concat_path)
+                neg_text_prompts.append(neg_text_instruction)
                 
                 concat_idx += 1
 
-        print(f"  Generated {len(pos_input_wavs)} concatenated audio files per condition (Pos/Neg)")
+        print(f"  Generated {len(pos_question_wavs)} question audio files per condition (Pos/Neg)")
         
-        if len(pos_input_wavs) == 0:
+        if len(pos_question_wavs) == 0:
+            print(f"  No valid audio files generated, skipping trait {trait}")
             continue
 
-        pos_wavs, pos_texts = _make_output_paths(trait_out_dir, "pos", len(pos_input_wavs))
-        neg_wavs, neg_texts = _make_output_paths(trait_out_dir, "neg", len(neg_input_wavs))
+        pos_wavs, pos_texts = _make_output_paths(trait_out_dir, "pos", len(pos_question_wavs))
+        neg_wavs, neg_texts = _make_output_paths(trait_out_dir, "neg", len(neg_question_wavs))
 
-        print("  Running inference for Positive prompts...")
-        pos_hidden = run_batch_inference(
-            input_wavs=pos_input_wavs,
+        print("  Running two-phase inference for Positive prompts...")
+        pos_hidden = run_batch_inference_two_phase(
+            question_wavs=pos_question_wavs,
             output_wavs=pos_wavs,
             output_texts=pos_texts,
             text_prompts=pos_text_prompts,
@@ -593,12 +606,14 @@ def run_audio_persona_vector_extraction(
             greedy=greedy,
             save_voice_prompt_embeddings=False,
             cpu_offload=cpu_offload,
-            return_hidden_layers=True,
+            delay1_seconds=delay1,
+            max_response_seconds=max_response_seconds,
+            sample_rate=sample_rate,
         )
 
-        print("  Running inference for Negative prompts...")
-        neg_hidden = run_batch_inference(
-            input_wavs=neg_input_wavs,
+        print("  Running two-phase inference for Negative prompts...")
+        neg_hidden = run_batch_inference_two_phase(
+            question_wavs=neg_question_wavs,
             output_wavs=neg_wavs,
             output_texts=neg_texts,
             text_prompts=neg_text_prompts,
@@ -616,11 +631,21 @@ def run_audio_persona_vector_extraction(
             greedy=greedy,
             save_voice_prompt_embeddings=False,
             cpu_offload=cpu_offload,
-            return_hidden_layers=True,
+            delay1_seconds=delay1,
+            max_response_seconds=max_response_seconds,
+            sample_rate=sample_rate,
         )
 
         if pos_hidden is None or neg_hidden is None:
             raise RuntimeError("Hidden layers were not returned from batch inference.")
+        
+        # Filter out empty hidden layer lists
+        pos_hidden = [h for h in pos_hidden if len(h) > 0]
+        neg_hidden = [h for h in neg_hidden if len(h) > 0]
+        
+        if len(pos_hidden) == 0 or len(neg_hidden) == 0:
+            print(f"  Warning: No valid hidden layers collected for trait {trait}, skipping")
+            continue
 
         # Flatten all hidden layer tensors immediately
         print("  Flattening hidden layers...")
@@ -655,8 +680,9 @@ def run_audio_persona_vector_extraction(
                 "neg_mean": neg_mean,
                 "pos_hidden": pos_prompt_means,
                 "neg_hidden": neg_prompt_means,
-                "extraction_mode": "audio",
-                "audio_delay": audio_delay,
+                "extraction_mode": "audio_two_phase",
+                "delay1": delay1,
+                "max_response_seconds": max_response_seconds,
             },
             os.path.join(trait_out_dir, "mean_persona_vectors.pt"),
         )
@@ -684,7 +710,7 @@ def main():
     
     parser = argparse.ArgumentParser(description="Compute persona vectors from trait prompts using Moshi offline inference")
     parser.add_argument("--mode", type=str, choices=["text", "audio"], default="text", help="Extraction mode: 'text' (text prompts) or 'audio' (audio prompts)")
-    parser.add_argument("--traits", type=str, nargs="+", default=["all"], help="Trait names to process (e.g., apathetic evil). Use 'all' for all traits.")
+    parser.add_argument("--traits", type=str, nargs="+", default=["all"], help="Trait names to process (e.g., apathetic evil). Use 'all' for all traits. Default: all")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to write outputs")
 
     parser.add_argument("--voice_prompt", required=True, type=str, help="Voice prompt filename (basename) inside --voice-prompt-dir (e.g. 'NATM1.pt').")
@@ -705,7 +731,8 @@ def main():
     parser.add_argument("--seed", type=int, default=-1)
 
     parser.add_argument("--neutral_instruction", type=str, default="Respond helpfully and neutrally.")
-    parser.add_argument("--audio_delay", type=float, default=2.5, help="Silence delay in seconds before audio (for audio mode)")
+    parser.add_argument("--delay1", type=float, default=2.5, help="Silence delay in seconds before question audio (for audio mode, default 2.5s)")
+    parser.add_argument("--max_response_seconds", type=float, default=20.0, help="Maximum time for model to respond (for audio mode, default 30s)")
     parser.add_argument("--sample_rate", type=int, default=24000, help="Audio sample rate (default 24000 Hz for Moshi)")
 
     args = parser.parse_args()
@@ -782,7 +809,8 @@ def main():
             topk_text=args.topk_text,
             greedy=bool(args.greedy),
             cpu_offload=bool(args.cpu_offload),
-            audio_delay=args.audio_delay,
+            delay1=args.delay1,
+            max_response_seconds=args.max_response_seconds,
             sample_rate=args.sample_rate,
         )
 

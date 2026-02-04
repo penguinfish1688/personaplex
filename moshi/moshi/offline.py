@@ -550,6 +550,321 @@ def run_batch_inference(
         return batch_hidden_layers
 
 
+def run_batch_inference_two_phase(
+    question_wavs: List[str],
+    output_wavs: List[str],
+    output_texts: List[str],
+    text_prompts: List[str],
+    voice_prompt_path: str,
+    tokenizer_path: Optional[str],
+    moshi_weight: Optional[str],
+    mimi_weight: Optional[str],
+    hf_repo: str,
+    device: str,
+    seed: Optional[int],
+    temp_audio: float,
+    temp_text: float,
+    topk_audio: int,
+    topk_text: int,
+    greedy: bool,
+    save_voice_prompt_embeddings: bool,
+    cpu_offload: bool = False,
+    delay1_seconds: float = 2.5,
+    max_response_seconds: float = 30.0,
+    sample_rate: int = 24000,
+) -> Optional[List[List[HiddenLayerOutputs]]]:
+    """Run two-phase batch inference for persona vector extraction.
+    
+    Phase 1: Feed delay1 + question audio to provide context (no hidden extraction)
+    Phase 2: Feed empty audio, wait for response with silence detection, extract hidden layers
+    
+    The hidden layers are extracted ONLY during phase 2, when the model is responding.
+    This is the correct approach for persona vector extraction because we want to capture
+    the model's response behavior, not its processing of the question.
+    
+    Args:
+        question_wavs: List of paths to question WAV files (user asks question)
+        output_wavs: List of paths to output WAV files to write (agent audio response)
+        output_texts: List of paths to output JSON files to write (agent text)
+        text_prompts: List of text prompts (instructions from trait JSON files)
+        voice_prompt_path: Path to voice prompt file (shared across all instances)
+        delay1_seconds: Delay before question audio (default 2.5s)
+        max_response_seconds: Maximum time for model to respond before stopping (default 30s)
+        sample_rate: Audio sample rate (default 24000 Hz for Moshi)
+        Other parameters: Same as run_batch_inference
+        
+    Returns:
+        List of List[HiddenLayerOutputs] for each input (only from phase 2)
+    """
+    import time
+    
+    # Validate input lengths
+    assert len(question_wavs) == len(text_prompts), f"question_wavs ({len(question_wavs)}) and text_prompts ({len(text_prompts)}) must have same length"
+    assert len(question_wavs) == len(output_wavs), f"question_wavs ({len(question_wavs)}) and output_wavs ({len(output_wavs)}) must have same length"
+    assert len(question_wavs) == len(output_texts), f"question_wavs ({len(question_wavs)}) and output_texts ({len(output_texts)}) must have same length"
+    
+    if len(question_wavs) == 0:
+        log("warning", "Empty input lists provided")
+        return []
+    
+    log("info", f"Starting two-phase batch inference with {len(question_wavs)} instances")
+    log("info", f"Parameters: delay1={delay1_seconds}s, max_response={max_response_seconds}s")
+    
+    if seed is not None and seed != -1:
+        seed_all(seed)
+
+    # Download config.json to increment download counter
+    hf_hub_download(hf_repo, "config.json")
+
+    # 1) Load Mimi encoders/decoders (shared across all instances)
+    log("info", "loading mimi")
+    if mimi_weight is None:
+        mimi_weight = hf_hub_download(hf_repo, loaders.MIMI_NAME)
+    mimi = loaders.get_mimi(mimi_weight, device)
+    other_mimi = loaders.get_mimi(mimi_weight, device)
+    log("info", "mimi loaded")
+
+    # 2) Load tokenizer (shared across all instances)
+    if tokenizer_path is None:
+        tokenizer_path = hf_hub_download(hf_repo, loaders.TEXT_TOKENIZER_NAME)
+    text_tokenizer = sentencepiece.SentencePieceProcessor(tokenizer_path)
+
+    # 3) Load Moshi LM and eval mode (shared across all instances)
+    log("info", "loading moshi")
+    if moshi_weight is None:
+        moshi_weight = hf_hub_download(hf_repo, loaders.MOSHI_NAME)
+    lm = loaders.get_moshi_lm(moshi_weight, device=device, cpu_offload=cpu_offload)
+    lm.eval()
+    log("info", "moshi loaded")
+
+    # 4) Construct LMGen (shared across all instances)
+    frame_size = int(mimi.sample_rate / mimi.frame_rate)
+    lm_gen = LMGen(
+        lm,
+        audio_silence_frame_cnt=int(0.5 * mimi.frame_rate),
+        sample_rate=mimi.sample_rate,
+        device=device,
+        frame_rate=mimi.frame_rate,
+        save_voice_prompt_embeddings=save_voice_prompt_embeddings,
+        use_sampling=not greedy,
+        temp=temp_audio,
+        temp_text=temp_text,
+        top_k=topk_audio,
+        top_k_text=topk_text,
+    )
+    
+    # Keep models in streaming mode
+    mimi.streaming_forever(1)
+    other_mimi.streaming_forever(1)
+    lm_gen.streaming_forever(1)
+
+    # 5) Warmup (once for all instances)
+    log("info", "warming up the model")
+    warmup(mimi, other_mimi, lm_gen, device, frame_size)
+
+    # 6) Load voice prompt (shared across all instances)
+    if voice_prompt_path.endswith('.pt'):
+        lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
+    else:
+        lm_gen.load_voice_prompt(voice_prompt_path)
+
+    # Pre-compute delay audio
+    delay1_samples = int(delay1_seconds * mimi.sample_rate)
+    max_response_frames = int(max_response_seconds * mimi.frame_rate)
+    
+    # Create silence array for delay1
+    delay1_silence = np.zeros(delay1_samples, dtype=np.float32)
+    
+    # Encode a single silence frame for phase 2
+    silence_frame = torch.zeros(1, 1, frame_size, dtype=torch.float32, device=device)
+
+    batch_hidden_layers: List[List[HiddenLayerOutputs]] = []
+    
+    # 7) Process each instance with two phases
+    for i, (question_wav, output_wav, output_text, text_prompt) in tqdm(enumerate(zip(question_wavs, output_wavs, output_texts, text_prompts)), total=len(question_wavs)):
+        log("info", f"Processing instance {i+1}/{len(question_wavs)}: {question_wav}")
+        instance_start_time = time.time()
+        
+        # Timestamps for logging
+        timestamps = {
+            "start": instance_start_time,
+            "question_start": None,
+            "question_end": None,
+            "response_start": None,
+            "silence_detected": None,
+            "max_response_reached": None,
+        }
+        
+        # Set text prompt for this instance (from trait JSON instruction)
+        lm_gen.text_prompt_tokens = (
+            text_tokenizer.encode(wrap_with_system_tags(text_prompt)) if len(text_prompt) > 0 else None
+        )
+
+        # Reset streaming state for this instance
+        mimi.reset_streaming()
+        other_mimi.reset_streaming()
+        lm_gen.reset_streaming()
+        lm_gen.step_system_prompts(mimi)
+        mimi.reset_streaming()
+
+        # Load question audio
+        question_audio = lm_load_audio(question_wav, mimi.sample_rate)
+        
+        # Create phase 1 audio: delay1 + question audio
+        phase1_audio = np.concatenate([delay1_silence, question_audio.numpy().flatten()])
+        phase1_audio = torch.from_numpy(phase1_audio).unsqueeze(0)  # Shape: [1, T]
+
+        # Process audio frames and collect outputs
+        generated_frames: List[np.ndarray] = []
+        generated_text_tokens: List[str] = []
+        
+        total_steps = 0
+        phase1_steps = 0
+        phase2_steps = 0
+        hidden_layers_list: List[HiddenLayerOutputs] = []
+        
+        # ============ PHASE 1: Feed question audio to provide context ============
+        timestamps["question_start"] = time.time()
+        log("info", f"  Phase 1: Feeding question audio ({phase1_audio.shape[-1] / mimi.sample_rate:.2f}s)")
+        
+        for user_encoded in lm_encode_from_sphn(
+            mimi,
+            lm_iterate_audio(
+                phase1_audio, sample_interval_size=lm_gen._frame_size, pad=True
+            ),
+            max_batch=1,
+        ):
+            steps = user_encoded.shape[-1]
+            for c in range(steps):
+                total_steps += 1
+                phase1_steps += 1
+                step_in = user_encoded[:, :, c : c + 1]
+                
+                # Phase 1: No hidden layer extraction, just feed context
+                tokens = lm_gen.step(step_in)
+                
+                if tokens is None:
+                    continue
+                    
+                # Decode current sampled agent frame to PCM
+                pcm = decode_tokens_to_pcm(mimi, other_mimi, lm_gen, tokens)
+                generated_frames.append(pcm)
+                
+                # Decode text token
+                text_token = tokens[0, 0, 0].item()
+                if text_token not in (0, 3):
+                    _text = text_tokenizer.id_to_piece(text_token)
+                    _text = _text.replace("▁", " ")
+                    generated_text_tokens.append(_text)
+                else:
+                    text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
+                    generated_text_tokens.append(text_token_map[text_token])
+        
+        timestamps["question_end"] = time.time()
+        log("info", f"  Phase 1 completed: {phase1_steps} steps ({timestamps['question_end'] - timestamps['question_start']:.2f}s)")
+        
+        # ============ PHASE 2: Feed silence, wait for response, extract hidden layers ============
+        timestamps["response_start"] = time.time()
+        log("info", f"  Phase 2: Waiting for model response (max {max_response_seconds}s, silence detection enabled)")
+        
+        silence_detected = False
+        consecutive_silence_count = 0
+        SILENCE_THRESHOLD = 3  # Number of consecutive silence tokens to confirm end of response
+        
+        # Reset mimi for phase 2
+        mimi.reset_streaming()
+        
+        for frame_idx in range(max_response_frames):
+            total_steps += 1
+            phase2_steps += 1
+            
+            # Encode silence frame
+            silence_encoded = mimi.encode(silence_frame)
+            
+            for c in range(silence_encoded.shape[-1]):
+                step_in = silence_encoded[:, :, c : c + 1]
+                
+                # Phase 2: Extract hidden layers and check for silence
+                result = lm_gen.step(step_in, return_hidden_layers=True, check_silence_token=True)
+                tokens, hidden_layers, is_silence = result
+                
+                if tokens is None:
+                    continue
+                
+                # Store hidden layers (this is what we want for persona vectors)
+                if hidden_layers is not None:
+                    hidden_layers_list.append(hidden_layers)
+                
+                # Check for silence token
+                if is_silence:
+                    consecutive_silence_count += 1
+                    if consecutive_silence_count >= SILENCE_THRESHOLD:
+                        silence_detected = True
+                        timestamps["silence_detected"] = time.time()
+                        log("info", f"  Silence token detected at step {total_steps} (phase2 step {phase2_steps})")
+                        break
+                else:
+                    consecutive_silence_count = 0
+                
+                # Decode current sampled agent frame to PCM
+                pcm = decode_tokens_to_pcm(mimi, other_mimi, lm_gen, tokens)
+                generated_frames.append(pcm)
+                
+                # Decode text token
+                text_token = tokens[0, 0, 0].item()
+                if text_token not in (0, 3):
+                    _text = text_tokenizer.id_to_piece(text_token)
+                    _text = _text.replace("▁", " ")
+                    generated_text_tokens.append(_text)
+                else:
+                    text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
+                    generated_text_tokens.append(text_token_map[text_token])
+            
+            if silence_detected:
+                break
+        
+        if not silence_detected:
+            timestamps["max_response_reached"] = time.time()
+            log("info", f"  Max response time reached at step {total_steps}")
+        
+        log("info", f"  Phase 2 completed: {phase2_steps} steps, collected {len(hidden_layers_list)} hidden layer outputs")
+        
+        # Log timing summary
+        total_time = time.time() - timestamps["start"]
+        log("info", f"  Timing summary for instance {i+1}:")
+        log("info", f"    Total steps: {total_steps} (phase1: {phase1_steps}, phase2: {phase2_steps})")
+        log("info", f"    Total time: {total_time:.2f}s")
+        if timestamps["silence_detected"]:
+            log("info", f"    Response ended by silence detection at {timestamps['silence_detected'] - timestamps['response_start']:.2f}s into phase 2")
+
+        if len(generated_frames) == 0:
+            log("error", f"No audio frames were generated for instance {i+1}. Check input file: {question_wav}")
+            continue
+
+        # Concatenate frames
+        output_pcm = np.concatenate(generated_frames, axis=-1)
+
+        # Write outputs for this instance
+        sphn.write_wav(output_wav, output_pcm, mimi.sample_rate)
+        log("info", f"Wrote output audio to {output_wav}")
+
+        with open(output_text, "w") as file:
+            json.dump(generated_text_tokens, file, ensure_ascii=False)
+        log("info", f"Wrote output text to {output_text}")
+        
+        # Store hidden layers for this instance (only phase 2 hidden layers)
+        if len(hidden_layers_list) > 0:
+            batch_hidden_layers.append(hidden_layers_list)
+        else:
+            log("warning", f"No hidden layers collected for instance {i+1}")
+            batch_hidden_layers.append([])
+
+    log("info", f"Two-phase batch inference completed for {len(question_wavs)} instances")
+    if len(batch_hidden_layers) > 0 and len(batch_hidden_layers[0]) > 0:
+        log("info", f"Hidden layers collected: {len(batch_hidden_layers)} instances, first has {len(batch_hidden_layers[0])} steps")
+    return batch_hidden_layers
+
+
 def main():
     """Parse CLI args and run offline inference."""
     parser = argparse.ArgumentParser(

@@ -56,6 +56,9 @@ FRAME_RATE_HZ = 12.5
 SILENCE_TOKENS = np.array([948, 243, 1178, 546, 1736, 1030, 1978, 2008], dtype=np.int64)
 SINE_TOKENS    = np.array([430, 1268, 381, 1611, 1095, 1495, 56, 472], dtype=np.int64)
 
+# Tolerance for silence token matching (number of tokens that must match)
+SILENCE_TOKEN_MATCH_THRESHOLD = 6  # At least 6 out of 8 tokens must match to be considered silence
+
 
 @dataclass
 class LMOutput:
@@ -720,6 +723,29 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt_cache: Optional[torch.Tensor] = None
         self.voice_prompt_embeddings: Optional[torch.Tensor] = None
         #self.voice_prompt_mimi_streaming_state: Optional[StreamingStateDict] = None
+        
+        # Silence token tensor for detection (moshi audio tokens only, channels 1-8)
+        self._silence_tokens_tensor = torch.tensor(
+            SILENCE_TOKENS, dtype=torch.long, device=lm_model.device
+        )
+
+    def is_silence_token(self, tokens: torch.Tensor, threshold: int = SILENCE_TOKEN_MATCH_THRESHOLD) -> bool:
+        """Check if the generated audio tokens match silence tokens.
+        
+        Args:
+            tokens: Generated tokens of shape [B, K, T] where K includes text + audio tokens
+            threshold: Minimum number of matching tokens to be considered silence (default 6 out of 8)
+            
+        Returns:
+            True if the audio tokens match silence tokens within threshold
+        """
+        if tokens is None:
+            return False
+        # Extract audio tokens (channels 1-8, index 1:9)
+        audio_tokens = tokens[0, 1:9, 0]  # Shape: [8]
+        # Count matching tokens
+        matches = (audio_tokens == self._silence_tokens_tensor).sum().item()
+        return matches >= threshold
 
     def _init_streaming_state(self, batch_size: int) -> _LMGenState:
         lm_model = self.lm_model
@@ -835,8 +861,21 @@ class LMGen(StreamingModule[_LMGenState]):
 
     @torch.no_grad()
     def step(self, input_tokens: torch.Tensor=None, moshi_tokens:torch.Tensor=None, text_token:torch.Tensor=None,
-             return_embeddings: bool=False, return_hidden_layers: bool=False) \
-        -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]] | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]] | tuple[torch.Tensor, HiddenLayerOutputs]:
+             return_embeddings: bool=False, return_hidden_layers: bool=False, check_silence_token: bool=False) \
+        -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]] | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]] | tuple[torch.Tensor, HiddenLayerOutputs] | tuple[torch.Tensor, HiddenLayerOutputs, bool]:
+        """Run a single step of the language model.
+        
+        Args:
+            input_tokens: User audio tokens
+            moshi_tokens: Moshi audio tokens  
+            text_token: Text token
+            return_embeddings: If True, return embeddings
+            return_hidden_layers: If True, return hidden layer outputs
+            check_silence_token: If True, also return a boolean indicating if silence was detected
+            
+        Returns:
+            Generated tokens and optionally embeddings, hidden layers, and silence detection flag
+        """
         state = self._streaming_state
         lm_model = self.lm_model
         prepared_inputs = self.prepare_step_input(
@@ -845,7 +884,7 @@ class LMGen(StreamingModule[_LMGenState]):
         # print("INPUT:", None if input_tokens is None else input_tokens.squeeze().cpu().tolist()) # DEBUG
         # print("MOSHI:", None if moshi_tokens is None else moshi_tokens.squeeze().cpu().tolist()) # DEBUG
         if prepared_inputs is None:
-            return_tuple_size = sum([self.report_loss or self.return_logits, return_embeddings, return_hidden_layers])
+            return_tuple_size = sum([self.report_loss or self.return_logits, return_embeddings, return_hidden_layers, check_silence_token])
             if return_tuple_size == 0:
                 return None
             elif return_tuple_size == 1:
@@ -915,6 +954,9 @@ class LMGen(StreamingModule[_LMGenState]):
             returns.append(embeddings)
         if return_hidden_layers:
             returns.append(combined_hidden_layers)
+        if check_silence_token:
+            is_silence = self.is_silence_token(output)
+            returns.append(is_silence)
             
         if len(returns) == 1:
             return returns[0]
