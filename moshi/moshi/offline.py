@@ -42,6 +42,7 @@ keep parity with voice-prompt feeding logic in the server.
 import argparse
 import os
 import tarfile
+import gc
 from pathlib import Path
 import json
 from typing import Optional, List
@@ -62,6 +63,19 @@ from .models.lm import HiddenLayerOutputs
 
 def log(level: str, msg: str):
     print(make_log(level, msg))
+
+
+def log_memory(prefix: str = ""):
+    """Log current GPU memory usage stats."""
+    if not torch.cuda.is_available():
+        return
+    
+    allocated = torch.cuda.memory_allocated() / 1e9  # GB
+    reserved = torch.cuda.memory_reserved() / 1e9    # GB
+    max_allocated = torch.cuda.max_memory_allocated() / 1e9  # GB
+    
+    prefix_str = f"[{prefix}] " if prefix else ""
+    log("info", f"{prefix_str}GPU Memory: allocated={allocated:.2f}GB, reserved={reserved:.2f}GB, max_allocated={max_allocated:.2f}GB")
 
 
 def seed_all(seed: int):
@@ -117,10 +131,12 @@ def decode_tokens_to_pcm(mimi: MimiModel, other_mimi: MimiModel, lm_gen: LMGen, 
     tokens is shaped [B, dep_q+1, 1]; channels 1..dep_q are the agent audio codebooks.
     Returns a 1D float32 numpy array (mono) for the current frame.
     """
-    pcm = mimi.decode(tokens[:, 1:9])
-    _ = other_mimi.decode(tokens[:, 1:9])
-    pcm = pcm.detach().cpu().numpy()[0, 0]
-    return pcm
+    with torch.no_grad():
+        pcm = mimi.decode(tokens[:, 1:9])
+        _ = other_mimi.decode(tokens[:, 1:9])
+        pcm_np = pcm.detach().cpu().numpy()[0, 0]
+        del pcm  # Explicitly free GPU memory
+    return pcm_np
 
 
 def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Optional[str]:
@@ -683,6 +699,7 @@ def run_batch_inference_two_phase(
     # 7) Process each instance with two phases
     for i, (question_wav, output_wav, output_text, text_prompt) in tqdm(enumerate(zip(question_wavs, output_wavs, output_texts, text_prompts)), total=len(question_wavs)):
         log("info", f"Processing instance {i+1}/{len(question_wavs)}: {question_wav}")
+        log_memory(f"Instance {i+1} start")
         instance_start_time = time.time()
         
         # Timestamps for logging
@@ -767,6 +784,7 @@ def run_batch_inference_two_phase(
         
         timestamps["question_end"] = time.time()
         log("info", f"  Phase 1 completed: {phase1_steps} steps ({timestamps['question_end'] - timestamps['question_start']:.2f}s)")
+        log_memory(f"Instance {i+1} after phase 1")
         
         # ============ PHASE 2: Feed silence, wait for response, extract hidden layers ============
         # Reset mimi streaming to clear decoder buffers (prevents OOM from accumulated streaming state)
@@ -780,7 +798,7 @@ def run_batch_inference_two_phase(
         silence_detected = False
         consecutive_silence_count = 0
         SILENCE_THRESHOLD = 3  # Number of consecutive silence tokens to confirm end of response
-        CLEANUP_INTERVAL = 50  # Clear CUDA cache every N frames to prevent fragmentation
+        CLEANUP_INTERVAL = 5  # Clear CUDA cache every N frames to prevent fragmentation (reduced from 50 for more aggressive cleanup)
         
         for frame_idx in range(max_response_frames):
             total_steps += 1
@@ -789,6 +807,8 @@ def run_batch_inference_two_phase(
             # Periodic cleanup to prevent memory fragmentation
             if frame_idx > 0 and frame_idx % CLEANUP_INTERVAL == 0:
                 torch.cuda.empty_cache()
+                gc.collect()  # Also collect Python garbage to free unreferenced objects
+                log_memory(f"Instance {i+1} phase 2 cleanup at frame {frame_idx}")
             
             # Encode silence frame
             silence_encoded = mimi.encode(silence_frame)
@@ -837,15 +857,22 @@ def run_batch_inference_two_phase(
                 else:
                     text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
                     generated_text_tokens.append(text_token_map[text_token])
+                
+                # Immediately free token tensor to reduce GPU memory fragmentation
+                del tokens
             
             if silence_detected:
                 break
+            
+            # Clean up silence_encoded to free GPU memory
+            del silence_encoded
         
         if not silence_detected:
             timestamps["max_response_reached"] = time.time()
             log("info", f"  Max response time reached at step {total_steps}")
         
         log("info", f"  Phase 2 completed: {phase2_steps} steps, collected {len(hidden_layers_list)} hidden layer outputs")
+        log_memory(f"Instance {i+1} after phase 2")
         
         # Log timing summary
         total_time = time.time() - timestamps["start"]
@@ -879,9 +906,12 @@ def run_batch_inference_two_phase(
         
         # Clean up GPU memory after each instance
         del generated_frames
+        del generated_text_tokens
         del hidden_layers_list
         torch.cuda.empty_cache()
+        gc.collect()  # Collect Python garbage to free unreferenced objects
         log("info", f"  GPU cache cleared after instance {i+1}")
+        log_memory(f"Instance {i+1} after cleanup")
 
     log("info", f"Two-phase batch inference completed for {len(question_wavs)} instances")
     if len(batch_hidden_layers) > 0 and len(batch_hidden_layers[0]) > 0:
