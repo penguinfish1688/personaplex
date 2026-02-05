@@ -797,10 +797,6 @@ def run_batch_inference_two_phase(
         log_memory(f"Instance {i+1} after phase 1")
         
         # ============ PHASE 2: Feed silence, wait for response, extract hidden layers ============
-        # Reset mimi streaming to clear decoder buffers (prevents OOM from accumulated streaming state)
-        # NOTE: lm_gen state is NOT reset - it retains context from Phase 1
-        mimi.reset_streaming()
-        other_mimi.reset_streaming()
         
         timestamps["response_start"] = time.time()
         log("info", f"  Phase 2: Waiting for model response (max {max_response_seconds}s, silence detection enabled)")
@@ -808,17 +804,10 @@ def run_batch_inference_two_phase(
         silence_detected = False
         consecutive_silence_count = 0
         SILENCE_THRESHOLD = 3  # Number of consecutive silence tokens to confirm end of response
-        CLEANUP_INTERVAL = 5  # Clear CUDA cache every N frames to prevent fragmentation (reduced from 50 for more aggressive cleanup)
-        
+
         for frame_idx in range(max_response_frames):
             total_steps += 1
             phase2_steps += 1
-            
-            # Periodic cleanup to prevent memory fragmentation
-            if frame_idx > 0 and frame_idx % CLEANUP_INTERVAL == 0:
-                torch.cuda.empty_cache()
-                gc.collect()  # Also collect Python garbage to free unreferenced objects
-                log_memory(f"Instance {i+1} phase 2 cleanup at frame {frame_idx}")
             
             # Encode silence frame
             silence_encoded = mimi.encode(silence_frame)
@@ -882,7 +871,6 @@ def run_batch_inference_two_phase(
             log("info", f"  Max response time reached at step {total_steps}")
         
         log("info", f"  Phase 2 completed: {phase2_steps} steps, collected {len(hidden_layers_list)} hidden layer outputs")
-        log_memory(f"Instance {i+1} after phase 2")
         
         # Log timing summary
         total_time = time.time() - timestamps["start"]
@@ -913,15 +901,6 @@ def run_batch_inference_two_phase(
         else:
             log("warning", f"No hidden layers collected for instance {i+1}")
             batch_hidden_layers.append([])
-        
-        # Clean up GPU memory after each instance
-        del generated_frames
-        del generated_text_tokens
-        del hidden_layers_list
-        torch.cuda.empty_cache()
-        gc.collect()  # Collect Python garbage to free unreferenced objects
-        log("info", f"  GPU cache cleared after instance {i+1}")
-        log_memory(f"Instance {i+1} after cleanup")
 
     log("info", f"Two-phase batch inference completed for {len(question_wavs)} instances")
     if len(batch_hidden_layers) > 0 and len(batch_hidden_layers[0]) > 0:
