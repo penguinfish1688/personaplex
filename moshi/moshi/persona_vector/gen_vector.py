@@ -442,6 +442,8 @@ def run_audio_persona_vector_extraction(
     delay1: float = 2.5,
     max_response_seconds: float = 30.0,
     sample_rate: int = 24000,
+    resume_trait: str | None = None,
+    resume_instance: int = 0,
 ):
     """
     Extract persona vectors using audio prompts with two-phase inference.
@@ -476,8 +478,25 @@ def run_audio_persona_vector_extraction(
 
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Handle resume mode
+    resume_mode = resume_trait is not None
+    first_trait_in_resume = True  # Track if this is the first trait in resume mode
+    if resume_mode:
+        print(f"Resume mode: Starting from trait '{resume_trait}' at instance {resume_instance}")
 
     for trait in traits:
+        # Skip traits before resume trait
+        if resume_mode and trait != resume_trait:
+            print(f"Skipping trait {trait} (resume mode)")
+            continue
+        
+        # Determine start_instance for this trait
+        start_instance_for_trait = resume_instance if (resume_mode and first_trait_in_resume) else 0
+        if resume_mode and first_trait_in_resume:
+            first_trait_in_resume = False  # Only the first trait uses resume_instance
+        resume_mode = False  # Only skip traits before the resume trait; process all pos/neg after
+        
         trait_path = os.path.join(trait_dir, f"{trait}.json")
         trait_audio_json = os.path.join(trait_audio_dir, trait, f"{trait}.json")
         
@@ -571,6 +590,7 @@ def run_audio_persona_vector_extraction(
             delay1_seconds=delay1,
             max_response_seconds=max_response_seconds,
             sample_rate=sample_rate,
+            start_instance_idx=start_instance_for_trait,
         )
 
         print("  Running two-phase inference for Negative prompts...")
@@ -596,6 +616,7 @@ def run_audio_persona_vector_extraction(
             delay1_seconds=delay1,
             max_response_seconds=max_response_seconds,
             sample_rate=sample_rate,
+            start_instance_idx=start_instance_for_trait,
         )
 
         if pos_hidden is None or neg_hidden is None:
@@ -696,6 +717,9 @@ def main():
     parser.add_argument("--delay1", type=float, default=2.5, help="Silence delay in seconds before question audio (for audio mode, default 2.5s)")
     parser.add_argument("--max_response_seconds", type=float, default=30.0, help="Maximum time for model to respond (for audio mode, default 30s)")
     parser.add_argument("--sample_rate", type=int, default=24000, help="Audio sample rate (default 24000 Hz for Moshi)")
+    
+    parser.add_argument("--resume_trait", type=str, default=None, help="Resume from a specific trait (e.g., 'evil')")
+    parser.add_argument("--resume_instance", type=int, default=0, help="Resume from a specific instance index within the trait (0-based, e.g., 92 to resume from instance 93)")
 
     args = parser.parse_args()
 
@@ -774,6 +798,8 @@ def main():
             delay1=args.delay1,
             max_response_seconds=args.max_response_seconds,
             sample_rate=args.sample_rate,
+            resume_trait=args.resume_trait,
+            resume_instance=args.resume_instance,
         )
 
 

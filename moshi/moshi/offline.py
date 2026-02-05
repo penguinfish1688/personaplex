@@ -588,6 +588,7 @@ def run_batch_inference_two_phase(
     delay1_seconds: float = 2.5,
     max_response_seconds: float = 30.0,
     sample_rate: int = 24000,
+    start_instance_idx: int = 0,
 ) -> Optional[List[List[HiddenLayerOutputs]]]:
     """Run two-phase batch inference for persona vector extraction.
     
@@ -607,6 +608,7 @@ def run_batch_inference_two_phase(
         delay1_seconds: Delay before question audio (default 2.5s)
         max_response_seconds: Maximum time for model to respond before stopping (default 30s)
         sample_rate: Audio sample rate (default 24000 Hz for Moshi)
+        start_instance_idx: Index to start from (default 0). Useful for resuming from a checkpoint.
         Other parameters: Same as run_batch_inference
         
     Returns:
@@ -624,6 +626,8 @@ def run_batch_inference_two_phase(
         return []
     
     log("info", f"Starting two-phase batch inference with {len(question_wavs)} instances")
+    if start_instance_idx > 0:
+        log("info", f"Resume mode: starting from instance {start_instance_idx+1}/{len(question_wavs)}")
     log("info", f"Parameters: delay1={delay1_seconds}s, max_response={max_response_seconds}s")
     
     if seed is not None and seed != -1:
@@ -698,6 +702,13 @@ def run_batch_inference_two_phase(
     
     # 7) Process each instance with two phases
     for i, (question_wav, output_wav, output_text, text_prompt) in tqdm(enumerate(zip(question_wavs, output_wavs, output_texts, text_prompts)), total=len(question_wavs)):
+        # Skip instances before start_instance_idx (for resume functionality)
+        if i < start_instance_idx:
+            log("info", f"Skipping instance {i+1}/{len(question_wavs)} (resume mode)")
+            # Still need to append empty list to maintain alignment of batch_hidden_layers
+            batch_hidden_layers.append([])
+            continue
+        
         log("info", f"Processing instance {i+1}/{len(question_wavs)}: {question_wav}")
         log_memory(f"Instance {i+1} start")
         instance_start_time = time.time()
