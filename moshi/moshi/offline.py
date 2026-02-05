@@ -718,11 +718,21 @@ def run_batch_inference_two_phase(
         )
 
         # Reset streaming state for this instance
+        mimi._stop_streaming()
+        other_mimi._stop_streaming()
+        lm_gen._stop_streaming()
+
+        mimi.streaming_forever(1)
+        other_mimi.streaming_forever(1)
+        lm_gen.streaming_forever(1)
+
+        # Keep models in streaming mode
         mimi.reset_streaming()
         other_mimi.reset_streaming()
         lm_gen.reset_streaming()
         lm_gen.step_system_prompts(mimi)
         mimi.reset_streaming()
+
 
         # Load question audio
         question_audio = lm_load_audio(question_wav, mimi.sample_rate)
