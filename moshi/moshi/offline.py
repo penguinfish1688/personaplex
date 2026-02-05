@@ -769,16 +769,26 @@ def run_batch_inference_two_phase(
         log("info", f"  Phase 1 completed: {phase1_steps} steps ({timestamps['question_end'] - timestamps['question_start']:.2f}s)")
         
         # ============ PHASE 2: Feed silence, wait for response, extract hidden layers ============
+        # Reset mimi streaming to clear decoder buffers (prevents OOM from accumulated streaming state)
+        # NOTE: lm_gen state is NOT reset - it retains context from Phase 1
+        mimi.reset_streaming()
+        other_mimi.reset_streaming()
+        
         timestamps["response_start"] = time.time()
         log("info", f"  Phase 2: Waiting for model response (max {max_response_seconds}s, silence detection enabled)")
         
         silence_detected = False
         consecutive_silence_count = 0
         SILENCE_THRESHOLD = 3  # Number of consecutive silence tokens to confirm end of response
+        CLEANUP_INTERVAL = 50  # Clear CUDA cache every N frames to prevent fragmentation
         
         for frame_idx in range(max_response_frames):
             total_steps += 1
             phase2_steps += 1
+            
+            # Periodic cleanup to prevent memory fragmentation
+            if frame_idx > 0 and frame_idx % CLEANUP_INTERVAL == 0:
+                torch.cuda.empty_cache()
             
             # Encode silence frame
             silence_encoded = mimi.encode(silence_frame)
