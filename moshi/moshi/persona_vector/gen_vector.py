@@ -444,6 +444,7 @@ def run_audio_persona_vector_extraction(
     sample_rate: int = 24000,
     resume_trait: str | None = None,
     resume_instance: int = 0,
+    resume_type: str | None = None,
 ):
     """
     Extract persona vectors using audio prompts with two-phase inference.
@@ -566,74 +567,120 @@ def run_audio_persona_vector_extraction(
 
         pos_wavs, pos_texts = _make_output_paths(trait_out_dir, "pos", len(pos_question_wavs))
         neg_wavs, neg_texts = _make_output_paths(trait_out_dir, "neg", len(neg_question_wavs))
+        # Only run pos inference if not resuming to neg, or if not resuming at all
+        if resume_type != "neg":
+            print("  Running two-phase inference for Positive prompts...")
+            pos_hidden = run_batch_inference_two_phase(
+                question_wavs=pos_question_wavs,
+                output_wavs=pos_wavs,
+                output_texts=pos_texts,
+                text_prompts=pos_text_prompts,
+                voice_prompt_path=voice_prompt_path,
+                tokenizer_path=tokenizer_path,
+                moshi_weight=moshi_weight,
+                mimi_weight=mimi_weight,
+                hf_repo=hf_repo,
+                device=device,
+                seed=seed,
+                temp_audio=temp_audio,
+                temp_text=temp_text,
+                topk_audio=topk_audio,
+                topk_text=topk_text,
+                greedy=greedy,
+                save_voice_prompt_embeddings=False,
+                cpu_offload=cpu_offload,
+                delay1_seconds=delay1,
+                max_response_seconds=max_response_seconds,
+                sample_rate=sample_rate,
+                start_instance_idx=start_instance_for_trait,
+                condition="pos",
+                output_dir=trait_out_dir,
+            )
 
-        print("  Running two-phase inference for Positive prompts...")
-        pos_hidden = run_batch_inference_two_phase(
-            question_wavs=pos_question_wavs,
-            output_wavs=pos_wavs,
-            output_texts=pos_texts,
-            text_prompts=pos_text_prompts,
-            voice_prompt_path=voice_prompt_path,
-            tokenizer_path=tokenizer_path,
-            moshi_weight=moshi_weight,
-            mimi_weight=mimi_weight,
-            hf_repo=hf_repo,
-            device=device,
-            seed=seed,
-            temp_audio=temp_audio,
-            temp_text=temp_text,
-            topk_audio=topk_audio,
-            topk_text=topk_text,
-            greedy=greedy,
-            save_voice_prompt_embeddings=False,
-            cpu_offload=cpu_offload,
-            delay1_seconds=delay1,
-            max_response_seconds=max_response_seconds,
-            sample_rate=sample_rate,
-            start_instance_idx=start_instance_for_trait,
-        )
+        # Only run neg inference if not resuming to pos, or if not resuming at all
+        if resume_type != "pos":
+            print("  Running two-phase inference for Negative prompts...")
+            neg_hidden = run_batch_inference_two_phase(
+                question_wavs=neg_question_wavs,
+                output_wavs=neg_wavs,
+                output_texts=neg_texts,
+                text_prompts=neg_text_prompts,
+                voice_prompt_path=voice_prompt_path,
+                tokenizer_path=tokenizer_path,
+                moshi_weight=moshi_weight,
+                mimi_weight=mimi_weight,
+                hf_repo=hf_repo,
+                device=device,
+                seed=seed,
+                temp_audio=temp_audio,
+                temp_text=temp_text,
+                topk_audio=topk_audio,
+                topk_text=topk_text,
+                greedy=greedy,
+                save_voice_prompt_embeddings=False,
+                cpu_offload=cpu_offload,
+                delay1_seconds=delay1,
+                max_response_seconds=max_response_seconds,
+                sample_rate=sample_rate,
+                start_instance_idx=start_instance_for_trait,
+                condition="neg",
+                output_dir=trait_out_dir,
+            )
 
-        print("  Running two-phase inference for Negative prompts...")
-        neg_hidden = run_batch_inference_two_phase(
-            question_wavs=neg_question_wavs,
-            output_wavs=neg_wavs,
-            output_texts=neg_texts,
-            text_prompts=neg_text_prompts,
-            voice_prompt_path=voice_prompt_path,
-            tokenizer_path=tokenizer_path,
-            moshi_weight=moshi_weight,
-            mimi_weight=mimi_weight,
-            hf_repo=hf_repo,
-            device=device,
-            seed=seed,
-            temp_audio=temp_audio,
-            temp_text=temp_text,
-            topk_audio=topk_audio,
-            topk_text=topk_text,
-            greedy=greedy,
-            save_voice_prompt_embeddings=False,
-            cpu_offload=cpu_offload,
-            delay1_seconds=delay1,
-            max_response_seconds=max_response_seconds,
-            sample_rate=sample_rate,
-            start_instance_idx=start_instance_for_trait,
-        )
-
-        if pos_hidden is None or neg_hidden is None:
-            raise RuntimeError("Hidden layers were not returned from batch inference.")
+        # Load checkpoint files from output directory
+        print("  Loading checkpoint files from inference...")
+        pos_hidden = []
+        neg_hidden = []
         
-        # Filter out empty hidden layer lists
-        pos_hidden = [h for h in pos_hidden if len(h) > 0]
-        neg_hidden = [h for h in neg_hidden if len(h) > 0]
+        # Helper function to extract numeric index from checkpoint filename
+        def get_checkpoint_index(filename):
+            try:
+                # Extract number from "pos_00092.pt" or "neg_00000.pt"
+                return int(filename.split("_")[1].split(".")[0])
+            except (IndexError, ValueError):
+                return float('inf')  # Sort unparseable files to end
+        
+        # Find checkpoint indices for both pos and neg
+        pos_files = [f for f in os.listdir(trait_out_dir) if f.startswith("pos_") and f.endswith(".pt")]
+        neg_files = [f for f in os.listdir(trait_out_dir) if f.startswith("neg_") and f.endswith(".pt")]
+        
+        # Get indices that exist in both pos and neg
+        pos_indices = {get_checkpoint_index(f) for f in pos_files if get_checkpoint_index(f) != float('inf')}
+        neg_indices = {get_checkpoint_index(f) for f in neg_files if get_checkpoint_index(f) != float('inf')}
+        common_indices = sorted(pos_indices & neg_indices)
+        
+        # Load matching checkpoint pairs in a single loop
+        for idx in common_indices:
+            try:
+                pos_filepath = os.path.join(trait_out_dir, f"pos_{idx:05d}.pt")
+                neg_filepath = os.path.join(trait_out_dir, f"neg_{idx:05d}.pt")
+                pos_hidden.append(torch.load(pos_filepath))
+                neg_hidden.append(torch.load(neg_filepath))
+            except Exception as e:
+                print(f"  Warning: Failed to load checkpoint pair for index {idx}: {e}")
+
+        
+        if len(pos_hidden) == 0 and len(neg_hidden) == 0:
+            print(f"  Warning: No checkpoint files found in {trait_out_dir}, skipping trait")
+            continue
         
         if len(pos_hidden) == 0 or len(neg_hidden) == 0:
-            print(f"  Warning: No valid hidden layers collected for trait {trait}, skipping")
+            print(f"  Warning: Incomplete checkpoints for trait {trait} (pos: {len(pos_hidden)}, neg: {len(neg_hidden)}), skipping")
             continue
+        
+        # Ensure we have matching counts for pairing (use minimum count)
+        min_count = min(len(pos_hidden), len(neg_hidden))
+        if len(pos_hidden) != len(neg_hidden):
+            print(f"  Warning: Pos and neg checkpoint counts differ (pos: {len(pos_hidden)}, neg: {len(neg_hidden)}). Using min_count={min_count} for pairing")
+            pos_hidden = pos_hidden[:min_count]
+            neg_hidden = neg_hidden[:min_count]
 
         # Flatten all hidden layer tensors immediately
         print("  Flattening hidden layers...")
         pos_hidden_flat = [[_flatten_hidden_outputs(step) for step in prompt_steps] for prompt_steps in pos_hidden]
         neg_hidden_flat = [[_flatten_hidden_outputs(step) for step in prompt_steps] for prompt_steps in neg_hidden]
+
+
 
         # Compute mean vectors per prompt
         print("  Computing means...")
@@ -720,6 +767,7 @@ def main():
     
     parser.add_argument("--resume_trait", type=str, default=None, help="Resume from a specific trait (e.g., 'evil')")
     parser.add_argument("--resume_instance", type=int, default=0, help="Resume from a specific instance index within the trait (0-based, e.g., 92 to resume from instance 93)")
+    parser.add_argument("--resume_type", type=str, choices=["pos", "neg"], default=None, help="Resume from a specific condition: 'pos' or 'neg' (e.g., 'neg')")
 
     args = parser.parse_args()
 
@@ -800,6 +848,7 @@ def main():
             sample_rate=args.sample_rate,
             resume_trait=args.resume_trait,
             resume_instance=args.resume_instance,
+            resume_type=args.resume_type,
         )
 
 

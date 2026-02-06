@@ -43,6 +43,7 @@ import argparse
 import os
 import tarfile
 import gc
+import pickle
 from pathlib import Path
 import json
 from typing import Optional, List
@@ -589,7 +590,9 @@ def run_batch_inference_two_phase(
     max_response_seconds: float = 30.0,
     sample_rate: int = 24000,
     start_instance_idx: int = 0,
-) -> Optional[List[List[HiddenLayerOutputs]]]:
+    condition: Optional[str] = None,
+    output_dir: Optional[str] = None,
+) -> None:
     """Run two-phase batch inference for persona vector extraction.
     
     Phase 1: Feed delay1 + question audio to provide context (no hidden extraction)
@@ -700,13 +703,19 @@ def run_batch_inference_two_phase(
 
     batch_hidden_layers: List[List[HiddenLayerOutputs]] = []
     
+    # Validate that condition and output_dir are provided for checkpoint saving
+    if condition and output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    else:
+        log("warning", "condition and output_dir not provided. Hidden layers will not be saved.")
+    
     # 7) Process each instance with two phases
     for i, (question_wav, output_wav, output_text, text_prompt) in tqdm(enumerate(zip(question_wavs, output_wavs, output_texts, text_prompts)), total=len(question_wavs)):
         # Skip instances before start_instance_idx (for resume functionality)
         if i < start_instance_idx:
             log("info", f"Skipping instance {i+1}/{len(question_wavs)} (resume mode)")
-            # Still need to append empty list to maintain alignment of batch_hidden_layers
-            batch_hidden_layers.append([])
+            if i >= len(batch_hidden_layers):
+                batch_hidden_layers.append([])
             continue
         
         log("info", f"Processing instance {i+1}/{len(question_wavs)}: {question_wav}")
@@ -907,16 +916,22 @@ def run_batch_inference_two_phase(
         log("info", f"Wrote output text to {output_text}")
         
         # Store hidden layers for this instance (only phase 2 hidden layers)
-        if len(hidden_layers_list) > 0:
-            batch_hidden_layers.append(hidden_layers_list)
-        else:
-            log("warning", f"No hidden layers collected for instance {i+1}")
-            batch_hidden_layers.append([])
+        # Update or append to batch_hidden_layers to support resume mode with overwrites
+        # Save checkpoint file for this instance
+        if condition and output_dir:
+            checkpoint_file = os.path.join(output_dir, f"{condition}_{i:05d}.pt")
+            try:
+                if len(hidden_layers_list) > 0:
+                    torch.save(hidden_layers_list, checkpoint_file)
+                    log("info", f"Saved checkpoint to {checkpoint_file}")
+                else:
+                    log("warning", f"No hidden layers collected for instance {i+1}, skipping checkpoint")
+            except Exception as e:
+                log("error", f"Failed to save checkpoint to {checkpoint_file}: {e}")
 
     log("info", f"Two-phase batch inference completed for {len(question_wavs)} instances")
     if len(batch_hidden_layers) > 0 and len(batch_hidden_layers[0]) > 0:
         log("info", f"Hidden layers collected: {len(batch_hidden_layers)} instances, first has {len(batch_hidden_layers[0])} steps")
-    return batch_hidden_layers
 
 
 def main():
