@@ -49,11 +49,11 @@ def _make_output_paths(base_dir: str, prefix: str, count: int) -> Tuple[List[str
     return output_wavs, output_texts
 
 
-def _flatten_hidden_outputs(hidden_outputs: HiddenLayerOutputs) -> HiddenLayerOutputs:
-    """Flatten all tensors in HiddenLayerOutputs to 1D vectors."""
+def _flatten_hidden_outputs(hidden_outputs: HiddenLayerOutputs) -> Dict[str, List[torch.Tensor] | List[List[torch.Tensor]]]:
+    """Flatten all tensors in HiddenLayerOutputs to 1D vectors and return as dictionary."""
     flat_text = [t.flatten() for t in hidden_outputs.text_transformer]
     flat_depth = [[d.flatten() for d in codebook] for codebook in hidden_outputs.depth_transformer]
-    return HiddenLayerOutputs(text_transformer=flat_text, depth_transformer=flat_depth)
+    return {"text": flat_text, "depth": flat_depth}
 
 
 def _mean_hidden_layers(step_hidden: List[HiddenLayerOutputs]) -> Dict[str, List[torch.Tensor] | List[List[torch.Tensor]]]:
