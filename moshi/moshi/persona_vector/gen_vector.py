@@ -648,7 +648,7 @@ def run_audio_persona_vector_extraction(
         pos_indices = {get_checkpoint_index(f) for f in pos_files if get_checkpoint_index(f) != float('inf')}
         neg_indices = {get_checkpoint_index(f) for f in neg_files if get_checkpoint_index(f) != float('inf')}
         common_indices = sorted(pos_indices & neg_indices)
-        
+        print(f"  Found {len(common_indices)} matching checkpoint pairs")
         # Load matching checkpoint pairs in a single loop
         for idx in common_indices:
             try:
@@ -667,25 +667,20 @@ def run_audio_persona_vector_extraction(
         if len(pos_hidden) == 0 or len(neg_hidden) == 0:
             print(f"  Warning: Incomplete checkpoints for trait {trait} (pos: {len(pos_hidden)}, neg: {len(neg_hidden)}), skipping")
             continue
-        
-        # Ensure we have matching counts for pairing (use minimum count)
-        min_count = min(len(pos_hidden), len(neg_hidden))
-        if len(pos_hidden) != len(neg_hidden):
-            print(f"  Warning: Pos and neg checkpoint counts differ (pos: {len(pos_hidden)}, neg: {len(neg_hidden)}). Using min_count={min_count} for pairing")
-            pos_hidden = pos_hidden[:min_count]
-            neg_hidden = neg_hidden[:min_count]
-
         # Flatten all hidden layer tensors immediately
+        # Note: Each loaded checkpoint is already a single averaged HiddenLayerOutputs (not a list of steps)
         print("  Flattening hidden layers...")
-        pos_hidden_flat = [[_flatten_hidden_outputs(step) for step in prompt_steps] for prompt_steps in pos_hidden]
-        neg_hidden_flat = [[_flatten_hidden_outputs(step) for step in prompt_steps] for prompt_steps in neg_hidden]
+        pos_hidden_flat = [_flatten_hidden_outputs(hidden) for hidden in pos_hidden]
+        neg_hidden_flat = [_flatten_hidden_outputs(hidden) for hidden in neg_hidden]
 
 
 
         # Compute mean vectors per prompt
-        print("  Computing means...")
-        pos_prompt_means = [_mean_hidden_layers(steps) for steps in pos_hidden_flat]
-        neg_prompt_means = [_mean_hidden_layers(steps) for steps in neg_hidden_flat]
+        # Since checkpoints are already averaged across steps, use them directly as prompt means
+        print("  Using pre-averaged checkpoints as prompt means...")
+        pos_prompt_means = pos_hidden_flat
+        neg_prompt_means = neg_hidden_flat
+
         
         # Calculate differences per prompt (needed for statistics)
         prompt_diffs = [_compute_diff(p, n) for p, n in zip(pos_prompt_means, neg_prompt_means)]

@@ -106,6 +106,51 @@ def wrap_with_system_tags(text: str) -> str:
     return f"<system> {cleaned} <system>"
 
 
+def average_hidden_layers(hidden_layers_list: List[HiddenLayerOutputs]) -> HiddenLayerOutputs:
+    """Average a list of HiddenLayerOutputs across steps into a single averaged output.
+    
+    Args:
+        hidden_layers_list: List of HiddenLayerOutputs objects (one per step)
+    
+    Returns:
+        Single HiddenLayerOutputs object with averaged tensors
+    """
+    if not hidden_layers_list:
+        raise ValueError("Cannot average empty hidden layers list")
+    
+    if len(hidden_layers_list) == 1:
+        return hidden_layers_list[0]
+    
+    num_steps = len(hidden_layers_list)
+    
+    # Average text transformer layers
+    avg_text_transformer = None
+    if hidden_layers_list[0].text_transformer is not None:
+        num_text_layers = len(hidden_layers_list[0].text_transformer)
+        avg_text_transformer = [
+            torch.stack([h.text_transformer[i] for h in hidden_layers_list]).mean(dim=0)
+            for i in range(num_text_layers)
+        ]
+    
+    # Average depth transformer layers
+    avg_depth_transformer = None
+    if hidden_layers_list[0].depth_transformer is not None:
+        num_codebooks = len(hidden_layers_list[0].depth_transformer)
+        num_depth_layers = len(hidden_layers_list[0].depth_transformer[0])
+        avg_depth_transformer = [
+            [
+                torch.stack([h.depth_transformer[c][l] for h in hidden_layers_list]).mean(dim=0)
+                for l in range(num_depth_layers)
+            ]
+            for c in range(num_codebooks)
+        ]
+    
+    return HiddenLayerOutputs(
+        text_transformer=avg_text_transformer,
+        depth_transformer=avg_depth_transformer
+    )
+
+
 def warmup(mimi: MimiModel, other_mimi: MimiModel, lm_gen: LMGen, device: str, frame_size: int):
     """Run a short warmup loop to initialize CUDA graphs and streaming state.
 
@@ -917,13 +962,15 @@ def run_batch_inference_two_phase(
         
         # Store hidden layers for this instance (only phase 2 hidden layers)
         # Update or append to batch_hidden_layers to support resume mode with overwrites
-        # Save checkpoint file for this instance
+        # Save checkpoint file for this instance (averaged across steps)
         if condition and output_dir:
             checkpoint_file = os.path.join(output_dir, f"{condition}_{i:05d}.pt")
             try:
                 if len(hidden_layers_list) > 0:
-                    torch.save(hidden_layers_list, checkpoint_file)
-                    log("info", f"Saved checkpoint to {checkpoint_file}")
+                    # Average hidden layers across steps before saving
+                    avg_hidden = average_hidden_layers(hidden_layers_list)
+                    torch.save(avg_hidden, checkpoint_file)
+                    log("info", f"Saved checkpoint to {checkpoint_file} (averaged {len(hidden_layers_list)} steps)")
                 else:
                     log("warning", f"No hidden layers collected for instance {i+1}, skipping checkpoint")
             except Exception as e:
