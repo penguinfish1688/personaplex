@@ -209,7 +209,7 @@ class ServerState:
                     return
                 await asyncio.sleep(0.001)
                 pcm = opus_reader.read_pcm()
-                if pcm.shape[-1] == 0:
+                if pcm is None or pcm.shape[-1] == 0:
                     continue
                 if all_pcm_data is None:
                     all_pcm_data = pcm
