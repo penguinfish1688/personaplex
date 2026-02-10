@@ -10,13 +10,49 @@ import numpy as np
 from typing import List
 from ..models.lm import HiddenLayerOutputs # Necessary for unpickling
 
+def _get_trait_label(pt_file: str) -> str:
+    """Return a clean trait label for use in output filenames.
+    Prefer the parent directory name when the basename is a generic
+    filename like 'mean_persona_vectors.pt'. Otherwise, use a cleaned
+    basename without extensions or known suffixes.
+    """
+    basename = os.path.basename(pt_file)
+    parent = os.path.basename(os.path.dirname(pt_file))
+    lower = basename.lower()
+
+    generic = (
+        "mean_persona_vector.pt",
+        "mean_persona_vectors.pt",
+        "mean_persona_vector.spt",
+        "mean_persona_vectors.spt",
+    )
+
+    if lower in generic or lower.startswith("mean_persona_vector"):
+        # prefer parent dir if it's a meaningful name
+        if parent and parent not in ("", ".", "tmp", "histogram", "output"):
+            return parent
+        # fallback to cleaned basename
+        name = basename
+    else:
+        name = basename
+
+    # strip known suffixes and extension
+    for s in ("_mean_persona_vectors.pt", "mean_persona_vectors.pt", "_mean_persona_vector.pt", "mean_persona_vector.pt", ".pt"):
+        if s in name:
+            name = name.replace(s, "")
+
+    name = name.strip()
+    return name or "persona"
+
+
 def plot_cosine_histograms(pt_file, output_dir):
     print(f"Loading {pt_file}...")
     torch.serialization.add_safe_globals([HiddenLayerOutputs])
     data = torch.load(pt_file, map_location=torch.device('cpu'), weights_only=False)
     
     # Extract file name
-    filename = os.path.basename(pt_file)
+    trait_label = _get_trait_label(pt_file)
+    filename = trait_label
 
     if "raw_cosines" not in data:
         print("Error: 'raw_cosines' not found in the .pt file. Please regenerate using the updated gen_vector.py.")
@@ -91,11 +127,19 @@ def calculate_similarity_between_traits(pt_files: List[str], output_dir: str):
             print(f"Warning: File not found: {fpath}")
             continue
 
-        # Extract a readable name from filename (e.g., 'evil' from 'evil_mean_persona_vectors.pt')
+        # Determine a readable trait name.
+        # If the file has a generic filename like 'mean_persona_vector.pt' (or plural),
+        # prefer the parent directory name (e.g., <trait>/mean_persona_vector.pt -> '<trait>').
         basename = os.path.basename(fpath)
-        name = basename.replace("_mean_persona_vectors.pt", "").replace("mean_persona_vectors.pt", "").replace(".pt", "")
-        if not name: 
-            name = basename
+        lower = basename.lower()
+        if lower in ("mean_persona_vector.pt", "mean_persona_vectors.pt", "mean_persona_vector.spt", "mean_persona_vectors.spt") or lower.startswith("mean_persona_vector"):
+            # Use parent directory as trait name
+            name = _get_trait_label(fpath)
+        else:
+            # Fallback: strip known suffixes from the filename
+            name = basename.replace("_mean_persona_vectors.pt", "").replace("mean_persona_vectors.pt", "").replace("_mean_persona_vector.pt", "").replace("mean_persona_vector.pt", "").replace(".pt", "")
+            if not name:
+                name = basename
         
         try:
             data = torch.load(fpath, map_location='cpu', weights_only=False)

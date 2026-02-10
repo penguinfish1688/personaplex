@@ -17,6 +17,7 @@ From: nvcr.io/nvidia/cuda:12.4.1-runtime-ubuntu22.04
     # - python3.10: Alternative Python version (for compatibility)
     # - sox: Sound eXchange audio tool (required by sox Python package)
     # - libstdc++-dev: C++ standard library (required by texterrors, nemo_toolkit)
+    # - ffmpeg: Required by torchcodec for audio/video codec support
     # - pyenv dependencies: For Python version management
     apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
@@ -34,6 +35,7 @@ From: nvcr.io/nvidia/cuda:12.4.1-runtime-ubuntu22.04
         sox \
         libsox-dev \
         libstdc++-12-dev \
+        ffmpeg \
         python3.10 \
         python3.10-dev \
         python3.10-venv \
