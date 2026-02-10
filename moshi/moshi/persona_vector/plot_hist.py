@@ -200,23 +200,23 @@ def main():
        python3 -m moshi.persona_vector.plot_hist --pt_file ... --output_dir ...
 
        ```bash
-       cd /home/penguinfish/personaplex/moshi && python3 -m moshi.persona_vector.plot_hist --pt_file /home/penguinfish/personaplex/tmp/histogram/apathetic_mean_persona_vectors.pt --output_dir /home/penguinfish/personaplex/tmp/histogram/
+       cd /home/penguinfish/personaplex/personaplex/moshi && python3 -m moshi.persona_vector.plot_hist --pt_file /home/penguinfish/personaplex/personaplex/tmp/histogram/apathetic/mean_persona_vectors.pt --output_dir /home/penguinfish/personaplex/personaplex/tmp/histogram/
        ```
 
     2. Multi trait comparison:
        python3 -m moshi.persona_vector.plot_hist --compare_files path/to/trait1.pt path/to/trait2.pt --output_dir ...
 
        ```bash
-        cd /home/penguinfish/personaplex/moshi && python3 -m moshi.persona_vector.plot_hist --compare_files \
-        /home/penguinfish/personaplex/tmp/histogram/evil_mean_persona_vectors.pt \
-        /home/penguinfish/personaplex/tmp/histogram/hallucinating_mean_persona_vectors.pt \
-        /home/penguinfish/personaplex/tmp/histogram/impolite_mean_persona_vectors.pt \
-        /home/penguinfish/personaplex/tmp/histogram/apathetic_mean_persona_vectors.pt \
-        /home/penguinfish/personaplex/tmp/histogram/sycophantic_mean_persona_vectors.pt \
-        /home/penguinfish/personaplex/tmp/histogram/humorous_mean_persona_vectors.pt \
-        /home/penguinfish/personaplex/tmp/histogram/optimistic_mean_persona_vectors.pt \
-        /home/penguinfish/personaplex/tmp/histogram/random_mean_persona_vectors.pt \
-        --output_dir /home/penguinfish/personaplex/tmp/histogram/trait_comparison
+        cd /home/penguinfish/personaplex/personaplex/moshi && python3 -m moshi.persona_vector.plot_hist --compare_files \
+        /home/penguinfish/personaplex/personaplex/tmp/histogram/evil/mean_persona_vectors.pt \
+        /home/penguinfish/personaplex/personaplex/tmp/histogram/hallucinating/mean_persona_vectors.pt \
+        /home/penguinfish/personaplex/personaplex/tmp/histogram/apathetic/mean_persona_vectors.pt \
+        /home/penguinfish/personaplex/personaplex/tmp/histogram/impolite/mean_persona_vectors.pt \
+        /home/penguinfish/personaplex/personaplex/tmp/histogram/sycophantic/mean_persona_vectors.pt \
+        /home/penguinfish/personaplex/personaplex/tmp/histogram/humorous/mean_persona_vectors.pt \
+        /home/penguinfish/personaplex/personaplex/tmp/histogram/optimistic/mean_persona_vectors.pt \
+        /home/penguinfish/personaplex/personaplex/tmp/histogram/random/mean_persona_vectors.pt \
+        --output_dir /home/penguinfish/personaplex/personaplex/tmp/histogram/trait_comparison
         ```
 
 
