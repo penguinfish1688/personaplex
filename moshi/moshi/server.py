@@ -205,11 +205,13 @@ class ServerState:
             all_pcm_data = None
 
             while True:
-                if close:
-                    return
                 await asyncio.sleep(0.001)
                 pcm = opus_reader.read_pcm()
                 if pcm is None or pcm.shape[-1] == 0:
+                    # No data right now — if the connection is closed we are done
+                    if close:
+                        clog.log("info", "opus_loop: connection closed, no more data — exiting")
+                        return
                     continue
                 if all_pcm_data is None:
                     all_pcm_data = pcm
@@ -243,12 +245,17 @@ class ServerState:
 
         async def send_loop():
             while True:
-                if close:
-                    return
                 await asyncio.sleep(0.001)
                 msg = opus_writer.read_bytes()
                 if len(msg) > 0:
-                    await ws.send_bytes(b"\x01" + msg)
+                    try:
+                        await ws.send_bytes(b"\x01" + msg)
+                    except Exception:
+                        clog.log("info", "send_loop: ws closed, cannot send — exiting")
+                        return
+                elif close:
+                    # No pending bytes and connection is closed — we're done
+                    return
 
         clog.log("info", "accepted connection")
         if len(request.query["text_prompt"]) > 0:
@@ -266,18 +273,15 @@ class ServerState:
             self.other_mimi.reset_streaming()
             self.lm_gen.reset_streaming()
             async def is_alive():
+                # IMPORTANT: Do NOT call ws.receive() here!
+                # This function is called in a tight loop during system-prompt
+                # processing.  ws.receive() destructively consumes the next
+                # queued message, which means any audio frames the client has
+                # already sent would be silently discarded.
+                # Instead, just check the connection-closed flag.
                 if close or ws.closed:
                     return False
-                try:
-                    # Check for disconnect without waiting too long
-                    msg = await asyncio.wait_for(ws.receive(), timeout=0.01)
-                    if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                        return False
-                except asyncio.TimeoutError:
-                    # No messages → client probably still alive
-                    return True
-                except aiohttp.ClientConnectionError:
-                    return False
+                await asyncio.sleep(0)  # yield to event loop
                 return True
             # Reuse mimi for encoding voice prompt and then reset it before conversation starts
             await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
@@ -288,20 +292,27 @@ class ServerState:
                 await ws.send_bytes(b"\x00")
                 clog.log("info", "sent handshake bytes")
                 # Clean cancellation manager
-                tasks = [
-                    asyncio.create_task(recv_loop()),
-                    asyncio.create_task(opus_loop()),
-                    asyncio.create_task(send_loop()),
-                ]
+                recv_task = asyncio.create_task(recv_loop())
+                opus_task = asyncio.create_task(opus_loop())
+                send_task = asyncio.create_task(send_loop())
 
-                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                # Force-kill remaining tasks
-                for task in pending:
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
+                # Wait for recv_loop to finish first (client disconnect).
+                # Then let opus_loop & send_loop drain remaining audio.
+                await recv_task
+                clog.log("info", "recv_loop done, draining remaining audio…")
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(opus_task, send_task),
+                        timeout=120,
+                    )
+                except asyncio.TimeoutError:
+                    clog.log("warning", "opus/send drain timed out after 120 s")
+                    for task in (opus_task, send_task):
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
                 await ws.close()
                 clog.log("info", "session closed")
                 # await asyncio.gather(opus_loop(), recv_loop(), send_loop())
