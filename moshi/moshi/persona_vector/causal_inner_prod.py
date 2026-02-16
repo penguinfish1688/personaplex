@@ -275,7 +275,7 @@ def inference(
 
     for user_encoded in lm_encode_from_sphn(
         mimi,
-        lm_iterate_audio(user_audio, sample_interval_size=lm_gen._frame_size, pad=True),
+        lm_iterate_audio(user_audio, sample_interval_size=frame_size, pad=True),
         max_batch=1,
     ):
         steps = user_encoded.shape[-1]
@@ -377,12 +377,12 @@ def projection_since_time(
 
 def main():
     """
-    --inference INPUT_WAV OUTPUT_WAV OUTPUT_HIDDEN : Run inference and save output wav/text/hidden.
+    --inference INPUT_WAV : Run inference and save output wav/text/hidden in INPUT_WAV directory.
     --show_token_name TIME : show token names since time (seconds).
     --projection_on_lsb TIME : show projection on lambda_silence_bar since time (seconds).
     """
     ap = argparse.ArgumentParser("causal_inner_prod")
-    ap.add_argument("--inference", nargs=3, metavar=("INPUT_WAV", "OUTPUT_WAV", "OUTPUT_HIDDEN"), default=None)
+    ap.add_argument("--inference", type=str, metavar="INPUT_WAV", default=None)
     ap.add_argument("--output-hidden", type=str, default=None, help="Hidden payload .pt path for analysis-only mode")
     ap.add_argument("--show_token_name", type=float, default=None, help="Time in seconds")
     ap.add_argument("--projection_on_lsb", type=float, default=None, help="Time in seconds")
@@ -408,8 +408,12 @@ def main():
 
     generated_hidden_path = None
     if args.inference is not None:
-        input_wav, output_wav, output_hidden = args.inference
-        output_text = str(Path(output_wav).with_suffix(".json"))
+        input_wav = args.inference
+        input_path = Path(input_wav)
+        output_dir = input_path.parent
+        output_wav = str(output_dir / "output.wav")
+        output_hidden = str(output_dir / "output_hidden.pt")
+        output_text = str(output_dir / "output.json")
         inference(
             input_wav=input_wav,
             output_wav=output_wav,
