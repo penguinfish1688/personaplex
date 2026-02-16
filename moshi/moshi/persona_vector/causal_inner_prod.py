@@ -64,9 +64,24 @@ def gamma_average(
     tokenizer_path: Optional[str] = None,
     moshi_weight: Optional[str] = None,
     hf_repo: str = loaders.DEFAULT_REPO,
+    exclude_silence_token: bool = True,
 ) -> torch.Tensor:
-    """Calculate the average embedding for moshi's vocabulary."""
+    """Calculate the average embedding for moshi's vocabulary.
+
+    Args:
+        exclude_silence_token: if True, omit the silence token (SILENCE_TOKEN_ID)
+            from the average. Defaults to True.
+    """
     embedding_matrix = _load_text_embedding_matrix(tokenizer_path, moshi_weight, hf_repo)
+    if exclude_silence_token:
+        vocab_size = embedding_matrix.shape[0]
+        if 0 <= SILENCE_TOKEN_ID < vocab_size:
+            mask = torch.ones(vocab_size, dtype=torch.bool)
+            mask[SILENCE_TOKEN_ID] = False
+            filtered = embedding_matrix[mask]
+            if filtered.numel() == 0:
+                return embedding_matrix.mean(dim=0)
+            return filtered.mean(dim=0)
     return embedding_matrix.mean(dim=0)
 
 
