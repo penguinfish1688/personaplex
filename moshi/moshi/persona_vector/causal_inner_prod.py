@@ -122,7 +122,7 @@ def lambda_silence_bar(
     tokenizer_path: Optional[str] = None,
     moshi_weight: Optional[str] = None,
     hf_repo: str = loaders.DEFAULT_REPO,
-    ridge: float = 1e-6,
+    ridge: float = 1e-8,
 ) -> torch.Tensor:
     cov = gamma_covariance(
         tokenizer_path=tokenizer_path,
