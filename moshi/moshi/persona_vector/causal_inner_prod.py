@@ -452,6 +452,7 @@ def main():
     ap.add_argument("--greedy", action="store_true")
     ap.add_argument("--save-voice-prompt-embeddings", action="store_true")
     ap.add_argument("--cpu-offload", action="store_true")
+    ap.add_argument("--no-causal", action="store_true", help="Use gamma_silence_bar instead of lambda_silence_bar for projection")
     args = ap.parse_args()
 
     generated_hidden_path = None
@@ -495,11 +496,20 @@ def main():
     if args.projection_on_lsb is not None:
         if hidden_path is None:
             raise ValueError("--projection_on_lsb requires --output-hidden or --inference")
-        direction = lambda_silence_bar(
-            tokenizer_path=args.tokenizer,
-            moshi_weight=args.moshi_weight,
-            hf_repo=args.hf_repo,
-        )
+        if args.no_causal:
+            # Directly calculate projection on embedding
+            direction = gamma_silence_bar(
+                tokenizer_path=args.tokenizer,
+                moshi_weight=args.moshi_weight,
+                hf_repo=args.hf_repo,
+            )
+        else:
+            direction = lambda_silence_bar(
+                tokenizer_path=args.tokenizer,
+                moshi_weight=args.moshi_weight,
+                hf_repo=args.hf_repo,
+            )
+        
         projection_since_time(direction, hidden_path, args.projection_on_lsb, args.n, show_results=True)
 
 
