@@ -164,7 +164,7 @@ def _select_hidden_since_time(hidden_payload: dict, time_sec: float, n: int):
     if indices.numel() == 0:
         return torch.empty((0, hidden_states.shape[-1])), torch.empty((0,), dtype=torch.long), [], torch.empty((0,))
     if n > 0:
-        indices = indices[-n:]
+        indices = indices[:n]
 
     selected_hidden = hidden_states[indices]
     selected_ids = token_ids[indices]
@@ -341,7 +341,7 @@ def inference(
 
 
 def hidden_since_time(output_hidden: str, time: float, n: int, show_token_name: bool = False) -> torch.Tensor:
-    """Return hidden states of last n tokens since the given time (seconds)."""
+    """Return hidden states of first n tokens since the given time (seconds)."""
     payload = torch.load(output_hidden, map_location="cpu")
     hidden, token_ids, token_names, times = _select_hidden_since_time(payload, time, n)
     if show_token_name:
@@ -357,7 +357,7 @@ def projection_since_time(
     n: int,
     show_results: bool = True,
 ) -> torch.Tensor:
-    """Project hidden states in output_hidden onto direction for last n tokens since time."""
+    """Project hidden states in output_hidden onto direction for first n tokens since time."""
     payload = torch.load(output_hidden, map_location="cpu")
     hidden, token_ids, token_names, times = _select_hidden_since_time(payload, time, n)
     if hidden.numel() == 0:
@@ -386,7 +386,7 @@ def main():
     ap.add_argument("--output-hidden", type=str, default=None, help="Hidden payload .pt path for analysis-only mode")
     ap.add_argument("--show_token_name", type=float, default=None, help="Time in seconds")
     ap.add_argument("--projection_on_lsb", type=float, default=None, help="Time in seconds")
-    ap.add_argument("--n", type=int, default=20, help="Number of latest tokens to show since given time")
+    ap.add_argument("--n", type=int, default=20, help="Number of first tokens to show since given time (0 means all)")
 
     ap.add_argument("--voice-prompt", type=str, default="NATF0.pt")
     ap.add_argument("--voice-prompt-dir", type=str, default=None)
@@ -456,5 +456,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # cd /home/penguinfish/personaplex/personaplex/moshi && python3 -m moshi.persona_vector.causal_inner_prod --show_token_name 5.0 --output-hidden /home/penguinfish/personaplex/personaplex/tmp/causal_inner_prod_out/turn-taking-example/output_hidden.pt --n 15
+    # python3 -m moshi.persona_vector.causal_inner_prod --projection_on_lsb 5.0 --output-hidden /home/penguinfish/personaplex/personaplex/tmp/causal_inner_prod_out/turn-taking-example/output_hidden.pt --n 15
     main()
 
