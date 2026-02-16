@@ -364,14 +364,47 @@ def projection_since_time(
         return torch.empty((0,), dtype=torch.float32)
 
     direction = direction.detach().cpu().float().reshape(-1)
+    direction_norm = torch.linalg.norm(direction)
+    if direction_norm.item() == 0:
+        raise ValueError("Projection direction has zero norm.")
+    direction_unit = direction / direction_norm
+
     projections = []
+    cosine_hidden_projection = []
+    residual_norms = []
     for row in hidden:
-        projections.append(calculate_projection(row.float().reshape(-1), direction))
+        hidden_row = row.float().reshape(-1)
+        scalar_projection = calculate_projection(hidden_row, direction)
+        projection_vector = scalar_projection * direction_unit
+
+        hidden_norm = torch.linalg.norm(hidden_row)
+        projection_norm = torch.linalg.norm(projection_vector)
+        if hidden_norm.item() == 0 or projection_norm.item() == 0:
+            cosine_value = 0.0
+        else:
+            cosine_value = torch.dot(hidden_row, projection_vector).item() / (hidden_norm.item() * projection_norm.item())
+
+        residual_norm = torch.linalg.norm(hidden_row - projection_vector).item()
+
+        projections.append(scalar_projection)
+        cosine_hidden_projection.append(cosine_value)
+        residual_norms.append(residual_norm)
+
     proj_tensor = torch.tensor(projections, dtype=torch.float32)
 
     if show_results:
-        for t, tid, tname, value in zip(times.tolist(), token_ids.tolist(), token_names, proj_tensor.tolist()):
-            print(f"time={t:.3f}s token_id={tid} token_name={tname} projection={value:.6f}")
+        for t, tid, tname, value, cosine_value, residual_norm in zip(
+            times.tolist(),
+            token_ids.tolist(),
+            token_names,
+            proj_tensor.tolist(),
+            cosine_hidden_projection,
+            residual_norms,
+        ):
+            print(
+                f"time={t:.3f}s token_id={tid} token_name={tname} projection={value:.6f} "
+                f"cos_hidden_projection={cosine_value:.6f} hidden_minus_projection_norm={residual_norm:.6f}"
+            )
     return proj_tensor
 
 
