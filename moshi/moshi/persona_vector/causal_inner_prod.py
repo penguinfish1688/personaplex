@@ -510,6 +510,15 @@ def main():
                 hf_repo=args.hf_repo,
             )
         
+        print("Cosine between gamma_silence_bar and lambda_silence_bar:", torch.nn.functional.cosine_similarity(
+            gamma_silence_bar(
+                tokenizer_path=args.tokenizer,
+                moshi_weight=args.moshi_weight,
+                hf_repo=args.hf_repo,
+            ).reshape(1, -1),
+            direction.reshape(1, -1),
+        ).item())
+
         projection_since_time(direction, hidden_path, args.projection_on_lsb, args.n, show_results=True)
 
 
@@ -517,4 +526,5 @@ if __name__ == "__main__":
     # cd /home/penguinfish/personaplex/personaplex/moshi && python3 -m moshi.persona_vector.causal_inner_prod --show_token_name 5.0 --output-hidden /home/penguinfish/personaplex/personaplex/tmp/causal_inner_prod_out/turn-taking-example/output_hidden.pt --n 15
     # python3 -m moshi.persona_vector.causal_inner_prod --projection_on_lsb 5.0 --output-hidden /home/penguinfish/personaplex/personaplex/tmp/causal_inner_prod_out/turn-taking-example/output_hidden.pt --n 15
     main()
+
 
