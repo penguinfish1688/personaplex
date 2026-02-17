@@ -448,8 +448,10 @@ def main():
     """
     --inference INPUT_WAV : Run inference and save output wav/text/hidden in INPUT_WAV directory.
     --inferece-batch ROOT_DIR : Run inference for ROOT_DIR/*/input.wav and write outputs beside each input.
-    --show_token_name TIME : show token names since time (seconds).
-    --projection_on_lsb TIME : show projection on lambda_silence_bar since time (seconds).
+    --show-token TIME : show token names since time (seconds).
+    --show-token-batch ROOT_DIR : show token names for ROOT_DIR/*/output_hidden.pt since time.
+    --projection TIME : show projection on selected direction since time (seconds).
+    --projection-batch ROOT_DIR : show projection for ROOT_DIR/*/output_hidden.pt since time.
     """
     ap = argparse.ArgumentParser("causal_inner_prod")
     ap.add_argument("--inference", type=str, metavar="INPUT_WAV", default=None)
@@ -463,8 +465,24 @@ def main():
         help="Batch mode: find ROOT_DIR/*/input.wav and write output.wav/output.json/output_hidden.pt per folder",
     )
     ap.add_argument("--output-hidden", type=str, default=None, help="Hidden payload .pt path for analysis-only mode")
-    ap.add_argument("--show_token_name", type=float, default=None, help="Time in seconds")
-    ap.add_argument("--projection_on_lsb", type=float, default=None, help="Time in seconds")
+    ap.add_argument("--show-token", type=float, default=None, dest="show_token", help="Time in seconds")
+    ap.add_argument(
+        "--show-token-batch",
+        type=str,
+        default=None,
+        dest="show_token_batch",
+        metavar="ROOT_DIR",
+        help="Batch mode: show token names for ROOT_DIR/*/output_hidden.pt",
+    )
+    ap.add_argument("--projection", type=float, default=None, dest="projection", help="Time in seconds")
+    ap.add_argument(
+        "--projection-batch",
+        type=str,
+        default=None,
+        dest="projection_batch",
+        metavar="ROOT_DIR",
+        help="Batch mode: show projection for ROOT_DIR/*/output_hidden.pt",
+    )
     ap.add_argument("--n", type=int, default=20, help="Number of first tokens to show since given time (0 means all)")
 
     ap.add_argument("--voice-prompt", type=str, default="NATF0.pt")
@@ -550,14 +568,28 @@ def main():
         )
 
     hidden_path = args.output_hidden or generated_hidden_path
-    if args.show_token_name is not None:
-        if hidden_path is None:
-            raise ValueError("--show_token_name requires --output-hidden or --inference")
-        hidden_since_time(hidden_path, args.show_token_name, args.n, show_token_name=True)
+    if args.show_token_batch is not None and args.show_token is None:
+        raise ValueError("--show-token-batch requires --show-token TIME")
+    if args.projection_batch is not None and args.projection is None:
+        raise ValueError("--projection-batch requires --projection TIME")
 
-    if args.projection_on_lsb is not None:
+    if args.show_token is not None and args.show_token_batch is None:
         if hidden_path is None:
-            raise ValueError("--projection_on_lsb requires --output-hidden or --inference")
+            raise ValueError("--show-token requires --output-hidden or --inference")
+        hidden_since_time(hidden_path, args.show_token, args.n, show_token_name=True)
+
+    if args.show_token_batch is not None:
+        root_dir = Path(args.show_token_batch)
+        hidden_paths = sorted(str(p) for p in root_dir.glob("*/output_hidden.pt"))
+        if len(hidden_paths) == 0:
+            raise FileNotFoundError(f"No files matched pattern {root_dir}/*/output_hidden.pt")
+        for hp in tqdm(hidden_paths, desc="show-token", unit="file"):
+            print(f"=== {hp} ===")
+            hidden_since_time(hp, args.show_token, args.n, show_token_name=True)
+
+    if args.projection is not None and args.projection_batch is None:
+        if hidden_path is None:
+            raise ValueError("--projection requires --output-hidden or --inference")
         if args.no_causal:
             # Directly calculate projection on embedding
             direction = gamma_silence_bar(
@@ -581,7 +613,38 @@ def main():
             direction.reshape(1, -1),
         ).item())
 
-        projection_since_time(direction, hidden_path, args.projection_on_lsb, args.n, show_results=True)
+        projection_since_time(direction, hidden_path, args.projection, args.n, show_results=True)
+
+    if args.projection_batch is not None:
+        root_dir = Path(args.projection_batch)
+        hidden_paths = sorted(str(p) for p in root_dir.glob("*/output_hidden.pt"))
+        if len(hidden_paths) == 0:
+            raise FileNotFoundError(f"No files matched pattern {root_dir}/*/output_hidden.pt")
+        if args.no_causal:
+            direction = gamma_silence_bar(
+                tokenizer_path=args.tokenizer,
+                moshi_weight=args.moshi_weight,
+                hf_repo=args.hf_repo,
+            )
+        else:
+            direction = lambda_silence_bar(
+                tokenizer_path=args.tokenizer,
+                moshi_weight=args.moshi_weight,
+                hf_repo=args.hf_repo,
+            )
+
+        print("Cosine between gamma_silence_bar and lambda_silence_bar:", torch.nn.functional.cosine_similarity(
+            gamma_silence_bar(
+                tokenizer_path=args.tokenizer,
+                moshi_weight=args.moshi_weight,
+                hf_repo=args.hf_repo,
+            ).reshape(1, -1),
+            direction.reshape(1, -1),
+        ).item())
+
+        for hp in tqdm(hidden_paths, desc="projection", unit="file"):
+            print(f"=== {hp} ===")
+            projection_since_time(direction, hp, args.projection, args.n, show_results=True)
 
 
 if __name__ == "__main__":
