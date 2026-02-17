@@ -216,7 +216,7 @@ def plot_projection_around_turn_taking(
     """Plot mean projection (with stderr) around turn-taking start for lambda/gamma.
 
     For each folder in root_dir/* with output_hidden.pt, uses center index from CSV and
-    aggregates projections on offsets [-5, +5].
+    aggregates projections on offsets [-10, +10].
     """
     try:
         import matplotlib.pyplot as plt
@@ -243,7 +243,7 @@ def plot_projection_around_turn_taking(
         hf_repo=hf_repo,
     ).detach().cpu().float().reshape(-1)
 
-    offsets = np.arange(-5, 6, dtype=int)
+    offsets = np.arange(-10, 11, dtype=int)
     lambda_samples: dict[int, list[float]] = {int(o): [] for o in offsets.tolist()}
     gamma_samples: dict[int, list[float]] = {int(o): [] for o in offsets.tolist()}
 
