@@ -12,6 +12,7 @@ import numpy as np
 import sentencepiece
 import sphn
 import torch
+from tqdm import tqdm
 from huggingface_hub import hf_hub_download
 
 from moshi.models import loaders, LMGen, MimiModel
@@ -192,10 +193,10 @@ def _select_hidden_since_time(hidden_payload: dict, time_sec: float, n: int):
 
 
 def inference(
-    input_wav: str,
-    output_wav: str,
-    output_hidden: str,
-    output_text: str,
+    input_wav: str | list[str],
+    output_wav: Optional[str],
+    output_hidden: Optional[str],
+    output_text: Optional[str],
     text_prompt: str,
     voice_prompt: str,
     voice_prompt_dir: Optional[str],
@@ -213,7 +214,7 @@ def inference(
     save_voice_prompt_embeddings: bool,
     cpu_offload: bool = False,
 ):
-    """Inference an input_wav and save output wav/text and hidden vectors to output_hidden."""
+    """Inference one or many input wavs and save wav/text/hidden outputs."""
     device = _resolve_device(device)
     if seed is not None and seed != -1:
         seed_all(seed)
@@ -268,91 +269,111 @@ def inference(
         tokenizer_any.EncodeAsIds(wrap_with_system_tags(text_prompt)) if len(text_prompt) > 0 else None
     )
 
-    mimi.reset_streaming()
-    other_mimi.reset_streaming()
-    lm_gen.reset_streaming()
-    lm_gen.step_system_prompts(mimi)
-    mimi.reset_streaming()
+    if isinstance(input_wav, str):
+        input_wavs = [input_wav]
+    else:
+        input_wavs = [str(x) for x in input_wav]
+    if len(input_wavs) == 0:
+        raise ValueError("No input wav files were provided.")
 
-    sample_rate = mimi.sample_rate
-    user_audio = lm_load_audio(input_wav, sample_rate)
+    file_iterator = tqdm(input_wavs, desc="inference", unit="file") if len(input_wavs) > 1 else input_wavs
+    for input_wav_one in file_iterator:
+        input_path = Path(input_wav_one)
+        if len(input_wavs) == 1 and output_wav is not None and output_hidden is not None and output_text is not None:
+            output_wav_one = output_wav
+            output_hidden_one = output_hidden
+            output_text_one = output_text
+        else:
+            output_dir = input_path.parent
+            output_wav_one = str(output_dir / "output.wav")
+            output_hidden_one = str(output_dir / "output_hidden.pt")
+            output_text_one = str(output_dir / "output.json")
 
-    generated_frames: list[np.ndarray] = []
-    generated_text_tokens: list[str] = []
-    hidden_vectors: list[torch.Tensor] = []
-    token_ids: list[int] = []
-    token_names: list[str] = []
-    times: list[float] = []
+        mimi.reset_streaming()
+        other_mimi.reset_streaming()
+        lm_gen.reset_streaming()
+        lm_gen.step_system_prompts(mimi)
+        mimi.reset_streaming()
 
-    total_target_samples = user_audio.shape[-1]
-    frame_rate = float(mimi.frame_rate)
-    step_idx = 0
+        sample_rate = mimi.sample_rate
+        user_audio = lm_load_audio(input_wav_one, sample_rate)
 
-    for user_encoded in lm_encode_from_sphn(
-        mimi,
-        lm_iterate_audio(user_audio, sample_interval_size=frame_size, pad=True),
-        max_batch=1,
-    ):
-        steps = user_encoded.shape[-1]
-        for c in range(steps):
-            step_in = user_encoded[:, :, c : c + 1]
-            result = lm_gen.step(step_in, return_hidden_layers=True)
-            tokens, hidden_layers = cast(tuple[torch.Tensor | None, HiddenLayerOutputs | None], result)
-            if tokens is None:
+        generated_frames: list[np.ndarray] = []
+        generated_text_tokens: list[str] = []
+        hidden_vectors: list[torch.Tensor] = []
+        token_ids: list[int] = []
+        token_names: list[str] = []
+        times: list[float] = []
+
+        total_target_samples = user_audio.shape[-1]
+        frame_rate = float(mimi.frame_rate)
+        step_idx = 0
+
+        for user_encoded in lm_encode_from_sphn(
+            mimi,
+            lm_iterate_audio(user_audio, sample_interval_size=frame_size, pad=True),
+            max_batch=1,
+        ):
+            steps = user_encoded.shape[-1]
+            for c in range(steps):
+                step_in = user_encoded[:, :, c : c + 1]
+                result = lm_gen.step(step_in, return_hidden_layers=True)
+                tokens, hidden_layers = cast(tuple[torch.Tensor | None, HiddenLayerOutputs | None], result)
+                if tokens is None:
+                    step_idx += 1
+                    continue
+
+                pcm = decode_tokens_to_pcm(mimi, other_mimi, lm_gen, tokens)
+                generated_frames.append(pcm)
+
+                text_token_id = int(tokens[0, 0, 0].item())
+                text_name = _token_name(text_tokenizer, text_token_id)
+                generated_text_tokens.append(text_name)
+                token_ids.append(text_token_id)
+                token_names.append(text_name)
+
+                if hidden_layers is None or hidden_layers.text_transformer is None:
+                    raise RuntimeError("Hidden layers were requested but not returned.")
+                last_text_hidden = hidden_layers.text_transformer[-1]
+                hidden_vectors.append(last_text_hidden.detach().cpu().float().reshape(-1))
+                times.append(step_idx / frame_rate)
                 step_idx += 1
-                continue
 
-            pcm = decode_tokens_to_pcm(mimi, other_mimi, lm_gen, tokens)
-            generated_frames.append(pcm)
+        if len(generated_frames) == 0:
+            raise RuntimeError(f"No audio frames were generated for {input_wav_one}. Check input/configuration.")
 
-            text_token_id = int(tokens[0, 0, 0].item())
-            text_name = _token_name(text_tokenizer, text_token_id)
-            generated_text_tokens.append(text_name)
-            token_ids.append(text_token_id)
-            token_names.append(text_name)
+        output_pcm = np.concatenate(generated_frames, axis=-1)
+        if output_pcm.shape[-1] > total_target_samples:
+            output_pcm = output_pcm[:total_target_samples]
+        elif output_pcm.shape[-1] < total_target_samples:
+            pad_len = total_target_samples - output_pcm.shape[-1]
+            output_pcm = np.concatenate([output_pcm, np.zeros(pad_len, dtype=output_pcm.dtype)], axis=-1)
 
-            if hidden_layers is None or hidden_layers.text_transformer is None:
-                raise RuntimeError("Hidden layers were requested but not returned.")
-            last_text_hidden = hidden_layers.text_transformer[-1]
-            hidden_vectors.append(last_text_hidden.detach().cpu().float().reshape(-1))
-            times.append(step_idx / frame_rate)
-            step_idx += 1
+        Path(output_wav_one).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_text_one).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_hidden_one).parent.mkdir(parents=True, exist_ok=True)
 
-    if len(generated_frames) == 0:
-        raise RuntimeError("No audio frames were generated. Check input/configuration.")
+        sphn.write_wav(output_wav_one, output_pcm, sample_rate)
+        with open(output_text_one, "w") as file:
+            json.dump(generated_text_tokens, file, ensure_ascii=False)
 
-    output_pcm = np.concatenate(generated_frames, axis=-1)
-    if output_pcm.shape[-1] > total_target_samples:
-        output_pcm = output_pcm[:total_target_samples]
-    elif output_pcm.shape[-1] < total_target_samples:
-        pad_len = total_target_samples - output_pcm.shape[-1]
-        output_pcm = np.concatenate([output_pcm, np.zeros(pad_len, dtype=output_pcm.dtype)], axis=-1)
+        hidden_payload = {
+            "hidden_states": torch.stack(hidden_vectors, dim=0),
+            "token_ids": torch.tensor(token_ids, dtype=torch.long),
+            "token_names": token_names,
+            "times": torch.tensor(times, dtype=torch.float32),
+            "frame_rate": frame_rate,
+            "sample_rate": int(sample_rate),
+            "input_wav": str(input_wav_one),
+            "output_wav": str(output_wav_one),
+            "output_text": str(output_text_one),
+            "text_prompt": text_prompt,
+        }
+        torch.save(hidden_payload, output_hidden_one)
 
-    Path(output_wav).parent.mkdir(parents=True, exist_ok=True)
-    Path(output_text).parent.mkdir(parents=True, exist_ok=True)
-    Path(output_hidden).parent.mkdir(parents=True, exist_ok=True)
-
-    sphn.write_wav(output_wav, output_pcm, sample_rate)
-    with open(output_text, "w") as file:
-        json.dump(generated_text_tokens, file, ensure_ascii=False)
-
-    hidden_payload = {
-        "hidden_states": torch.stack(hidden_vectors, dim=0),
-        "token_ids": torch.tensor(token_ids, dtype=torch.long),
-        "token_names": token_names,
-        "times": torch.tensor(times, dtype=torch.float32),
-        "frame_rate": frame_rate,
-        "sample_rate": int(sample_rate),
-        "input_wav": str(input_wav),
-        "output_wav": str(output_wav),
-        "output_text": str(output_text),
-        "text_prompt": text_prompt,
-    }
-    torch.save(hidden_payload, output_hidden)
-
-    print(f"Wrote output audio to {output_wav}")
-    print(f"Wrote output text to {output_text}")
-    print(f"Wrote output hidden payload to {output_hidden}")
+        print(f"Wrote output audio to {output_wav_one}")
+        print(f"Wrote output text to {output_text_one}")
+        print(f"Wrote output hidden payload to {output_hidden_one}")
 
 
 def hidden_since_time(output_hidden: str, time: float, n: int, show_token_name: bool = False) -> torch.Tensor:
@@ -426,11 +447,21 @@ def projection_since_time(
 def main():
     """
     --inference INPUT_WAV : Run inference and save output wav/text/hidden in INPUT_WAV directory.
+    --inferece-batch ROOT_DIR : Run inference for ROOT_DIR/*/input.wav and write outputs beside each input.
     --show_token_name TIME : show token names since time (seconds).
     --projection_on_lsb TIME : show projection on lambda_silence_bar since time (seconds).
     """
     ap = argparse.ArgumentParser("causal_inner_prod")
     ap.add_argument("--inference", type=str, metavar="INPUT_WAV", default=None)
+    ap.add_argument(
+        "--inferece-batch",
+        "--inference-batch",
+        dest="inferece_batch",
+        type=str,
+        metavar="ROOT_DIR",
+        default=None,
+        help="Batch mode: find ROOT_DIR/*/input.wav and write output.wav/output.json/output_hidden.pt per folder",
+    )
     ap.add_argument("--output-hidden", type=str, default=None, help="Hidden payload .pt path for analysis-only mode")
     ap.add_argument("--show_token_name", type=float, default=None, help="Time in seconds")
     ap.add_argument("--projection_on_lsb", type=float, default=None, help="Time in seconds")
@@ -456,6 +487,9 @@ def main():
     args = ap.parse_args()
 
     generated_hidden_path = None
+    if args.inference is not None and args.inferece_batch is not None:
+        raise ValueError("Use only one of --inference or --inferece-batch")
+
     if args.inference is not None:
         input_wav = args.inference
         input_path = Path(input_wav)
@@ -486,6 +520,34 @@ def main():
             cpu_offload=args.cpu_offload,
         )
         generated_hidden_path = output_hidden
+
+    if args.inferece_batch is not None:
+        root_dir = Path(args.inferece_batch)
+        input_wavs = sorted(str(p) for p in root_dir.glob("*/input.wav"))
+        if len(input_wavs) == 0:
+            raise FileNotFoundError(f"No files matched pattern {root_dir}/*/input.wav")
+        inference(
+            input_wav=input_wavs,
+            output_wav=None,
+            output_hidden=None,
+            output_text=None,
+            text_prompt=args.text_prompt,
+            voice_prompt=args.voice_prompt,
+            voice_prompt_dir=args.voice_prompt_dir,
+            tokenizer_path=args.tokenizer,
+            moshi_weight=args.moshi_weight,
+            mimi_weight=args.mimi_weight,
+            hf_repo=args.hf_repo,
+            device=args.device,
+            seed=args.seed,
+            temp_audio=args.temp_audio,
+            temp_text=args.temp_text,
+            topk_audio=args.topk_audio,
+            topk_text=args.topk_text,
+            greedy=args.greedy,
+            save_voice_prompt_embeddings=args.save_voice_prompt_embeddings,
+            cpu_offload=args.cpu_offload,
+        )
 
     hidden_path = args.output_hidden or generated_hidden_path
     if args.show_token_name is not None:
@@ -523,6 +585,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # python3 -m moshi.persona_vector.causal_inner_prod --inference /home/penguinfish/personaplex/personaplex/tmp/causal_inner_prod_out/turn-taking-example/input.wav 
     # cd /home/penguinfish/personaplex/personaplex/moshi && python3 -m moshi.persona_vector.causal_inner_prod --show_token_name 5.0 --output-hidden /home/penguinfish/personaplex/personaplex/tmp/causal_inner_prod_out/turn-taking-example/output_hidden.pt --n 15
     # python3 -m moshi.persona_vector.causal_inner_prod --projection_on_lsb 5.0 --output-hidden /home/penguinfish/personaplex/personaplex/tmp/causal_inner_prod_out/turn-taking-example/output_hidden.pt --n 15
     main()
