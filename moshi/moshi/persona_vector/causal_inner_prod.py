@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import csv
 import gc
 import json
 import os
@@ -177,6 +178,160 @@ def _glob_sorted_by_parent_numeric(root_dir: Path, pattern: str):
             return (1, parent)
 
     return [p for p in sorted(paths, key=_key)]
+
+
+def _load_turn_taking_start_map(csv_path: str) -> dict[str, int]:
+    """Load mapping from folder name to turn-taking start step index.
+
+    CSV format: first column is folder/file number, second column is step index.
+    Rows with second column -1 are ignored.
+    """
+    mapping: dict[str, int] = {}
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if len(row) < 2:
+                continue
+            folder_raw = row[0].strip()
+            step_raw = row[1].strip()
+            if folder_raw == "":
+                continue
+            try:
+                step_idx = int(float(step_raw))
+            except ValueError:
+                continue
+            if step_idx == -1:
+                continue
+            mapping[folder_raw] = step_idx
+    return mapping
+
+
+def plot_projection_around_turn_taking(
+    root_dir: str,
+    turn_taking_start_csv: str,
+    tokenizer_path: Optional[str],
+    moshi_weight: Optional[str],
+    hf_repo: str,
+):
+    """Plot mean projection (with stderr) around turn-taking start for lambda/gamma.
+
+    For each folder in root_dir/* with output_hidden.pt, uses center index from CSV and
+    aggregates projections on offsets [-5, +5].
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise ImportError("matplotlib is required for --plot-projection") from exc
+
+    root = Path(root_dir)
+    hidden_paths = _glob_sorted_by_parent_numeric(root, "*/output_hidden.pt")
+    if len(hidden_paths) == 0:
+        raise FileNotFoundError(f"No files matched pattern {root}/*/output_hidden.pt")
+
+    turn_map = _load_turn_taking_start_map(turn_taking_start_csv)
+    if len(turn_map) == 0:
+        raise ValueError(f"No valid entries found in turn-taking CSV: {turn_taking_start_csv}")
+
+    lambda_dir = lambda_silence_bar(
+        tokenizer_path=tokenizer_path,
+        moshi_weight=moshi_weight,
+        hf_repo=hf_repo,
+    ).detach().cpu().float().reshape(-1)
+    gamma_dir = gamma_silence_bar(
+        tokenizer_path=tokenizer_path,
+        moshi_weight=moshi_weight,
+        hf_repo=hf_repo,
+    ).detach().cpu().float().reshape(-1)
+
+    offsets = np.arange(-5, 6, dtype=int)
+    lambda_samples: dict[int, list[float]] = {int(o): [] for o in offsets.tolist()}
+    gamma_samples: dict[int, list[float]] = {int(o): [] for o in offsets.tolist()}
+
+    valid_file_count = 0
+    frame_rates: list[float] = []
+
+    for hidden_path in tqdm(hidden_paths, desc="plot-projection", unit="file"):
+        folder_name = hidden_path.parent.name
+        if folder_name not in turn_map:
+            continue
+
+        center_idx = turn_map[folder_name]
+        payload = torch.load(str(hidden_path), map_location="cpu")
+        hidden_states = payload["hidden_states"]
+        frame_rate = float(payload.get("frame_rate", 12.5))
+        frame_rates.append(frame_rate)
+
+        valid_file_count += 1
+        total_steps = hidden_states.shape[0]
+        for offset in offsets.tolist():
+            token_idx = center_idx + int(offset)
+            if token_idx < 0 or token_idx >= total_steps:
+                continue
+            hidden_vec = hidden_states[token_idx].detach().cpu().float().reshape(-1)
+            lambda_samples[int(offset)].append(calculate_projection(hidden_vec, lambda_dir))
+            gamma_samples[int(offset)].append(calculate_projection(hidden_vec, gamma_dir))
+
+    if valid_file_count == 0:
+        raise ValueError("No matching files between root_dir/*/output_hidden.pt and CSV first column")
+
+    ref_frame_rate = float(np.mean(frame_rates)) if len(frame_rates) > 0 else 12.5
+    x_seconds = offsets.astype(np.float32) / ref_frame_rate
+
+    lambda_mean = []
+    lambda_sem = []
+    gamma_mean = []
+    gamma_sem = []
+    for offset in offsets.tolist():
+        lam = np.asarray(lambda_samples[int(offset)], dtype=np.float32)
+        gam = np.asarray(gamma_samples[int(offset)], dtype=np.float32)
+
+        if lam.size == 0:
+            lambda_mean.append(np.nan)
+            lambda_sem.append(np.nan)
+        else:
+            lambda_mean.append(float(lam.mean()))
+            lambda_sem.append(float(lam.std(ddof=0) / np.sqrt(valid_file_count)))
+
+        if gam.size == 0:
+            gamma_mean.append(np.nan)
+            gamma_sem.append(np.nan)
+        else:
+            gamma_mean.append(float(gam.mean()))
+            gamma_sem.append(float(gam.std(ddof=0) / np.sqrt(valid_file_count)))
+
+    lambda_mean_arr = np.asarray(lambda_mean, dtype=np.float32)
+    lambda_sem_arr = np.asarray(lambda_sem, dtype=np.float32)
+    gamma_mean_arr = np.asarray(gamma_mean, dtype=np.float32)
+    gamma_sem_arr = np.asarray(gamma_sem, dtype=np.float32)
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(x_seconds, lambda_mean_arr, marker="o", label="projection on lambda_silence_bar")
+    plt.fill_between(
+        x_seconds,
+        lambda_mean_arr - lambda_sem_arr,
+        lambda_mean_arr + lambda_sem_arr,
+        alpha=0.2,
+    )
+
+    plt.plot(x_seconds, gamma_mean_arr, marker="o", label="projection on gamma_silence_bar")
+    plt.fill_between(
+        x_seconds,
+        gamma_mean_arr - gamma_sem_arr,
+        gamma_mean_arr + gamma_sem_arr,
+        alpha=0.2,
+    )
+
+    plt.axvline(0.0, linestyle="--", linewidth=1)
+    plt.xlabel("Time relative to turn-taking start (s)")
+    plt.ylabel("Projection value")
+    plt.title(f"Projection around turn-taking start (n={valid_file_count})")
+    plt.legend()
+    plt.tight_layout()
+
+    save_path = root / "projection_around_turn_taking.png"
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+    print(f"Wrote projection plot to {save_path}")
 
 
 def _select_hidden_since_time(hidden_payload: dict, time_sec: float, n: int):
@@ -526,6 +681,20 @@ def main():
     ap.add_argument("--save-voice-prompt-embeddings", action="store_true")
     ap.add_argument("--cpu-offload", action="store_true")
     ap.add_argument("--no-causal", action="store_true", help="Use gamma_silence_bar instead of lambda_silence_bar for projection")
+    ap.add_argument(
+        "--plot-projection",
+        type=str,
+        default=None,
+        metavar="ROOT_DIR",
+        help="Plot average projection around turn-taking start for ROOT_DIR/*/output_hidden.pt",
+    )
+    ap.add_argument(
+        "--turn-taking-start",
+        type=str,
+        default=None,
+        metavar="CSV_PATH",
+        help="CSV with (folder_name, center_step_index); rows with -1 are ignored",
+    )
     args = ap.parse_args()
 
     generated_hidden_path = None
@@ -669,6 +838,27 @@ def main():
         for hp in tqdm(hidden_paths, desc="projection", unit="file"):
             print(f"=== {hp} ===")
             projection_since_time(direction, hp, args.projection, args.n, show_results=True)
+
+    if args.plot_projection is not None:
+        """Prompt for the plot
+        /home/penguinfish/personaplex/personaplex/tmp/turn_taking_start.csv
+        Plot the projection on lambda_silence_bar and gamma_silence_bar. y axis will be the projection value
+        and x axis will be the time in seconds. The middle of x axis will be the time step index indicate at turn_taking_start.csv
+        The first column of .csv is the file number under <root-dir>/THE NUMBER/input.wav, and the second column is the time step index
+        Take +-5 step from the middle time step index and plot the projection values for those steps. The value is the average projection of
+        <root-dir>/*/output_hidden.pt for the tokens at those steps. And if the second column of .csv is -1, then ignore that. The plot should
+        have two lines, one for projection on lambda_silence_bar and one for projection on gamma_silence_bar. There should be uncertainty for each
+        point on each step, i.e. std/sqrt(n) where n is the number of files under <root-dir>. Usage: --plot-projection <root-dir> --turn-taking-start <path-to-csv>
+        """
+        if args.turn_taking_start is None:
+            raise ValueError("--plot-projection requires --turn-taking-start CSV_PATH")
+        plot_projection_around_turn_taking(
+            root_dir=args.plot_projection,
+            turn_taking_start_csv=args.turn_taking_start,
+            tokenizer_path=args.tokenizer,
+            moshi_weight=args.moshi_weight,
+            hf_repo=args.hf_repo,
+        )
 
 
 if __name__ == "__main__":
