@@ -163,6 +163,22 @@ def _token_name(text_tokenizer: sentencepiece.SentencePieceProcessor, token_id: 
     return piece.replace("▁", " ")
 
 
+def _glob_sorted_by_parent_numeric(root_dir: Path, pattern: str):
+    """Return list of Path objects matching pattern under root_dir/*/..., sorted
+    so numeric parent directory names come first in ascending numeric order,
+    followed by non-numeric names in lexicographic order."""
+    paths = list(root_dir.glob(pattern))
+
+    def _key(p: Path):
+        parent = p.parent.name
+        try:
+            return (0, int(parent))
+        except Exception:
+            return (1, parent)
+
+    return [p for p in sorted(paths, key=_key)]
+
+
 def _select_hidden_since_time(hidden_payload: dict, time_sec: float, n: int):
     hidden_states = hidden_payload["hidden_states"]
     token_ids = hidden_payload["token_ids"]
@@ -549,7 +565,7 @@ def main():
 
     if args.inferece_batch is not None:
         root_dir = Path(args.inferece_batch)
-        input_wavs = sorted(str(p) for p in root_dir.glob("*/input.wav"))
+        input_wavs = [str(p) for p in _glob_sorted_by_parent_numeric(root_dir, "*/input.wav")]
         if len(input_wavs) == 0:
             raise FileNotFoundError(f"No files matched pattern {root_dir}/*/input.wav")
         inference(
@@ -588,7 +604,7 @@ def main():
 
     if args.show_token_batch is not None:
         root_dir = Path(args.show_token_batch)
-        hidden_paths = sorted(str(p) for p in root_dir.glob("*/output_hidden.pt"))
+        hidden_paths = [str(p) for p in _glob_sorted_by_parent_numeric(root_dir, "*/output_hidden.pt")]
         if len(hidden_paths) == 0:
             raise FileNotFoundError(f"No files matched pattern {root_dir}/*/output_hidden.pt")
         for hp in tqdm(hidden_paths, desc="show-token", unit="file"):
@@ -625,7 +641,7 @@ def main():
 
     if args.projection_batch is not None:
         root_dir = Path(args.projection_batch)
-        hidden_paths = sorted(str(p) for p in root_dir.glob("*/output_hidden.pt"))
+        hidden_paths = [str(p) for p in _glob_sorted_by_parent_numeric(root_dir, "*/output_hidden.pt")]
         if len(hidden_paths) == 0:
             raise FileNotFoundError(f"No files matched pattern {root_dir}/*/output_hidden.pt")
         if args.no_causal:
