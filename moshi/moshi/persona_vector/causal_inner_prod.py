@@ -178,18 +178,25 @@ def _select_hidden_since_time(hidden_payload: dict, time_sec: float, n: int):
     mask = times >= float(time_sec)
     indices = torch.where(mask)[0]
     if indices.numel() == 0:
-        return torch.empty((0, hidden_states.shape[-1])), torch.empty((0,), dtype=torch.long), [], torch.empty((0,))
+        return (
+            torch.empty((0, hidden_states.shape[-1])),
+            torch.empty((0,), dtype=torch.long),
+            [],
+            torch.empty((0,)),
+            torch.empty((0,), dtype=torch.long),
+        )
     if n > 0:
         indices = indices[:n]
 
     selected_hidden = hidden_states[indices]
     selected_ids = token_ids[indices]
     selected_times = times[indices]
+    selected_step_indices = indices.to(dtype=torch.long)
     if token_names is None:
         selected_names = [str(int(tid)) for tid in selected_ids.tolist()]
     else:
         selected_names = [str(token_names[i]) for i in indices.tolist()]
-    return selected_hidden, selected_ids, selected_names, selected_times
+    return selected_hidden, selected_ids, selected_names, selected_times, selected_step_indices
 
 
 def inference(
@@ -379,10 +386,10 @@ def inference(
 def hidden_since_time(output_hidden: str, time: float, n: int, show_token_name: bool = False) -> torch.Tensor:
     """Return hidden states of first n tokens since the given time (seconds)."""
     payload = torch.load(output_hidden, map_location="cpu")
-    hidden, token_ids, token_names, times = _select_hidden_since_time(payload, time, n)
+    hidden, token_ids, token_names, times, step_indices = _select_hidden_since_time(payload, time, n)
     if show_token_name:
-        for t, tid, tname in zip(times.tolist(), token_ids.tolist(), token_names):
-            print(f"time={t:.3f}s token_id={tid} token_name={tname}")
+        for step_idx, t, tid, tname in zip(step_indices.tolist(), times.tolist(), token_ids.tolist(), token_names):
+            print(f"token_idx={step_idx} time={t:.3f}s token_id={tid} token_name={tname}")
     return hidden
 
 
@@ -395,7 +402,7 @@ def projection_since_time(
 ) -> torch.Tensor:
     """Project hidden states in output_hidden onto direction for first n tokens since time."""
     payload = torch.load(output_hidden, map_location="cpu")
-    hidden, token_ids, token_names, times = _select_hidden_since_time(payload, time, n)
+    hidden, token_ids, token_names, times, step_indices = _select_hidden_since_time(payload, time, n)
     if hidden.numel() == 0:
         return torch.empty((0,), dtype=torch.float32)
 
@@ -429,7 +436,8 @@ def projection_since_time(
     proj_tensor = torch.tensor(projections, dtype=torch.float32)
 
     if show_results:
-        for t, tid, tname, value, cosine_value, residual_norm in zip(
+        for step_idx, t, tid, tname, value, cosine_value, residual_norm in zip(
+            step_indices.tolist(),
             times.tolist(),
             token_ids.tolist(),
             token_names,
@@ -438,7 +446,7 @@ def projection_since_time(
             residual_norms,
         ):
             print(
-                f"time={t:.3f}s token_id={tid} token_name={tname} projection={value:.6f} "
+                f"token_idx={step_idx} time={t:.3f}s token_id={tid} token_name={tname} projection={value:.6f} "
                 f"cos_hidden_projection={cosine_value:.6f} hidden_minus_projection_norm={residual_norm:.6f}"
             )
     return proj_tensor
