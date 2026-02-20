@@ -209,6 +209,53 @@ def plot_logits_evolution(decode_data_list: list[DecodeData], output_path: str):
     plt.close(fig)
 
 
+def plot_final_token_probability_heatmap(decode_data_list: list[DecodeData], output_path: str):
+    """Plot probability of the final-layer decoded token across all layers/steps.
+
+    For each token step `t`, let `y_t` be the token id decoded at the final layer.
+    This plot shows `P_layer_t(y_t)` for each layer at that same step.
+
+    Heatmap layout:
+        - x-axis: token step index
+        - y-axis: layer index
+        - cell value: probability in [0, 1]
+    """
+    if len(decode_data_list) == 0:
+        raise ValueError("decode_data_list is empty")
+
+    num_tokens = len(decode_data_list)
+    num_layers = int(decode_data_list[0].logits.shape[0])
+    prob_grid = np.zeros((num_layers, num_tokens), dtype=np.float32)
+
+    for t, item in enumerate(decode_data_list):
+        if item.logits.shape[0] != num_layers:
+            raise ValueError("All DecodeData entries must have the same number of layers")
+        final_token_id = int(item.token_ids[-1].item())
+        probs = F.softmax(item.logits.float(), dim=-1)  # [L, V]
+        prob_grid[:, t] = probs[:, final_token_id].cpu().numpy()
+
+    fig_w = max(10.0, num_tokens * 0.7)
+    fig_h = max(8.0, num_layers * 0.24)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
+
+    im = ax.imshow(prob_grid, aspect="auto", cmap="YlOrRd", origin="upper", vmin=0.0, vmax=1.0)
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("P(final-layer decoded token)")
+
+    ax.set_xlabel("Token index")
+    ax.set_ylabel("Layer (1..L)")
+    ax.set_xticks(np.arange(num_tokens))
+    ax.set_yticks(np.arange(num_layers))
+    ax.set_yticklabels([str(i + 1) for i in range(num_layers)])
+    ax.set_title("Premature decode: final-token probability across layers")
+
+    fig.tight_layout()
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
 def decode_preview(token_names: Sequence[str], chunk: int = 10) -> str:
     """Return a compact preview string for final output tokens.
 
@@ -331,7 +378,16 @@ def main():
         output_path = hidden_path.with_name(f"logits_evolution_{args.start}_{end_idx}.png")
 
     plot_logits_evolution(decode_data, str(output_path))
+
+    if args.output:
+        prob_output_path = output_path.with_name(f"{output_path.stem}_final_token_prob{output_path.suffix}")
+    else:
+        end_idx = args.end if args.end >= 0 else payload["text_hidden_layers"].shape[0]
+        prob_output_path = hidden_path.with_name(f"final_token_probability_{args.start}_{end_idx}.png")
+
+    plot_final_token_probability_heatmap(decode_data, str(prob_output_path))
     print(f"Saved figure to {output_path}")
+    print(f"Saved figure to {prob_output_path}")
 
 
 if __name__ == "__main__":
