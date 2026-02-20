@@ -34,6 +34,7 @@ import sentencepiece
 import torch
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
+from matplotlib.colors import LogNorm
 
 from moshi.models import loaders
 
@@ -226,6 +227,7 @@ def plot_final_token_probability_heatmap(decode_data_list: list[DecodeData], out
     num_tokens = len(decode_data_list)
     num_layers = int(decode_data_list[0].logits.shape[0])
     prob_grid = np.zeros((num_layers, num_tokens), dtype=np.float32)
+    token_grid: list[list[str]] = [["" for _ in range(num_tokens)] for _ in range(num_layers)]
 
     for t, item in enumerate(decode_data_list):
         if item.logits.shape[0] != num_layers:
@@ -233,14 +235,57 @@ def plot_final_token_probability_heatmap(decode_data_list: list[DecodeData], out
         final_token_id = int(item.token_ids[-1].item())
         probs = F.softmax(item.logits.float(), dim=-1)  # [L, V]
         prob_grid[:, t] = probs[:, final_token_id].cpu().numpy()
+        for layer_idx in range(num_layers):
+            token_grid[layer_idx][t] = item.tokens[layer_idx]
 
     fig_w = max(10.0, num_tokens * 0.7)
     fig_h = max(8.0, num_layers * 0.24)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
 
-    im = ax.imshow(prob_grid, aspect="auto", cmap="YlOrRd", origin="upper", vmin=0.0, vmax=1.0)
+    positive_probs = prob_grid[prob_grid > 0]
+    if positive_probs.size == 0:
+        vmin = 1e-8
+    else:
+        vmin = max(float(np.min(positive_probs)), 1e-8)
+    im = ax.imshow(
+        np.clip(prob_grid, vmin, 1.0),
+        aspect="auto",
+        cmap="YlOrRd",
+        origin="upper",
+        norm=LogNorm(vmin=vmin, vmax=1.0),
+    )
     cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("P(final-layer decoded token)")
+    cbar.set_label("P(final-layer decoded token) [log scale]")
+
+    def _plot_safe_text(text: str) -> str:
+        return text.replace("\n", " ").replace("$", "\\$")
+
+    for y in range(num_layers):
+        for x in range(num_tokens):
+            token_txt = _plot_safe_text(token_grid[y][x])
+            p = float(prob_grid[y, x])
+            txt_color = "white" if p < 0.2 else "black"
+            try:
+                ax.text(
+                    x,
+                    y,
+                    token_txt,
+                    ha="center",
+                    va="center",
+                    fontsize=6,
+                    color=txt_color,
+                    parse_math=False,
+                )
+            except TypeError:
+                ax.text(
+                    x,
+                    y,
+                    token_txt,
+                    ha="center",
+                    va="center",
+                    fontsize=6,
+                    color=txt_color,
+                )
 
     ax.set_xlabel("Token index")
     ax.set_ylabel("Layer (1..L)")
