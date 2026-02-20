@@ -80,20 +80,31 @@ class DecodeData:
         self.tokens = [self._id_to_piece(int(t)) for t in self.token_ids.tolist()]
 
     def _calculate_logits(self) -> torch.Tensor:
-        """Project hidden states `[L, D]` to logits `[L, vocab_size]`."""
+        """Project hidden states `[L, D]` to logits `[L, vocab_size]`.
+
+        This mirrors the model decode head path used in `LMModel.forward_embeddings`:
+        optional `out_norm` -> `text_linear`.
+        The projection is executed in the same dtype/device as `text_linear.weight`
+        for parity with model behavior, then converted to float32 for analysis.
+        """
         x = self.hidden_states
         if x.dim() != 2:
             raise RuntimeError(f"Expected hidden states shape [L, D], got {tuple(x.shape)}")
 
         # `lm.out_norm` can be RMSNorm, which expects 3D `[B, T, D]`.
-        x = x.unsqueeze(0)  # [1, L, D]
-        if self._projection.out_norm is not None:
-            x = self._projection.out_norm(x)
-        logits = self._projection.text_linear(x)
+        text_linear_weight = self._projection.text_linear.weight
+        proj_device = text_linear_weight.device
+        proj_dtype = text_linear_weight.dtype
+
+        x = x.to(device=proj_device, dtype=proj_dtype).unsqueeze(0)  # [1, L, D]
+        with torch.no_grad():
+            if self._projection.out_norm is not None:
+                x = self._projection.out_norm(x)
+            logits = self._projection.text_linear(x)
         logits = logits.squeeze(0)  # [L, V]
         if logits.dim() != 2:
             raise RuntimeError(f"Unexpected logits shape: {tuple(logits.shape)}")
-        return logits.float()
+        return logits.float().cpu()
 
     def _greedy_decode(self) -> torch.Tensor:
         """Greedy token ids for every layer: `[L]`."""
