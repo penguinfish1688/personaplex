@@ -82,9 +82,15 @@ class DecodeData:
     def _calculate_logits(self) -> torch.Tensor:
         """Project hidden states `[L, D]` to logits `[L, vocab_size]`."""
         x = self.hidden_states
+        if x.dim() != 2:
+            raise RuntimeError(f"Expected hidden states shape [L, D], got {tuple(x.shape)}")
+
+        # `lm.out_norm` can be RMSNorm, which expects 3D `[B, T, D]`.
+        x = x.unsqueeze(0)  # [1, L, D]
         if self._projection.out_norm is not None:
             x = self._projection.out_norm(x)
         logits = self._projection.text_linear(x)
+        logits = logits.squeeze(0)  # [L, V]
         if logits.dim() != 2:
             raise RuntimeError(f"Unexpected logits shape: {tuple(logits.shape)}")
         return logits.float()
@@ -266,7 +272,7 @@ def main():
     if not hidden_path.exists():
         raise FileNotFoundError(f"Hidden payload not found: {hidden_path}")
 
-    payload = torch.load(hidden_path, map_location="cpu")
+    payload = torch.load(hidden_path, map_location="cpu", weights_only=True)
     if "text_hidden_layers" not in payload:
         raise ValueError("Unsupported payload: missing key 'text_hidden_layers'")
 
