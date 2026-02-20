@@ -173,10 +173,27 @@ def plot_logits_evolution(decode_data_list: list[DecodeData], output_path: str):
     cbar = fig.colorbar(im, ax=ax)
     cbar.set_label("JSD vs final layer")
 
+    def _plot_safe_text(text: str) -> str:
+        # Keep tokens visible while preventing mathtext parsing failures.
+        return text.replace("\n", " ").replace("$", "\\$")
+
     for y in range(num_layers):
         for x in range(num_tokens):
-            token_txt = token_grid[y][x].replace("\n", " ")
-            ax.text(x, y, token_txt, ha="center", va="center", fontsize=6, color="black")
+            token_txt = _plot_safe_text(token_grid[y][x])
+            try:
+                ax.text(
+                    x,
+                    y,
+                    token_txt,
+                    ha="center",
+                    va="center",
+                    fontsize=6,
+                    color="black",
+                    parse_math=False,
+                )
+            except TypeError:
+                # Older matplotlib without `parse_math` argument.
+                ax.text(x, y, token_txt, ha="center", va="center", fontsize=6, color="black")
 
     ax.set_xlabel("Token index")
     ax.set_ylabel("Layer (1..L)")
