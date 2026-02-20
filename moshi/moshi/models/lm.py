@@ -74,6 +74,7 @@ class LMOutput:
 class HiddenLayerOutputs:
     """Container for hidden layer outputs from both text and depth transformers."""
     text_transformer: Optional[List[torch.Tensor]] = None  # List of hidden states from text transformer layers
+    text_attention_weights: Optional[List[torch.Tensor]] = None  # List of attention weights from text transformer layers
     depth_transformer: Optional[List[List[torch.Tensor]]] = None  # List of hidden states from depth transformer layers
 
 
@@ -453,23 +454,51 @@ class LMModel(StreamingContainer):
         self,
         sequence: torch.Tensor,
         return_hidden_layers: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
-        return self.forward_embeddings(self.embed_codes(sequence), return_hidden_layers=return_hidden_layers)
+        return_attention_weights: bool = False,
+    ):
+        return self.forward_embeddings(
+            self.embed_codes(sequence),
+            return_hidden_layers=return_hidden_layers,
+            return_attention_weights=return_attention_weights,
+        )
     
-    def forward_embeddings(self, input: torch.Tensor, return_hidden_layers: bool = False) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+    def forward_embeddings(
+        self,
+        input: torch.Tensor,
+        return_hidden_layers: bool = False,
+        return_attention_weights: bool = False,
+    ):
         # print("EMBED:", input[0, 0, :10].float().cpu().tolist()) # DEBUG
-        if return_hidden_layers:
+        if return_hidden_layers and return_attention_weights:
+            transformer_out, hidden_layers, attention_weights = self.transformer(
+                input,
+                return_hidden_layers=True,
+                return_attention_weights=True,
+            )
+        elif return_hidden_layers:
             transformer_out, hidden_layers = self.transformer(input, return_hidden_layers=True)
+            attention_weights = None
+        elif return_attention_weights:
+            transformer_out, attention_weights = self.transformer(
+                input,
+                return_attention_weights=True,
+            )
+            hidden_layers = None
         else:
             transformer_out = self.transformer(input)
             hidden_layers = None
+            attention_weights = None
         if self.out_norm:
             transformer_out = self.out_norm(transformer_out)
         assert isinstance(transformer_out, torch.Tensor)
         text_logits = self.text_linear(transformer_out)
         text_logits = text_logits[:, None]
+        if return_hidden_layers and return_attention_weights:
+            return transformer_out, text_logits, hidden_layers, attention_weights
         if return_hidden_layers:
             return transformer_out, text_logits, hidden_layers
+        if return_attention_weights:
+            return transformer_out, text_logits, attention_weights
         return transformer_out, text_logits
 
     def forward_depformer(
@@ -861,7 +890,7 @@ class LMGen(StreamingModule[_LMGenState]):
 
     @torch.no_grad()
     def step(self, input_tokens: torch.Tensor=None, moshi_tokens:torch.Tensor=None, text_token:torch.Tensor=None,
-             return_embeddings: bool=False, return_hidden_layers: bool=False, check_silence_token: bool=False) \
+               return_embeddings: bool=False, return_hidden_layers: bool=False, return_attention_weights: bool=False, check_silence_token: bool=False) \
         -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]] | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]] | tuple[torch.Tensor, HiddenLayerOutputs] | tuple[torch.Tensor, HiddenLayerOutputs, bool]:
         """Run a single step of the language model.
         
@@ -871,11 +900,13 @@ class LMGen(StreamingModule[_LMGenState]):
             text_token: Text token
             return_embeddings: If True, return embeddings
             return_hidden_layers: If True, return hidden layer outputs
+            return_attention_weights: If True, return text transformer attention weights
             check_silence_token: If True, also return a boolean indicating if silence was detected
             
         Returns:
             Generated tokens and optionally embeddings, hidden layers, and silence detection flag
         """
+        capture_hidden = return_hidden_layers or return_attention_weights
         state = self._streaming_state
         lm_model = self.lm_model
         prepared_inputs = self.prepare_step_input(
@@ -884,7 +915,7 @@ class LMGen(StreamingModule[_LMGenState]):
         # print("INPUT:", None if input_tokens is None else input_tokens.squeeze().cpu().tolist()) # DEBUG
         # print("MOSHI:", None if moshi_tokens is None else moshi_tokens.squeeze().cpu().tolist()) # DEBUG
         if prepared_inputs is None:
-            return_tuple_size = sum([self.report_loss or self.return_logits, return_embeddings, return_hidden_layers, check_silence_token])
+            return_tuple_size = sum([self.report_loss or self.return_logits, return_embeddings, capture_hidden, check_silence_token])
             if return_tuple_size == 0:
                 return None
             elif return_tuple_size == 1:
@@ -906,15 +937,24 @@ class LMGen(StreamingModule[_LMGenState]):
             embeddings = self.lm_model.embed_codes(input_)
         
         # For hidden layers, we need to bypass the graphed version
-        if return_hidden_layers:
+        if capture_hidden and return_attention_weights:
+            result = lm_model.forward_codes(
+                input_,
+                return_hidden_layers=True,
+                return_attention_weights=True,
+            )
+            transformer_out, text_logits, text_hidden_layers, text_attention_weights = result
+        elif capture_hidden:
             result = lm_model.forward_codes(input_, return_hidden_layers=True)
             transformer_out, text_logits, text_hidden_layers = result
+            text_attention_weights = None
         else:
             transformer_out, text_logits = state.graphed_main(input_)
             text_hidden_layers = None
+            text_attention_weights = None
 
         # Process transformer output and get depth hidden layers if requested
-        if return_hidden_layers:
+        if capture_hidden:
             output_result = self.process_transformer_output(
                 transformer_out,
                 text_logits,
@@ -922,7 +962,7 @@ class LMGen(StreamingModule[_LMGenState]):
                 target_,
                 model_input_position,
                 target_position,
-                return_hidden_layers=True,
+                return_hidden_layers=capture_hidden,
             )
             # Handle variable return structure from process_transformer_output
             if self.report_loss:
@@ -935,6 +975,7 @@ class LMGen(StreamingModule[_LMGenState]):
             # Create combined hidden layer outputs
             combined_hidden_layers = HiddenLayerOutputs(
                 text_transformer=text_hidden_layers,  # The text transformer hidden layers for this step
+                text_attention_weights=text_attention_weights,
                 depth_transformer=depth_hidden_layers # The depth_hidden_layers is a list of hidden transformer layers for each acoustic token in this step
             )
         else:
@@ -952,7 +993,7 @@ class LMGen(StreamingModule[_LMGenState]):
         returns = [output]
         if return_embeddings:
             returns.append(embeddings)
-        if return_hidden_layers:
+        if capture_hidden:
             returns.append(combined_hidden_layers)
         if check_silence_token:
             is_silence = self.is_silence_token(output)

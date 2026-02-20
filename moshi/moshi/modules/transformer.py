@@ -32,6 +32,7 @@ See `StreamingTransformer` for more information.
 
 from contextlib import ExitStack
 from dataclasses import dataclass
+import math
 import typing as tp
 
 from einops import rearrange
@@ -397,7 +398,13 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
         else:
             return state.kv_cache.complete(k, v)
 
-    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor):
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        return_attention_weights: bool = False,
+    ):
         state = self._streaming_state
         T = query.shape[1]
 
@@ -434,7 +441,20 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
                 attn_bias = attn_bias & (delta < self.context)
         else:
             attn_bias = None
-        x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
+        if return_attention_weights:
+            scale = 1.0 / math.sqrt(q.shape[-1])
+            attn_logits = torch.matmul(q, k.transpose(-2, -1)) * scale
+            if attn_bias is not None:
+                attn_mask = attn_bias
+                if attn_mask.dim() == 2:
+                    attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
+                elif attn_mask.dim() == 3:
+                    attn_mask = attn_mask.unsqueeze(1)
+                attn_logits = attn_logits.masked_fill(~attn_mask, float("-inf"))
+            attn_weights = torch.softmax(attn_logits.float(), dim=-1).to(q.dtype)
+            x = torch.matmul(attn_weights, v)
+        else:
+            x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
 
         x = rearrange(x, "b h t d -> b t (h d)")
         if self.weights_per_step:
@@ -444,6 +464,8 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
         if state is not None:
             state.offset.add_(T)
             state.offset_cpu += T
+        if return_attention_weights:
+            return x, attn_weights
         return x
 
 
@@ -596,23 +618,38 @@ class StreamingTransformerLayer(StreamingModule[_LayerState]):
                 update = self.gating(x)
         return x_orig + self.layer_scale_2(update)
 
-    def _sa_block(self, x: torch.Tensor):
+    def _sa_block(self, x: torch.Tensor, return_attention_weights: bool = False):
         if self.skip_self_attn:
+            if return_attention_weights:
+                return x, None
             return x
         x_orig = x
         x = self.norm1(x)
+        if return_attention_weights:
+            update, attn_weights = self.self_attn(
+                x,
+                x,
+                x,
+                return_attention_weights=True,
+            )
+            return x_orig + self.layer_scale_1(update), attn_weights
         update = self.self_attn(x, x, x)
         return x_orig + self.layer_scale_1(update)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, return_attention_weights: bool = False):
         with ExitStack() as stack:
             if x.device.type != 'cuda':
                 stack.enter_context(no_compile())
-            x = self._sa_block(x)
+            if return_attention_weights:
+                x, attn_weights = self._sa_block(x, return_attention_weights=True)
+            else:
+                x = self._sa_block(x)
             x = self._ff_block(x)
             state = self._streaming_state
             if state:
                 state.offset_cpu += x.shape[1]
+            if return_attention_weights:
+                return x, attn_weights
             return x
 
 
@@ -695,7 +732,14 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
         device = next(self.parameters()).device
         return _TransformerState(offset=torch.zeros(1, device=device, dtype=torch.long))
 
-    def forward(self, x: torch.Tensor, return_hidden_layers: bool = False, *args, **kwargs):
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_hidden_layers: bool = False,
+        return_attention_weights: bool = False,
+        *args,
+        **kwargs,
+    ):
         B, T, C = x.shape
 
         state = self._streaming_state
@@ -713,17 +757,26 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
             x = x + self.positional_scale * pos_emb
 
         hidden_layers = [] if return_hidden_layers else None
+        attention_weights = [] if return_attention_weights else None
         
         for layer in self.layers:
-            x = layer(x, *args, **kwargs)
+            if return_attention_weights:
+                x, layer_attn = layer(x, return_attention_weights=True, *args, **kwargs)
+                attention_weights.append(layer_attn.clone() if isinstance(layer_attn, torch.Tensor) else layer_attn)
+            else:
+                x = layer(x, *args, **kwargs)
             if return_hidden_layers:
                 hidden_layers.append(x.clone())
 
         if state is not None:
             state.offset.add_(T)
         
+        if return_hidden_layers and return_attention_weights:
+            return x, hidden_layers, attention_weights
         if return_hidden_layers:
             return x, hidden_layers
+        if return_attention_weights:
+            return x, attention_weights
         return x
 
 

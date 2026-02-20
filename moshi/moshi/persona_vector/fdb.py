@@ -45,6 +45,7 @@ def main():
     ap.add_argument("--greedy", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--overwrite", action="store_true", help="Re-process files that already have output.wav")
+    ap.add_argument("--save-hidden", action="store_true", help="Save per-token hidden/attention payload to output_hidden.pt")
     args = ap.parse_args()
 
     # Voice prompt
@@ -60,16 +61,18 @@ def main():
         return
 
     # Build lists, skip existing unless --overwrite
-    in_wavs, out_wavs, out_txts, prompts = [], [], [], []
+    in_wavs, out_wavs, out_txts, out_hiddens, prompts = [], [], [], [], []
     for inp in inputs:
         out_wav = inp.with_name("output.wav")
         out_txt = inp.with_name("output.json")
+        out_hidden = inp.with_name("output_hidden.pt")
         if not args.overwrite and out_wav.exists():
             print(f"[SKIP] {out_wav}")
             continue
         in_wavs.append(str(inp))
         out_wavs.append(str(out_wav))
         out_txts.append(str(out_txt))
+        out_hiddens.append(str(out_hidden))
         prompts.append(args.text_prompt)
 
     if not in_wavs:
@@ -98,6 +101,8 @@ def main():
             save_voice_prompt_embeddings=False,
             cpu_offload=args.cpu_offload,
             return_hidden_layers=False,
+            save_hidden_payload=bool(args.save_hidden),
+            output_hiddens=out_hiddens if args.save_hidden else None,
         )
     print(f"[FDB] Done. Processed {len(in_wavs)} files.")
 

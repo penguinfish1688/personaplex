@@ -46,7 +46,7 @@ import gc
 import pickle
 from pathlib import Path
 import json
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 import numpy as np
 import torch
@@ -149,6 +149,113 @@ def average_hidden_layers(hidden_layers_list: List[HiddenLayerOutputs]) -> Hidde
         text_transformer=avg_text_transformer,
         depth_transformer=avg_depth_transformer
     )
+
+
+def _extract_text_hidden_per_layer(step_hidden: HiddenLayerOutputs) -> torch.Tensor:
+    """Convert one step of text hidden layers to a dense `[L, D]` CPU tensor.
+
+    Args:
+        step_hidden: Hidden layers for one generated token.
+
+    Returns:
+        Tensor of shape `[num_text_layers, hidden_dim]` in `float32` on CPU.
+    """
+    if not step_hidden.text_transformer:
+        raise RuntimeError("Missing text transformer hidden layers in step output.")
+    layers: list[torch.Tensor] = []
+    for layer_hidden in step_hidden.text_transformer:
+        layer = layer_hidden.detach().cpu().float()
+        if layer.dim() == 3 and layer.shape[0] == 1 and layer.shape[1] == 1:
+            layer = layer[0, 0]
+        elif layer.dim() != 1:
+            layer = layer.reshape(-1)
+        layers.append(layer)
+    return torch.stack(layers, dim=0)
+
+
+def _extract_text_attention_per_layer(step_hidden: HiddenLayerOutputs) -> Optional[torch.Tensor]:
+    """Convert one step of text attention weights to a `[L, H, K]` CPU tensor.
+
+    `K` is the available context length at this generation step and can vary by token.
+    """
+    if not step_hidden.text_attention_weights:
+        return None
+    per_layer: list[torch.Tensor] = []
+    for layer_attn in step_hidden.text_attention_weights:
+        attn = layer_attn.detach().cpu().float()
+        # Expected shape from transformer: [B, H, Tq, Tk] with B=1, Tq=1 in step mode.
+        if attn.dim() == 4 and attn.shape[0] == 1:
+            attn = attn[0]
+        if attn.dim() == 3 and attn.shape[1] == 1:
+            attn = attn[:, 0, :]
+        elif attn.dim() == 3 and attn.shape[0] == 1:
+            attn = attn[0]
+        if attn.dim() != 2:
+            raise RuntimeError(f"Unexpected attention shape {tuple(attn.shape)}")
+        per_layer.append(attn)
+    return torch.stack(per_layer, dim=0)
+
+
+def _build_hidden_payload(
+    *,
+    input_wav: str,
+    output_wav: str,
+    output_text: str,
+    frame_rate_hz: float,
+    text_token_ids: list[int],
+    text_token_pieces: list[str],
+    text_hidden_layers_per_token: list[torch.Tensor],
+    text_attention_layers_per_token: list[Optional[torch.Tensor]],
+) -> Dict[str, Any]:
+    """Build the serialized `.pt` payload consumed by premature decode tools.
+
+    Saved schema (`schema_version=1`):
+        - `text_hidden_layers`: `torch.FloatTensor[T, L, D]`
+          - `T`: number of generated output tokens from `input.wav` processing only.
+          - `L`: number of main text transformer layers.
+          - `D`: hidden size.
+        - `text_attention_weights`: `list[torch.FloatTensor[L, H, K_t]]`
+          - Per-token attention weights for the main text transformer only.
+          - `H`: attention heads.
+          - `K_t`: available key length at token `t` (can vary with causal growth).
+        - `token_ids`: `torch.LongTensor[T]` generated text token ids.
+        - `token_names`: `list[str]` generated token pieces (special tokens preserved).
+        - `times`: `torch.FloatTensor[T]` token start time in seconds.
+        - `token_time_ranges_sec`: `torch.FloatTensor[T, 2]` token `[start, end)`.
+        - `hidden_states`: `torch.FloatTensor[T, D]` final-layer hidden states (compat key).
+        - `frame_rate`: scalar float, default 12.5 for Moshi.
+
+    Token-time alignment:
+        token `0` corresponds to `[0, 1/frame_rate_hz)` seconds of generated response,
+        token `t` corresponds to `[t/frame_rate_hz, (t+1)/frame_rate_hz)`.
+    """
+    if len(text_hidden_layers_per_token) == 0:
+        raise RuntimeError("Cannot save hidden payload: no generated tokens were captured.")
+
+    hidden_tensor = torch.stack(text_hidden_layers_per_token, dim=0)  # [T, L, D]
+    token_ids_tensor = torch.tensor(text_token_ids, dtype=torch.long)
+    t = hidden_tensor.shape[0]
+    times = torch.arange(t, dtype=torch.float32) / float(frame_rate_hz)
+    token_time_ranges = torch.stack(
+        [times, times + (1.0 / float(frame_rate_hz))],
+        dim=1,
+    )
+
+    payload: Dict[str, Any] = {
+        "schema_version": 1,
+        "input_wav": input_wav,
+        "output_wav": output_wav,
+        "output_text": output_text,
+        "frame_rate": float(frame_rate_hz),
+        "token_ids": token_ids_tensor,
+        "token_names": text_token_pieces,
+        "times": times,
+        "token_time_ranges_sec": token_time_ranges,
+        "text_hidden_layers": hidden_tensor,
+        "text_attention_weights": text_attention_layers_per_token,
+        "hidden_states": hidden_tensor[:, -1, :],
+    }
+    return payload
 
 
 def warmup(mimi: MimiModel, other_mimi: MimiModel, lm_gen: LMGen, device: str, frame_size: int):
@@ -422,6 +529,8 @@ def run_batch_inference(
     save_voice_prompt_embeddings: bool,
     cpu_offload: bool = False,
     return_hidden_layers: bool = False,
+    save_hidden_payload: bool = False,
+    output_hiddens: Optional[List[str]] = None,
 ) -> Optional[List[List[HiddenLayerOutputs]]]:
     """Run batch offline inference using multiple input WAVs and text prompts.
     
@@ -441,6 +550,10 @@ def run_batch_inference(
     assert len(input_wavs) == len(text_prompts), f"input_wavs ({len(input_wavs)}) and text_prompts ({len(text_prompts)}) must have same length"
     assert len(input_wavs) == len(output_wavs), f"input_wavs ({len(input_wavs)}) and output_wavs ({len(output_wavs)}) must have same length"
     assert len(input_wavs) == len(output_texts), f"input_wavs ({len(input_wavs)}) and output_texts ({len(output_texts)}) must have same length"
+    if output_hiddens is not None:
+        assert len(input_wavs) == len(output_hiddens), (
+            f"input_wavs ({len(input_wavs)}) and output_hiddens ({len(output_hiddens)}) must have same length"
+        )
     
     if len(input_wavs) == 0:
         log("warning", "Empty input lists provided")
@@ -507,6 +620,7 @@ def run_batch_inference(
         lm_gen.load_voice_prompt(voice_prompt_path)
 
     batch_hidden_layers: List[List[HiddenLayerOutputs]] = []
+    capture_hidden = return_hidden_layers or save_hidden_payload
     
     # 7) Process each instance
     for i, (input_wav, output_wav, output_text, text_prompt) in tqdm(enumerate(zip(input_wavs, output_wavs, output_texts, text_prompts))):
@@ -531,10 +645,12 @@ def run_batch_inference(
         # Process audio frames and collect outputs
         generated_frames: List[np.ndarray] = []
         generated_text_tokens: List[str] = []
+        generated_text_token_ids: List[int] = []
         total_target_samples = user_audio.shape[-1]
         
-        total_steps = 0
         hidden_layers_list: List[HiddenLayerOutputs] = []
+        text_hidden_layers_per_token: list[torch.Tensor] = []
+        text_attention_layers_per_token: list[Optional[torch.Tensor]] = []
         for user_encoded in lm_encode_from_sphn(
             mimi,
             lm_iterate_audio(
@@ -545,25 +661,30 @@ def run_batch_inference(
             steps = user_encoded.shape[-1]
             # Store hidden layers for each step
             for c in range(steps):
-                total_steps += 1
                 step_in = user_encoded[:, :, c : c + 1]
                 
-                if return_hidden_layers:
-                    # Debug: Check dep_q value (only for first instance)
-                    
-                    result = lm_gen.step(step_in, return_hidden_layers=True)
+                if capture_hidden:
+                    result = lm_gen.step(
+                        step_in,
+                        return_hidden_layers=True,
+                        return_attention_weights=save_hidden_payload,
+                    )
                     tokens, hidden_layers = result  # type: ignore
                     assert isinstance(hidden_layers, HiddenLayerOutputs), "Hidden layers were requested but not captured."
-                    hidden_layers_list.append(hidden_layers)
-                    
-                    if i == 0 and total_steps == 0:  # Only log details for first instance
-                        log("info", f"DEBUG: len(hidden_layers.depth_transformer) = {len(hidden_layers.depth_transformer)}")
-                        log("info", f"Retrieved {len(hidden_layers.text_transformer)} text transformer hidden layers and {len(hidden_layers.depth_transformer)} codebooks, each with {len(hidden_layers.depth_transformer[0])} layers")
                 else:
                     tokens = lm_gen.step(step_in)
+                    hidden_layers = None
                 
                 if tokens is None:
                     continue
+
+                if capture_hidden:
+                    assert hidden_layers is not None
+                    if return_hidden_layers:
+                        hidden_layers_list.append(hidden_layers)
+                    if save_hidden_payload:
+                        text_hidden_layers_per_token.append(_extract_text_hidden_per_layer(hidden_layers))
+                        text_attention_layers_per_token.append(_extract_text_attention_per_layer(hidden_layers))
                     
                 # Decode current sampled agent frame to PCM
                 pcm = decode_tokens_to_pcm(mimi, other_mimi, lm_gen, tokens)
@@ -571,6 +692,7 @@ def run_batch_inference(
                 
                 # Decode text token
                 text_token = tokens[0, 0, 0].item()
+                generated_text_token_ids.append(int(text_token))
                 if text_token not in (0, 3):
                     _text = text_tokenizer.id_to_piece(text_token)  # type: ignore
                     _text = _text.replace("▁", " ")
@@ -603,11 +725,26 @@ def run_batch_inference(
         
         # Store hidden layers for this instance
         if return_hidden_layers:
-            assert len(hidden_layers_list) == total_steps, "Mismatch in hidden layers collected and steps taken"
+            assert len(hidden_layers_list) == len(generated_text_tokens), "Mismatch in hidden layers and generated token count"
             batch_hidden_layers.append(hidden_layers_list)
+        if save_hidden_payload:
+            output_hidden = output_hiddens[i] if output_hiddens is not None else str(Path(output_wav).with_name("output_hidden.pt"))
+            Path(output_hidden).parent.mkdir(parents=True, exist_ok=True)
+            payload = _build_hidden_payload(
+                input_wav=input_wav,
+                output_wav=output_wav,
+                output_text=output_text,
+                frame_rate_hz=float(mimi.frame_rate),
+                text_token_ids=generated_text_token_ids,
+                text_token_pieces=generated_text_tokens,
+                text_hidden_layers_per_token=text_hidden_layers_per_token,
+                text_attention_layers_per_token=text_attention_layers_per_token,
+            )
+            torch.save(payload, output_hidden)
+            log("info", f"Wrote hidden payload to {output_hidden}")
 
     log("info", f"Batch inference completed for {len(input_wavs)} instances")
-    if return_hidden_layers:
+    if return_hidden_layers and len(batch_hidden_layers) > 0:
         log("info", f"Hidden layers for {len(batch_hidden_layers)} instances with {len(batch_hidden_layers[0])} steps were returned during batch inference.")
         return batch_hidden_layers
 
