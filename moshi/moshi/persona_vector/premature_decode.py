@@ -24,6 +24,7 @@ Token-time alignment:
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
@@ -35,6 +36,7 @@ import torch
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 from matplotlib.colors import LogNorm
+from matplotlib.patches import Rectangle
 
 from moshi.models import loaders
 
@@ -141,7 +143,51 @@ def _jsd_from_logits(logits_p: torch.Tensor, logits_q: torch.Tensor) -> torch.Te
     return 0.5 * (kl_pm + kl_qm)
 
 
-def plot_logits_evolution(decode_data_list: list[DecodeData], output_path: str):
+def _resolve_token_range(t_total: int, start: int, end: int) -> tuple[int, int]:
+    start_idx = max(0, start)
+    end_idx = t_total if end < 0 else min(end, t_total)
+    if start_idx >= end_idx:
+        raise ValueError(f"Invalid range [{start_idx}, {end_idx}) for total tokens {t_total}")
+    return start_idx, end_idx
+
+
+def _load_input_transcript_spans(
+    hidden_path: Path,
+    frame_rate_hz: float,
+) -> list[tuple[float, float, str]]:
+    """Load user transcript from sibling `input.json` and map time -> token index spans.
+
+    Returns:
+        List of `(start_token, end_token, text)` where token values are floats.
+    """
+    input_json = hidden_path.with_name("input.json")
+    if not input_json.exists():
+        return []
+
+    with open(input_json, "r") as f:
+        payload = json.load(f)
+
+    chunks = payload.get("chunks", [])
+    spans: list[tuple[float, float, str]] = []
+    for chunk in chunks:
+        text = str(chunk.get("text", "")).strip()
+        ts = chunk.get("timestamp", None)
+        if not text or not isinstance(ts, list) or len(ts) != 2:
+            continue
+        start_sec = float(ts[0])
+        end_sec = float(ts[1])
+        if end_sec <= start_sec:
+            continue
+        spans.append((start_sec * frame_rate_hz, end_sec * frame_rate_hz, text))
+    return spans
+
+
+def plot_logits_evolution(
+    decode_data_list: list[DecodeData],
+    output_path: str,
+    token_start_idx: int = 0,
+    transcript_spans: Optional[list[tuple[float, float, str]]] = None,
+):
     """Plot layer-wise JSD heatmap and most likely token at each cell.
 
     Spec:
@@ -203,6 +249,39 @@ def plot_logits_evolution(decode_data_list: list[DecodeData], output_path: str):
     ax.set_yticklabels([str(i + 1) for i in range(num_layers)])
     ax.set_title("Premature decode: layer-wise logits evolution")
 
+    if transcript_spans:
+        lane_y = float(num_layers)
+        lane_h = 0.8
+        for start_tok, end_tok, word in transcript_spans:
+            local_start = start_tok - token_start_idx
+            local_end = end_tok - token_start_idx
+            if local_end <= -0.5 or local_start >= num_tokens - 0.5:
+                continue
+            draw_start = max(local_start, -0.5)
+            draw_end = min(local_end, num_tokens - 0.5)
+            if draw_end <= draw_start:
+                continue
+            rect = Rectangle(
+                (draw_start, lane_y),
+                draw_end - draw_start,
+                lane_h,
+                facecolor="#f3f3f3",
+                edgecolor="#888888",
+                linewidth=0.5,
+                alpha=0.9,
+            )
+            ax.add_patch(rect)
+            center_x = 0.5 * (draw_start + draw_end)
+            safe_word = _plot_safe_text(word)
+            try:
+                ax.text(center_x, lane_y + lane_h / 2, safe_word, ha="center", va="center", fontsize=6, color="black", parse_math=False)
+            except TypeError:
+                ax.text(center_x, lane_y + lane_h / 2, safe_word, ha="center", va="center", fontsize=6, color="black")
+
+        ax.axhline(num_layers - 0.5, color="#666666", linewidth=0.8)
+        ax.text(-1.2, lane_y + lane_h / 2, "User", ha="right", va="center", fontsize=7, color="black")
+        ax.set_ylim(num_layers + lane_h + 0.4, -0.5)
+
     fig.tight_layout()
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -210,7 +289,12 @@ def plot_logits_evolution(decode_data_list: list[DecodeData], output_path: str):
     plt.close(fig)
 
 
-def plot_final_token_probability_heatmap(decode_data_list: list[DecodeData], output_path: str):
+def plot_final_token_probability_heatmap(
+    decode_data_list: list[DecodeData],
+    output_path: str,
+    token_start_idx: int = 0,
+    transcript_spans: Optional[list[tuple[float, float, str]]] = None,
+):
     """Plot probability of the final-layer decoded token across all layers/steps.
 
     For each token step `t`, let `y_t` be the token id decoded at the final layer.
@@ -294,6 +378,39 @@ def plot_final_token_probability_heatmap(decode_data_list: list[DecodeData], out
     ax.set_yticklabels([str(i + 1) for i in range(num_layers)])
     ax.set_title("Premature decode: final-token probability across layers")
 
+    if transcript_spans:
+        lane_y = float(num_layers)
+        lane_h = 0.8
+        for start_tok, end_tok, word in transcript_spans:
+            local_start = start_tok - token_start_idx
+            local_end = end_tok - token_start_idx
+            if local_end <= -0.5 or local_start >= num_tokens - 0.5:
+                continue
+            draw_start = max(local_start, -0.5)
+            draw_end = min(local_end, num_tokens - 0.5)
+            if draw_end <= draw_start:
+                continue
+            rect = Rectangle(
+                (draw_start, lane_y),
+                draw_end - draw_start,
+                lane_h,
+                facecolor="#f3f3f3",
+                edgecolor="#888888",
+                linewidth=0.5,
+                alpha=0.9,
+            )
+            ax.add_patch(rect)
+            center_x = 0.5 * (draw_start + draw_end)
+            safe_word = _plot_safe_text(word)
+            try:
+                ax.text(center_x, lane_y + lane_h / 2, safe_word, ha="center", va="center", fontsize=6, color="black", parse_math=False)
+            except TypeError:
+                ax.text(center_x, lane_y + lane_h / 2, safe_word, ha="center", va="center", fontsize=6, color="black")
+
+        ax.axhline(num_layers - 0.5, color="#666666", linewidth=0.8)
+        ax.text(-1.2, lane_y + lane_h / 2, "User", ha="right", va="center", fontsize=7, color="black")
+        ax.set_ylim(num_layers + lane_h + 0.4, -0.5)
+
     fig.tight_layout()
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -350,10 +467,7 @@ def premature_decode(
         raise ValueError("Expected payload['text_hidden_layers'] with shape [T, L, D]")
 
     t_total = int(hidden.shape[0])
-    start = max(0, start)
-    end = t_total if end < 0 else min(end, t_total)
-    if start >= end:
-        raise ValueError(f"Invalid range [{start}, {end}) for total tokens {t_total}")
+    start, end = _resolve_token_range(t_total, start, end)
 
     attention_list = hidden_payload.get("text_attention_weights", [None] * t_total)
     if len(attention_list) != t_total:
@@ -396,6 +510,11 @@ def main():
     if "text_hidden_layers" not in payload:
         raise ValueError("Unsupported payload: missing key 'text_hidden_layers'")
 
+    t_total = int(payload["text_hidden_layers"].shape[0])
+    start_idx, end_idx = _resolve_token_range(t_total, args.start, args.end)
+    frame_rate_hz = float(payload.get("frame_rate", 12.5))
+    transcript_spans = _load_input_transcript_spans(hidden_path, frame_rate_hz)
+
     token_names = payload.get("token_names", [])
     if args.preview_output:
         print(decode_preview(token_names))
@@ -412,25 +531,33 @@ def main():
         hidden_payload=payload,
         projection=projection,
         tokenizer=tokenizer,
-        start=args.start,
-        end=args.end,
+        start=start_idx,
+        end=end_idx,
     )
 
     if args.output:
         output_path = Path(args.output)
     else:
-        end_idx = args.end if args.end >= 0 else payload["text_hidden_layers"].shape[0]
-        output_path = hidden_path.with_name(f"logits_evolution_{args.start}_{end_idx}.png")
+        output_path = hidden_path.with_name(f"logits_evolution_{start_idx}_{end_idx}.png")
 
-    plot_logits_evolution(decode_data, str(output_path))
+    plot_logits_evolution(
+        decode_data,
+        str(output_path),
+        token_start_idx=start_idx,
+        transcript_spans=transcript_spans,
+    )
 
     if args.output:
         prob_output_path = output_path.with_name(f"{output_path.stem}_final_token_prob{output_path.suffix}")
     else:
-        end_idx = args.end if args.end >= 0 else payload["text_hidden_layers"].shape[0]
-        prob_output_path = hidden_path.with_name(f"final_token_probability_{args.start}_{end_idx}.png")
+        prob_output_path = hidden_path.with_name(f"final_token_probability_{start_idx}_{end_idx}.png")
 
-    plot_final_token_probability_heatmap(decode_data, str(prob_output_path))
+    plot_final_token_probability_heatmap(
+        decode_data,
+        str(prob_output_path),
+        token_start_idx=start_idx,
+        transcript_spans=transcript_spans,
+    )
     print(f"Saved figure to {output_path}")
     print(f"Saved figure to {prob_output_path}")
 
