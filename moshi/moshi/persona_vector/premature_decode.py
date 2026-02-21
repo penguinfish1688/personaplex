@@ -47,6 +47,7 @@ SPECIAL_TOKEN_MAP = {
     2: "EOS",
     3: "PAD",
 }
+PAD_TOKEN_ID = 3
 
 
 @dataclass
@@ -418,6 +419,125 @@ def plot_final_token_probability_heatmap(
     plt.close(fig)
 
 
+def plot_pad_token_probability_heatmap(
+    decode_data_list: list[DecodeData],
+    output_path: str,
+    token_start_idx: int = 0,
+    transcript_spans: Optional[list[tuple[float, float, str]]] = None,
+):
+    """Plot probability of `<PAD>` token (id=3) across all layers/steps."""
+    if len(decode_data_list) == 0:
+        raise ValueError("decode_data_list is empty")
+
+    num_tokens = len(decode_data_list)
+    num_layers = int(decode_data_list[0].logits.shape[0])
+    prob_grid = np.zeros((num_layers, num_tokens), dtype=np.float32)
+    token_grid: list[list[str]] = [["" for _ in range(num_tokens)] for _ in range(num_layers)]
+
+    for t, item in enumerate(decode_data_list):
+        if item.logits.shape[0] != num_layers:
+            raise ValueError("All DecodeData entries must have the same number of layers")
+        probs = F.softmax(item.logits.float(), dim=-1)  # [L, V]
+        prob_grid[:, t] = probs[:, PAD_TOKEN_ID].cpu().numpy()
+        for layer_idx in range(num_layers):
+            token_grid[layer_idx][t] = item.tokens[layer_idx]
+
+    fig_w = max(10.0, num_tokens * 0.7)
+    fig_h = max(8.0, num_layers * 0.24)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
+
+    positive_probs = prob_grid[prob_grid > 0]
+    if positive_probs.size == 0:
+        vmin = 1e-8
+    else:
+        vmin = max(float(np.min(positive_probs)), 1e-8)
+    im = ax.imshow(
+        np.clip(prob_grid, vmin, 1.0),
+        aspect="auto",
+        cmap="YlOrRd",
+        origin="upper",
+        norm=LogNorm(vmin=vmin, vmax=1.0),
+    )
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("P(<PAD>) [log scale]")
+
+    def _plot_safe_text(text: str) -> str:
+        return text.replace("\n", " ").replace("$", "\\$")
+
+    for y in range(num_layers):
+        for x in range(num_tokens):
+            token_txt = _plot_safe_text(token_grid[y][x])
+            p = float(prob_grid[y, x])
+            txt_color = "white" if p < 0.2 else "black"
+            try:
+                ax.text(
+                    x,
+                    y,
+                    token_txt,
+                    ha="center",
+                    va="center",
+                    fontsize=6,
+                    color=txt_color,
+                    parse_math=False,
+                )
+            except TypeError:
+                ax.text(
+                    x,
+                    y,
+                    token_txt,
+                    ha="center",
+                    va="center",
+                    fontsize=6,
+                    color=txt_color,
+                )
+
+    ax.set_xlabel("Token index")
+    ax.set_ylabel("Layer (1..L)")
+    ax.set_xticks(np.arange(num_tokens))
+    ax.set_yticks(np.arange(num_layers))
+    ax.set_yticklabels([str(i + 1) for i in range(num_layers)])
+    ax.set_title("Premature decode: <PAD> probability across layers")
+
+    if transcript_spans:
+        lane_y = float(num_layers)
+        lane_h = 0.8
+        for start_tok, end_tok, word in transcript_spans:
+            local_start = start_tok - token_start_idx
+            local_end = end_tok - token_start_idx
+            if local_end <= -0.5 or local_start >= num_tokens - 0.5:
+                continue
+            draw_start = max(local_start, -0.5)
+            draw_end = min(local_end, num_tokens - 0.5)
+            if draw_end <= draw_start:
+                continue
+            rect = Rectangle(
+                (draw_start, lane_y),
+                draw_end - draw_start,
+                lane_h,
+                facecolor="#f3f3f3",
+                edgecolor="#888888",
+                linewidth=0.5,
+                alpha=0.9,
+            )
+            ax.add_patch(rect)
+            center_x = 0.5 * (draw_start + draw_end)
+            safe_word = _plot_safe_text(word)
+            try:
+                ax.text(center_x, lane_y + lane_h / 2, safe_word, ha="center", va="center", fontsize=6, color="black", parse_math=False)
+            except TypeError:
+                ax.text(center_x, lane_y + lane_h / 2, safe_word, ha="center", va="center", fontsize=6, color="black")
+
+        ax.axhline(num_layers - 0.5, color="#666666", linewidth=0.8)
+        ax.text(-1.2, lane_y + lane_h / 2, "User", ha="right", va="center", fontsize=7, color="black")
+        ax.set_ylim(num_layers + lane_h + 0.4, -0.5)
+
+    fig.tight_layout()
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
 def decode_preview(token_names: Sequence[str], chunk: int = 10) -> str:
     """Return a compact preview string for final output tokens.
 
@@ -558,8 +678,21 @@ def main():
         token_start_idx=start_idx,
         transcript_spans=transcript_spans,
     )
+
+    if args.output:
+        pad_prob_output_path = output_path.with_name(f"{output_path.stem}_pad_token_prob{output_path.suffix}")
+    else:
+        pad_prob_output_path = hidden_path.with_name(f"pad_token_probability_{start_idx}_{end_idx}.png")
+
+    plot_pad_token_probability_heatmap(
+        decode_data,
+        str(pad_prob_output_path),
+        token_start_idx=start_idx,
+        transcript_spans=transcript_spans,
+    )
     print(f"Saved figure to {output_path}")
     print(f"Saved figure to {prob_output_path}")
+    print(f"Saved figure to {pad_prob_output_path}")
 
 
 if __name__ == "__main__":
