@@ -217,9 +217,21 @@ def plot_logits_evolution(
     fig_h = max(8.0, num_layers * 0.24)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
 
-    im = ax.imshow(jsd_grid, aspect="auto", cmap="Blues", origin="upper")
+    positive_jsd = jsd_grid[jsd_grid > 0]
+    if positive_jsd.size == 0:
+        jsd_vmin = 1e-12
+    else:
+        jsd_vmin = max(float(np.min(positive_jsd)), 1e-12)
+
+    im = ax.imshow(
+        np.clip(jsd_grid, jsd_vmin, None),
+        aspect="auto",
+        cmap="Blues",
+        origin="upper",
+        norm=LogNorm(vmin=jsd_vmin, vmax=max(float(np.max(jsd_grid)), jsd_vmin)),
+    )
     cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("JSD vs final layer")
+    cbar.set_label("JSD vs final layer [log scale]")
 
     def _plot_safe_text(text: str) -> str:
         # Keep tokens visible while preventing mathtext parsing failures.
@@ -327,20 +339,9 @@ def plot_final_token_probability_heatmap(
     fig_h = max(8.0, num_layers * 0.24)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
 
-    positive_probs = prob_grid[prob_grid > 0]
-    if positive_probs.size == 0:
-        vmin = 1e-8
-    else:
-        vmin = max(float(np.min(positive_probs)), 1e-8)
-    im = ax.imshow(
-        np.clip(prob_grid, vmin, 1.0),
-        aspect="auto",
-        cmap="YlOrRd",
-        origin="upper",
-        norm=LogNorm(vmin=vmin, vmax=1.0),
-    )
+    im = ax.imshow(prob_grid, aspect="auto", cmap="YlOrRd", origin="upper", vmin=0.0, vmax=1.0)
     cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("P(final-layer decoded token) [log scale]")
+    cbar.set_label("P(final-layer decoded token)")
 
     def _plot_safe_text(text: str) -> str:
         return text.replace("\n", " ").replace("$", "\\$")
@@ -446,20 +447,9 @@ def plot_pad_token_probability_heatmap(
     fig_h = max(8.0, num_layers * 0.24)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
 
-    positive_probs = prob_grid[prob_grid > 0]
-    if positive_probs.size == 0:
-        vmin = 1e-8
-    else:
-        vmin = max(float(np.min(positive_probs)), 1e-8)
-    im = ax.imshow(
-        np.clip(prob_grid, vmin, 1.0),
-        aspect="auto",
-        cmap="YlOrRd",
-        origin="upper",
-        norm=LogNorm(vmin=vmin, vmax=1.0),
-    )
+    im = ax.imshow(prob_grid, aspect="auto", cmap="YlOrRd", origin="upper", vmin=0.0, vmax=1.0)
     cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("P(<PAD>) [log scale]")
+    cbar.set_label("P(<PAD>)")
 
     def _plot_safe_text(text: str) -> str:
         return text.replace("\n", " ").replace("$", "\\$")
