@@ -342,15 +342,17 @@ def plot_final_token_probability_heatmap(
     positive_probs = prob_grid[prob_grid > 0]
     if positive_probs.size == 0:
         prob_vmin = 1e-8
+        prob_vmax = 1.0
     else:
         prob_vmin = max(float(np.min(positive_probs)), 1e-8)
+        prob_vmax = max(float(np.max(positive_probs)), prob_vmin)
 
     im = ax.imshow(
-        np.clip(prob_grid, prob_vmin, 1.0),
+        np.clip(prob_grid, prob_vmin, prob_vmax),
         aspect="auto",
         cmap="YlOrRd",
         origin="upper",
-        norm=LogNorm(vmin=prob_vmin, vmax=1.0),
+        norm=LogNorm(vmin=prob_vmin, vmax=prob_vmax),
     )
     cbar = fig.colorbar(im, ax=ax)
     cbar.set_label("P(final-layer decoded token) [log scale]")
@@ -462,15 +464,17 @@ def plot_pad_token_probability_heatmap(
     positive_probs = prob_grid[prob_grid > 0]
     if positive_probs.size == 0:
         prob_vmin = 1e-8
+        prob_vmax = 1.0
     else:
         prob_vmin = max(float(np.min(positive_probs)), 1e-8)
+        prob_vmax = max(float(np.max(positive_probs)), prob_vmin)
 
     im = ax.imshow(
-        np.clip(prob_grid, prob_vmin, 1.0),
+        np.clip(prob_grid, prob_vmin, prob_vmax),
         aspect="auto",
         cmap="YlOrRd",
         origin="upper",
-        norm=LogNorm(vmin=prob_vmin, vmax=1.0),
+        norm=LogNorm(vmin=prob_vmin, vmax=prob_vmax),
     )
     cbar = fig.colorbar(im, ax=ax)
     cbar.set_label("P(<PAD>) [log scale]")
