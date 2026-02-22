@@ -206,39 +206,28 @@ def pad_lookback_ratio(
             continue
         assert layer_time.shape[0] == num_layers, "Layer count must stay constant across tokens"
 
-        # Expected mapping for generated token indices under fixed context prefix:
-        # key index = context_prefix_tokens + token_index
-        expected_min_k = context_prefix_tokens + t + 1
-        assert k >= expected_min_k, (
-            f"Attention key length too short at token {t}: K={k}, expected at least {expected_min_k}. "
-            "This usually means context-window truncation happened; increase context or reduce analyzed range."
-        )
+        # Absolute-position mapping that supports sliding/truncated key windows.
+        # Define absolute index of generated token t as: abs_t = context_prefix_tokens + t.
+        # At step t with key length K, visible key absolute indices are contiguous:
+        # [abs_t - (K - 1), ..., abs_t].
+        abs_t = context_prefix_tokens + t
+        start_abs = abs_t - (k - 1)
+        key_abs = torch.arange(k, device=layer_time.device, dtype=torch.long) + int(start_abs)
+        gen_idx = key_abs - int(context_prefix_tokens)  # generated-token index for each key
 
-        # Enforce fixed prefix assumption requested by user.
-        # For token t, generated-token slot [0..t] should start at `context_prefix_tokens`.
-        # (There may be extra history to the right only if architecture changes; we disallow it.)
-        implied_prefix = k - (t + 1)
-        assert implied_prefix == context_prefix_tokens, (
-            f"Non-constant context prefix detected at token {t}: implied={implied_prefix}, "
-            f"expected={context_prefix_tokens}."
-        )
+        # Denominator: all generated lookback tokens i where 0 <= i < t.
+        den_mask = (gen_idx >= 0) & (gen_idx < t)
 
-        # Full-key masks with fixed ignored context prefix.
-        # We include lookback tokens [0..t-1] and exclude current token t.
-        num_mask_full = torch.zeros((k,), dtype=torch.float32, device=layer_time.device)
-        den_mask_full = torch.zeros((k,), dtype=torch.float32, device=layer_time.device)
+        # Numerator: lookback tokens that are both PAD output and user-silent.
+        num_mask = torch.zeros((k,), dtype=torch.bool, device=layer_time.device)
+        if bool(den_mask.any()):
+            valid_pos = torch.nonzero(den_mask, as_tuple=False).squeeze(-1)
+            valid_gen_idx = gen_idx[valid_pos].cpu().tolist()
+            valid_flags = [numerator_token_mask[int(i)] for i in valid_gen_idx]
+            num_mask[valid_pos] = torch.tensor(valid_flags, dtype=torch.bool, device=layer_time.device)
 
-        if t > 0:
-            lookback_num = torch.tensor(
-                numerator_token_mask[:t],
-                dtype=torch.float32,
-                device=layer_time.device,
-            )
-            num_mask_full[context_prefix_tokens : context_prefix_tokens + t] = lookback_num
-            den_mask_full[context_prefix_tokens : context_prefix_tokens + t] = 1.0
-
-        numerator = (layer_time * num_mask_full.unsqueeze(0)).sum(dim=-1)
-        denominator = (layer_time * den_mask_full.unsqueeze(0)).sum(dim=-1)
+        numerator = (layer_time * num_mask.unsqueeze(0).float()).sum(dim=-1)
+        denominator = (layer_time * den_mask.unsqueeze(0).float()).sum(dim=-1)
 
         ratio = torch.where(denominator > 0, numerator / denominator, torch.zeros_like(denominator))
         ratios[t] = ratio.detach().cpu().float()
