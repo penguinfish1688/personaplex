@@ -221,7 +221,7 @@ if __name__ == "__main__":
     import argparse
     # Visualize the amplitude of the input wav
     parser = argparse.ArgumentParser(description="Visualize input WAV amplitude and compute pad lookback ratios.")
-    parser.add_argument("input_wav", type=str, help="Path to the input WAV file.")
+    parser.add_argument("--input_wav", type=str, help="Path to the input WAV file.")
     
     args = parser.parse_args()
     visualize_wav_amplitude(args.input_wav)
