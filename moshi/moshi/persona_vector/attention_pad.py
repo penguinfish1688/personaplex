@@ -146,7 +146,7 @@ def pad_lookback_ratio(
     decode_data_list: list[DecodeData],
     input_wav: str,
     frame_rate: float = 12.5,
-    activity_threshold: float = 0.02,
+    activity_threshold: float = 0.1,
 ):
     """
     Compute the user-silent pad lookback ratio of each tokens.
