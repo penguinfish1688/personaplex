@@ -632,6 +632,7 @@ def plot_pad_lookback_ratio(decode_data_list: list[DecodeData], output_path: str
     if len(decode_data_list) == 0:
         raise ValueError("decode_data_list is empty")
 
+    print("Calculating PAD lookback ratio...")
     ratio = pad_lookback_ratio(decode_data_list, input_wav=input_wav)  # [T, L]
     if ratio.numel() == 0:
         raise ValueError("pad_lookback_ratio returned empty tensor")
@@ -721,6 +722,7 @@ def main():
         print(decode_preview(token_names))
         return
 
+    print("Loading decoder projection and tokenizer...")
     tokenizer = _load_tokenizer(args.hf_repo, args.tokenizer)
     projection = _load_decoder_projection(
         hf_repo=args.hf_repo,
@@ -728,6 +730,7 @@ def main():
         device=args.device,
     )
 
+    print("Running premature decode...")
     decode_data = premature_decode(
         hidden_payload=payload,
         projection=projection,
@@ -741,6 +744,7 @@ def main():
     else:
         output_path = hidden_path.with_name(f"logits_evolution_{start_idx}_{end_idx}.png")
 
+    print("Plotting logits evolution heatmap...")
     plot_logits_evolution(
         decode_data,
         str(output_path),
@@ -753,6 +757,7 @@ def main():
     else:
         prob_output_path = hidden_path.with_name(f"final_token_probability_{start_idx}_{end_idx}.png")
 
+    print("Plotting final token probability heatmap...")
     plot_final_token_probability_heatmap(
         decode_data,
         str(prob_output_path),
@@ -765,6 +770,7 @@ def main():
     else:
         pad_prob_output_path = hidden_path.with_name(f"pad_token_probability_{start_idx}_{end_idx}.png")
 
+    print("Plotting <PAD> token probability heatmap...")
     plot_pad_token_probability_heatmap(
         decode_data,
         str(pad_prob_output_path),
@@ -781,6 +787,7 @@ def main():
     if not input_wav_path.exists():
         raise FileNotFoundError(f"Input wav not found for PAD lookback ratio: {input_wav_path}")
 
+    print("Plotting PAD lookback ratio heatmap...")
     plot_pad_lookback_ratio(
         decode_data,
         str(pad_lookback_output_path),

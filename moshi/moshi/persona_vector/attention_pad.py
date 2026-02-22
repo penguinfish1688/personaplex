@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
-
+from tqdm import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
 import soundfile as sf
@@ -71,6 +71,7 @@ def user_active_mask(input_wav, frame_rate, threshold):
         segment = waveform[start:end]
         is_active = bool(np.max(np.abs(segment)) >= float(threshold))
         mask.append(is_active)
+    print(f"User active ratio: {sum(mask) / len(mask) if mask else 0}")
     return mask
 
 
@@ -90,6 +91,7 @@ def output_pad_mask(decode_data_list: list[DecodeData]):
     for decode_data in decode_data_list:
         final_token_id, _, _ = decode_data.get_final_output()
         mask.append(final_token_id == PAD_TOKEN_ID)
+    print(f"PAD token ratio: {sum(mask) / len(mask) if mask else 0}")
     return mask
 
 
@@ -186,7 +188,7 @@ def pad_lookback_ratio(
 
     ratios = torch.zeros((t_total, num_layers), dtype=torch.float32)
 
-    for t, decode_data in enumerate(decode_data_list):
+    for t, decode_data in tqdm(enumerate(decode_data_list)):
         if decode_data.attention_weights is None:
             continue
 
@@ -208,6 +210,7 @@ def pad_lookback_ratio(
 
         lookback_base_mask = numerator_token_mask[:lookback_len]
         mask_tensor = torch.tensor(lookback_base_mask, dtype=torch.float32, device=lookback_attn.device).unsqueeze(0)
+        print(f"Token {t}: lookback_len={lookback_len}, pad&silent_count={mask_tensor.sum().item()}, total_lookback_count={lookback_len}")
 
         numerator = (lookback_attn * mask_tensor).sum(dim=-1)
         denominator = lookback_attn.sum(dim=-1)
