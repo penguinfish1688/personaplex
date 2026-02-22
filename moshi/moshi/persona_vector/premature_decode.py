@@ -623,6 +623,69 @@ def premature_decode(
         )
     return decode_data_list
 
+def plot_pad_lookback_ratio(decode_data_list: list[DecodeData], output_path: str):
+    """Import attention_pad.py to plot the ratio of attention to PAD tokens across layers and steps.
+    use the same layout as the other heatmaps, but with cell value = that ratio.
+    """
+    from .attention_pad import pad_lookback_ratio
+
+    if len(decode_data_list) == 0:
+        raise ValueError("decode_data_list is empty")
+
+    ratio = pad_lookback_ratio(decode_data_list)  # [T, L]
+    if ratio.numel() == 0:
+        raise ValueError("pad_lookback_ratio returned empty tensor")
+
+    ratio_grid = ratio.transpose(0, 1).cpu().numpy().astype(np.float32)  # [L, T]
+    num_layers, num_tokens = ratio_grid.shape
+
+    token_grid: list[list[str]] = [["" for _ in range(num_tokens)] for _ in range(num_layers)]
+    for t, item in enumerate(decode_data_list):
+        for layer_idx in range(num_layers):
+            token_grid[layer_idx][t] = item.tokens[layer_idx]
+
+    fig_w = max(10.0, num_tokens * 0.7)
+    fig_h = max(8.0, num_layers * 0.24)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
+
+    im = ax.imshow(ratio_grid, aspect="auto", cmap="PuBuGn", origin="upper", vmin=0.0, vmax=1.0)
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("PAD lookback ratio")
+
+    def _plot_safe_text(text: str) -> str:
+        return text.replace("\n", " ").replace("$", "\\$")
+
+    for y in range(num_layers):
+        for x in range(num_tokens):
+            token_txt = _plot_safe_text(token_grid[y][x])
+            v = float(ratio_grid[y, x])
+            txt_color = "white" if v > 0.45 else "black"
+            try:
+                ax.text(
+                    x,
+                    y,
+                    token_txt,
+                    ha="center",
+                    va="center",
+                    fontsize=6,
+                    color=txt_color,
+                    parse_math=False,
+                )
+            except TypeError:
+                ax.text(x, y, token_txt, ha="center", va="center", fontsize=6, color=txt_color)
+
+    ax.set_xlabel("Token index")
+    ax.set_ylabel("Layer (1..L)")
+    ax.set_xticks(np.arange(num_tokens))
+    ax.set_yticks(np.arange(num_layers))
+    ax.set_yticklabels([str(i + 1) for i in range(num_layers)])
+    ax.set_title("Premature decode: PAD lookback ratio")
+
+    fig.tight_layout()
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path)
+    plt.close(fig)
 
 def main():
     ap = argparse.ArgumentParser("premature_decode")
@@ -708,9 +771,20 @@ def main():
         token_start_idx=start_idx,
         transcript_spans=transcript_spans,
     )
+
+    if args.output:
+        pad_lookback_output_path = output_path.with_name(f"{output_path.stem}_pad_lookback_ratio{output_path.suffix}")
+    else:
+        pad_lookback_output_path = hidden_path.with_name(f"pad_lookback_ratio_{start_idx}_{end_idx}.png")
+
+    plot_pad_lookback_ratio(
+        decode_data,
+        str(pad_lookback_output_path),
+    )
     print(f"Saved figure to {output_path}")
     print(f"Saved figure to {prob_output_path}")
     print(f"Saved figure to {pad_prob_output_path}")
+    print(f"Saved figure to {pad_lookback_output_path}")
 
 
 if __name__ == "__main__":
