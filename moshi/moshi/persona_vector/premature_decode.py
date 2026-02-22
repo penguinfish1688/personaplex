@@ -623,7 +623,12 @@ def premature_decode(
         )
     return decode_data_list
 
-def plot_pad_lookback_ratio(decode_data_list: list[DecodeData], output_path: str, input_wav: str):
+def plot_pad_lookback_ratio(
+    decode_data_list: list[DecodeData],
+    output_path: str,
+    input_wav: str,
+    token_offset: int = 0,
+):
     """Import attention_pad.py to plot the ratio of attention to PAD tokens across layers and steps.
     use the same layout as the other heatmaps, but with cell value = that ratio.
     """
@@ -633,7 +638,9 @@ def plot_pad_lookback_ratio(decode_data_list: list[DecodeData], output_path: str
         raise ValueError("decode_data_list is empty")
 
     print("Calculating PAD lookback ratio...")
-    ratio = pad_lookback_ratio(decode_data_list, input_wav=input_wav)  # [T, L]
+    ratio = pad_lookback_ratio(
+        decode_data_list, input_wav=input_wav, token_offset=token_offset,
+    )  # [T, L]
     if ratio.numel() == 0:
         raise ValueError("pad_lookback_ratio returned empty tensor")
 
@@ -703,6 +710,11 @@ def plot_pad_lookback_ratio(decode_data_list: list[DecodeData], output_path: str
     plt.close(fig)
 
 def main():
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(name)s  %(levelname)s  %(message)s",
+    )
     ap = argparse.ArgumentParser("premature_decode")
     ap.add_argument("--root-dir", type=str, required=True, help="Root dir containing <n>/output_hidden.pt")
     ap.add_argument("-n", "--sample-number", type=int, required=True, help="Sample folder number under root-dir")
@@ -806,6 +818,7 @@ def main():
         decode_data,
         str(pad_lookback_output_path),
         input_wav=str(input_wav_path),
+        token_offset=start_idx,
     )
     print(f"Saved figure to {output_path}")
     print(f"Saved figure to {prob_output_path}")

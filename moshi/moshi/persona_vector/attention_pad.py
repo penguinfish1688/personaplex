@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Optional
+
 import matplotlib.pyplot as plt
 import numpy as np
 import soundfile as sf
 import torch
 
 from .premature_decode import DecodeData, PAD_TOKEN_ID
+
+logger = logging.getLogger(__name__)
 
 
 def visualize_wav_amplitude(input_wav):
@@ -146,24 +150,35 @@ def pad_lookback_ratio(
     frame_rate: float = 12.5,
     activity_threshold: float = 0.1,
     context_prefix_tokens: Optional[int] = None,
+    token_offset: int = 0,
 ):
     """
-    Compute the user-silent pad lookback ratio of each tokens.
+    Compute the user-silent pad lookback ratio of each token.
 
     for each token T:
         for each layer l:
-            user_silent_pad_lookback_ratio =
-                sum of attention weight on token_t, t < T, where token_t is <PAD> and user is silent
-                --------------------------------------------------------------------------------------
-                sum of attention weight on all token_t, t < T.
+            ratio =
+                sum of attention weight on key i, where i is a generated token < T,
+                    model output at i is <PAD>, AND user is silent at i
+                -------------------------------------------------------------------
+                sum of attention weight on all generated tokens < T
+
+    The denominator is the total attention on all lookback generated tokens (i < T),
+    so the ratio represents the share of lookback attention going to PAD-and-silent tokens.
 
     Args:
-        decode_data_list (list[DecodeData]): A list of DecodeData, each corresponds to a token. The list is ordered by time.
+        decode_data_list (list[DecodeData]): A list of DecodeData, each corresponds to a token.
+            The list is ordered by time and may be a SLICE of the full sequence.
         input_wav (str): Path to the user input wav used to estimate user activity over time.
         frame_rate (float): Token frame rate, default 12.5.
         activity_threshold (float): Absolute-amplitude threshold for active speech.
         context_prefix_tokens (Optional[int]): Fixed number of attention key positions to ignore
-            as pre-input context. If None, inferred from token-0 attention length as `K0 - 1`.
+            as pre-input context. If None, inferred from token-0 attention length as ``K0 - 1``.
+            When *decode_data_list* is a slice starting at full-sequence index ``token_offset``,
+            the inferred value is ``actual_prefix + token_offset``.
+        token_offset (int): The full-sequence index of the first token in *decode_data_list*.
+            Needed to align ``user_active_mask`` with the correct audio segment and to correctly
+            determine pad status for lookback tokens within the slice.  Default 0 (no slice).
 
     Returns:
         torch.FloatTensor: Ratio tensor of shape [T, L] where T is token count and L is layer count.
@@ -186,13 +201,42 @@ def pad_lookback_ratio(
 
     t_total = len(decode_data_list)
 
+    # ── masks ────────────────────────────────────────────────────────────
+    # pad_mask[i] refers to decode_data_list[i]  →  full-sequence token (token_offset + i).
     pad_mask = output_pad_mask(decode_data_list)
-    user_active = user_active_mask(input_wav, frame_rate=frame_rate, threshold=activity_threshold)
-    if len(user_active) < t_total:
-        user_active = list(user_active) + [False] * (t_total - len(user_active))
-    user_silent_mask = [not bool(flag) for flag in user_active[:t_total]]
 
-    numerator_token_mask = [pad and silent for pad, silent in zip(pad_mask, user_silent_mask)]
+    # user_active covers the ENTIRE wav from time-0 so that we can index by
+    # the full-sequence generated-token index rather than the local slice index.
+    user_active_full = user_active_mask(input_wav, frame_rate=frame_rate, threshold=activity_threshold)
+
+    # ── pre-compute a combined boolean: is full-sequence token i  (PAD ∧ user-silent)? ──
+    # Only tokens inside the slice [token_offset, token_offset + t_total) have known pad status.
+    max_full_gen_idx = token_offset + t_total
+    combined_pad_silent: list[bool] = [False] * max_full_gen_idx
+    for i in range(t_total):
+        full_i = token_offset + i
+        is_pad = pad_mask[i]
+        is_silent = (full_i >= len(user_active_full)) or (not user_active_full[full_i])
+        combined_pad_silent[full_i] = is_pad and is_silent
+    combined_tensor = torch.tensor(combined_pad_silent, dtype=torch.bool)
+
+    # ── diagnostic logging ───────────────────────────────────────────────
+    n_pad = sum(pad_mask)
+    n_user_active = sum(1 for flag in user_active_full[token_offset:token_offset + t_total]
+                        if token_offset < len(user_active_full) and flag)
+    n_user_silent = t_total - n_user_active
+    n_combined = sum(combined_pad_silent)
+    logger.info(
+        "pad_lookback_ratio config: t_total=%d  token_offset=%d  "
+        "context_prefix_tokens=%d  first_k=%d  num_layers=%d",
+        t_total, token_offset, context_prefix_tokens, first_k, num_layers,
+    )
+    logger.info(
+        "  masks: pad_count=%d/%d  user_active=%d  user_silent=%d  "
+        "combined(pad∧silent)=%d  user_active_full_len=%d",
+        n_pad, t_total, n_user_active, n_user_silent,
+        n_combined, len(user_active_full),
+    )
 
     ratios = torch.zeros((t_total, num_layers), dtype=torch.float32)
 
@@ -206,32 +250,55 @@ def pad_lookback_ratio(
             continue
         assert layer_time.shape[0] == num_layers, "Layer count must stay constant across tokens"
 
-        # Absolute-position mapping that supports sliding/truncated key windows.
-        # Define absolute index of generated token t as: abs_t = context_prefix_tokens + t.
-        # At step t with key length K, visible key absolute indices are contiguous:
-        # [abs_t - (K - 1), ..., abs_t].
+        # ── absolute-position mapping (supports sliding/truncated KV windows) ──
         abs_t = context_prefix_tokens + t
         start_abs = abs_t - (k - 1)
         key_abs = torch.arange(k, device=layer_time.device, dtype=torch.long) + int(start_abs)
-        gen_idx = key_abs - int(context_prefix_tokens)  # generated-token index for each key
 
-        # Denominator: all generated lookback tokens i where 0 <= i < t.
-        den_mask = (gen_idx >= 0) & (gen_idx < t)
+        # gen_idx_local:  index relative to decode_data_list  (0 = first entry)
+        # gen_idx_full:   index in the full generated-token sequence
+        gen_idx_local = key_abs - int(context_prefix_tokens)          # range: [t-(k-1) .. t]
+        gen_idx_full  = gen_idx_local + token_offset                  # full-sequence index
 
-        # Numerator: lookback tokens that are both PAD output and user-silent.
-        num_mask = torch.zeros((k,), dtype=torch.bool, device=layer_time.device)
-        if bool(den_mask.any()):
-            valid_pos = torch.nonzero(den_mask, as_tuple=False).squeeze(-1)
-            valid_gen_idx = gen_idx[valid_pos].cpu().tolist()
-            valid_flags = [numerator_token_mask[int(i)] for i in valid_gen_idx]
-            num_mask[valid_pos] = torch.tensor(valid_flags, dtype=torch.bool, device=layer_time.device)
+        # ── denominator: sum of attention on all generated lookback tokens (i < t) ──
+        lookback_in_slice = (gen_idx_local >= 0) & (gen_idx_local < t)
+        denominator = (layer_time * lookback_in_slice.unsqueeze(0).float()).sum(dim=-1)  # [L]
 
-        numerator = (layer_time * num_mask.unsqueeze(0).float()).sum(dim=-1)
-        denominator = (layer_time * den_mask.unsqueeze(0).float()).sum(dim=-1)
+        # ── numerator: lookback keys that are (generated ∧ <t ∧ PAD ∧ user-silent) ──
+        # A key qualifies for numerator when:
+        #   • it maps to a generated token in the slice:  0 <= gen_idx_local < t
+        #   • combined_pad_silent[gen_idx_full] is True
+        in_combined_range = (gen_idx_full >= 0) & (gen_idx_full < max_full_gen_idx)
+
+        # Clamp for safe indexing (the out-of-range slots are already excluded by masks).
+        safe_full_idx = gen_idx_full.clamp(0, max(max_full_gen_idx - 1, 0))
+        num_mask = lookback_in_slice & in_combined_range & combined_tensor[safe_full_idx]
+
+        numerator = (layer_time * num_mask.unsqueeze(0).float()).sum(dim=-1)  # [L]
 
         ratio = torch.where(denominator > 0, numerator / denominator, torch.zeros_like(denominator))
         ratios[t] = ratio.detach().cpu().float()
 
+        # Per-token diagnostics for first few + last token.
+        if t < 3 or t == t_total - 1:
+            logger.info(
+                "  step t=%d: K=%d  abs_t=%d  lookback_in_slice=%d  "
+                "num_positions=%d  numerator_mean=%.6f  denom_mean=%.6f  ratio_mean=%.6f",
+                t, k, abs_t,
+                int(lookback_in_slice.sum().item()),
+                int(num_mask.sum().item()),
+                float(numerator.mean().item()),
+                float(denominator.mean().item()),
+                float(ratio.mean().item()),
+            )
+
+    total_nonzero = int((ratios > 0).sum().item())
+    logger.info(
+        "pad_lookback_ratio result: shape=%s  non-zero=%d/%d  "
+        "max=%.6f  mean=%.6f",
+        list(ratios.shape), total_nonzero, ratios.numel(),
+        float(ratios.max().item()), float(ratios.mean().item()),
+    )
     return ratios
 
 
