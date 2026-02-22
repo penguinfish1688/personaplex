@@ -628,6 +628,8 @@ def plot_pad_lookback_ratio(
     output_path: str,
     input_wav: str,
     token_offset: int = 0,
+    token_start_idx: int = 0,
+    transcript_spans: Optional[list[tuple[float, float, str]]] = None,
 ):
     """Import attention_pad.py to plot the ratio of attention to PAD tokens across layers and steps.
     use the same layout as the other heatmaps, but with cell value = that ratio.
@@ -702,6 +704,39 @@ def plot_pad_lookback_ratio(
     ax.set_yticks(np.arange(num_layers))
     ax.set_yticklabels([str(i + 1) for i in range(num_layers)])
     ax.set_title("Premature decode: PAD lookback ratio")
+
+    if transcript_spans:
+        lane_y = float(num_layers)
+        lane_h = 0.8
+        for start_tok, end_tok, word in transcript_spans:
+            local_start = start_tok - token_start_idx
+            local_end = end_tok - token_start_idx
+            if local_end <= -0.5 or local_start >= num_tokens - 0.5:
+                continue
+            draw_start = max(local_start, -0.5)
+            draw_end = min(local_end, num_tokens - 0.5)
+            if draw_end <= draw_start:
+                continue
+            rect = Rectangle(
+                (draw_start, lane_y),
+                draw_end - draw_start,
+                lane_h,
+                facecolor="#f3f3f3",
+                edgecolor="#888888",
+                linewidth=0.5,
+                alpha=0.9,
+            )
+            ax.add_patch(rect)
+            center_x = 0.5 * (draw_start + draw_end)
+            safe_word = _plot_safe_text(word)
+            try:
+                ax.text(center_x, lane_y + lane_h / 2, safe_word, ha="center", va="center", fontsize=6, color="black", parse_math=False)
+            except TypeError:
+                ax.text(center_x, lane_y + lane_h / 2, safe_word, ha="center", va="center", fontsize=6, color="black")
+
+        ax.axhline(num_layers - 0.5, color="#666666", linewidth=0.8)
+        ax.text(-1.2, lane_y + lane_h / 2, "User", ha="right", va="center", fontsize=7, color="black")
+        ax.set_ylim(num_layers + lane_h + 0.4, -0.5)
 
     fig.tight_layout()
     out_path = Path(output_path)
@@ -819,6 +854,8 @@ def main():
         str(pad_lookback_output_path),
         input_wav=str(input_wav_path),
         token_offset=start_idx,
+        token_start_idx=start_idx,
+        transcript_spans=transcript_spans,
     )
     print(f"Saved figure to {output_path}")
     print(f"Saved figure to {prob_output_path}")
