@@ -250,6 +250,18 @@ def pad_lookback_ratio(
             continue
         assert layer_time.shape[0] == num_layers, "Layer count must stay constant across tokens"
 
+        # Dump raw attention weight stats for first few tokens (debug).
+        if t < 3 or t == t_total - 1:
+            attn_sum = float(layer_time.sum().item())
+            attn_max = float(layer_time.max().item())
+            attn_nonzero = int((layer_time > 0).sum().item())
+            logger.info(
+                "  [attn debug] t=%d  K=%d  attn_sum=%.6f  attn_max=%.6f  "
+                "attn_nonzero=%d/%d  shape=%s",
+                t, k, attn_sum, attn_max, attn_nonzero,
+                layer_time.numel(), list(layer_time.shape),
+            )
+
         # ── absolute-position mapping (supports sliding/truncated KV windows) ──
         abs_t = context_prefix_tokens + t
         start_abs = abs_t - (k - 1)

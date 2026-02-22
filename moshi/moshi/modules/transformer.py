@@ -465,6 +465,20 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
             state.offset.add_(T)
             state.offset_cpu += T
         if return_attention_weights:
+            # The RingKVCache stores keys at slot = step % capacity, so the K
+            # dimension of attn_weights is in ring-buffer slot order, NOT
+            # chronological order.  Reorder to chronological so that downstream
+            # consumers (e.g. pad_lookback_ratio) can map key index → step with
+            # a simple arange.  Invalid slots (pos_k < 0) are dropped.
+            if self.causal and pos_k is not None:
+                pk = pos_k.view(-1)                     # [capacity]
+                valid = pk >= 0
+                valid_indices = torch.where(valid)[0]
+                if valid_indices.numel() > 0:
+                    valid_pos = pk[valid_indices]
+                    _, sort_order = valid_pos.sort()
+                    chrono_indices = valid_indices[sort_order]
+                    attn_weights = attn_weights[:, :, :, chrono_indices]
             return x, attn_weights
         return x
 
