@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
-from tqdm import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
 import soundfile as sf
@@ -35,7 +34,6 @@ def visualize_wav_amplitude(input_wav):
     output_path = wav_path.with_name("input_amplitude.png")
     fig.savefig(output_path)
     plt.close(fig)
-    print(f"Saved amplitude visualization to {output_path}")
 
 
 def user_active_mask(input_wav, frame_rate, threshold):
@@ -71,7 +69,6 @@ def user_active_mask(input_wav, frame_rate, threshold):
         segment = waveform[start:end]
         is_active = bool(np.max(np.abs(segment)) >= float(threshold))
         mask.append(is_active)
-    print(f"User active ratio: {sum(mask) / len(mask) if mask else 0}")
     return mask
 
 
@@ -91,7 +88,6 @@ def output_pad_mask(decode_data_list: list[DecodeData]):
     for decode_data in decode_data_list:
         final_token_id, _, _ = decode_data.get_final_output()
         mask.append(final_token_id == PAD_TOKEN_ID)
-    print(f"PAD token ratio: {sum(mask) / len(mask) if mask else 0}")
     return mask
 
 
@@ -149,6 +145,7 @@ def pad_lookback_ratio(
     input_wav: str,
     frame_rate: float = 12.5,
     activity_threshold: float = 0.1,
+    context_prefix_tokens: Optional[int] = None,
 ):
     """
     Compute the user-silent pad lookback ratio of each tokens.
@@ -165,6 +162,8 @@ def pad_lookback_ratio(
         input_wav (str): Path to the user input wav used to estimate user activity over time.
         frame_rate (float): Token frame rate, default 12.5.
         activity_threshold (float): Absolute-amplitude threshold for active speech.
+        context_prefix_tokens (Optional[int]): Fixed number of attention key positions to ignore
+            as pre-input context. If None, inferred from token-0 attention length as `K0 - 1`.
 
     Returns:
         torch.FloatTensor: Ratio tensor of shape [T, L] where T is token count and L is layer count.
@@ -175,7 +174,16 @@ def pad_lookback_ratio(
     if decode_data_list[0].attention_weights is None:
         raise ValueError("attention weights are required to compute pad_lookback_ratio")
 
-    num_layers = int(_attention_to_layer_time(decode_data_list[0].attention_weights).shape[0])
+    first_layer_time = _attention_to_layer_time(decode_data_list[0].attention_weights)
+    num_layers = int(first_layer_time.shape[0])
+    first_k = int(first_layer_time.shape[1])
+    assert first_k >= 1, "Token-0 attention must have at least one key position"
+
+    inferred_prefix = first_k - 1
+    if context_prefix_tokens is None:
+        context_prefix_tokens = inferred_prefix
+    assert context_prefix_tokens >= 0, "context_prefix_tokens must be non-negative"
+
     t_total = len(decode_data_list)
 
     pad_mask = output_pad_mask(decode_data_list)
@@ -188,7 +196,7 @@ def pad_lookback_ratio(
 
     ratios = torch.zeros((t_total, num_layers), dtype=torch.float32)
 
-    for t, decode_data in tqdm(enumerate(decode_data_list)):
+    for t, decode_data in enumerate(decode_data_list):
         if decode_data.attention_weights is None:
             continue
 
@@ -196,24 +204,41 @@ def pad_lookback_ratio(
         k = int(layer_time.shape[-1])
         if k == 0:
             continue
+        assert layer_time.shape[0] == num_layers, "Layer count must stay constant across tokens"
 
-        # Use only lookback positions (t' < t). Right-align recent generated tokens.
-        # Extract a generated-token-aligned window of length (t + 1), then drop current token.
-        lookback_len = max(0, t)
-        generated_window_len = min(k, t + 1)
+        # Expected mapping for generated token indices under fixed context prefix:
+        # key index = context_prefix_tokens + token_index
+        expected_min_k = context_prefix_tokens + t + 1
+        assert k >= expected_min_k, (
+            f"Attention key length too short at token {t}: K={k}, expected at least {expected_min_k}. "
+            "This usually means context-window truncation happened; increase context or reduce analyzed range."
+        )
 
-        if generated_window_len == 0 or lookback_len == 0:
-            continue
+        # Enforce fixed prefix assumption requested by user.
+        # For token t, generated-token slot [0..t] should start at `context_prefix_tokens`.
+        # (There may be extra history to the right only if architecture changes; we disallow it.)
+        implied_prefix = k - (t + 1)
+        assert implied_prefix == context_prefix_tokens, (
+            f"Non-constant context prefix detected at token {t}: implied={implied_prefix}, "
+            f"expected={context_prefix_tokens}."
+        )
 
-        recent_attn = layer_time[:, k - generated_window_len : k]  # [L, <=t+1]
-        lookback_attn = recent_attn[:, :lookback_len]  # exclude current token
+        # Full-key masks with fixed ignored context prefix.
+        # We include lookback tokens [0..t-1] and exclude current token t.
+        num_mask_full = torch.zeros((k,), dtype=torch.float32, device=layer_time.device)
+        den_mask_full = torch.zeros((k,), dtype=torch.float32, device=layer_time.device)
 
-        lookback_base_mask = numerator_token_mask[:lookback_len]
-        mask_tensor = torch.tensor(lookback_base_mask, dtype=torch.float32, device=lookback_attn.device).unsqueeze(0)
-        print(f"Token {t}: lookback_len={lookback_len}, pad&silent_count={mask_tensor.sum().item()}, total_lookback_count={lookback_len}")
+        if t > 0:
+            lookback_num = torch.tensor(
+                numerator_token_mask[:t],
+                dtype=torch.float32,
+                device=layer_time.device,
+            )
+            num_mask_full[context_prefix_tokens : context_prefix_tokens + t] = lookback_num
+            den_mask_full[context_prefix_tokens : context_prefix_tokens + t] = 1.0
 
-        numerator = (lookback_attn * mask_tensor).sum(dim=-1)
-        denominator = lookback_attn.sum(dim=-1)
+        numerator = (layer_time * num_mask_full.unsqueeze(0)).sum(dim=-1)
+        denominator = (layer_time * den_mask_full.unsqueeze(0)).sum(dim=-1)
 
         ratio = torch.where(denominator > 0, numerator / denominator, torch.zeros_like(denominator))
         ratios[t] = ratio.detach().cpu().float()
