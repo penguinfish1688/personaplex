@@ -649,9 +649,23 @@ def plot_pad_lookback_ratio(decode_data_list: list[DecodeData], output_path: str
     fig_h = max(8.0, num_layers * 0.24)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
 
-    im = ax.imshow(ratio_grid, aspect="auto", cmap="PuBuGn", origin="upper", vmin=0.0, vmax=1.0)
+    positive_ratio = ratio_grid[ratio_grid > 0]
+    if positive_ratio.size == 0:
+        ratio_vmin = 1e-8
+        ratio_vmax = 1.0
+    else:
+        ratio_vmin = max(float(np.min(positive_ratio)), 1e-8)
+        ratio_vmax = max(float(np.max(positive_ratio)), ratio_vmin)
+
+    im = ax.imshow(
+        np.clip(ratio_grid, ratio_vmin, ratio_vmax),
+        aspect="auto",
+        cmap="PuBuGn",
+        origin="upper",
+        norm=LogNorm(vmin=ratio_vmin, vmax=ratio_vmax),
+    )
     cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("PAD lookback ratio")
+    cbar.set_label("PAD lookback ratio [log scale]")
 
     def _plot_safe_text(text: str) -> str:
         return text.replace("\n", " ").replace("$", "\\$")
