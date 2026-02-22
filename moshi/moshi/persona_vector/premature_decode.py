@@ -623,7 +623,7 @@ def premature_decode(
         )
     return decode_data_list
 
-def plot_pad_lookback_ratio(decode_data_list: list[DecodeData], output_path: str):
+def plot_pad_lookback_ratio(decode_data_list: list[DecodeData], output_path: str, input_wav: str):
     """Import attention_pad.py to plot the ratio of attention to PAD tokens across layers and steps.
     use the same layout as the other heatmaps, but with cell value = that ratio.
     """
@@ -632,7 +632,7 @@ def plot_pad_lookback_ratio(decode_data_list: list[DecodeData], output_path: str
     if len(decode_data_list) == 0:
         raise ValueError("decode_data_list is empty")
 
-    ratio = pad_lookback_ratio(decode_data_list)  # [T, L]
+    ratio = pad_lookback_ratio(decode_data_list, input_wav=input_wav)  # [T, L]
     if ratio.numel() == 0:
         raise ValueError("pad_lookback_ratio returned empty tensor")
 
@@ -777,9 +777,14 @@ def main():
     else:
         pad_lookback_output_path = hidden_path.with_name(f"pad_lookback_ratio_{start_idx}_{end_idx}.png")
 
+    input_wav_path = hidden_path.with_name("input.wav")
+    if not input_wav_path.exists():
+        raise FileNotFoundError(f"Input wav not found for PAD lookback ratio: {input_wav_path}")
+
     plot_pad_lookback_ratio(
         decode_data,
         str(pad_lookback_output_path),
+        input_wav=str(input_wav_path),
     )
     print(f"Saved figure to {output_path}")
     print(f"Saved figure to {prob_output_path}")

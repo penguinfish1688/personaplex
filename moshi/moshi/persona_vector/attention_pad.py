@@ -143,7 +143,9 @@ def attention_weight_masked_sum(decode_data: DecodeData, mask: list[bool]):
 
 def pad_lookback_ratio(
     decode_data_list: list[DecodeData],
-    user_active: Optional[list[bool]] = None,
+    input_wav: str,
+    frame_rate: float = 12.5,
+    activity_threshold: float = 0.02,
 ):
     """
     Compute the user-silent pad lookback ratio of each tokens.
@@ -157,8 +159,9 @@ def pad_lookback_ratio(
 
     Args:
         decode_data_list (list[DecodeData]): A list of DecodeData, each corresponds to a token. The list is ordered by time.
-        user_active (Optional[list[bool]]): Optional user activity mask aligned to generated tokens.
-            If None, user activity gating is disabled (equivalent to all tokens user-silent).
+        input_wav (str): Path to the user input wav used to estimate user activity over time.
+        frame_rate (float): Token frame rate, default 12.5.
+        activity_threshold (float): Absolute-amplitude threshold for active speech.
 
     Returns:
         torch.FloatTensor: Ratio tensor of shape [T, L] where T is token count and L is layer count.
@@ -173,12 +176,10 @@ def pad_lookback_ratio(
     t_total = len(decode_data_list)
 
     pad_mask = output_pad_mask(decode_data_list)
-    if user_active is None:
-        user_silent_mask = [True] * t_total
-    else:
-        if len(user_active) < t_total:
-            user_active = list(user_active) + [False] * (t_total - len(user_active))
-        user_silent_mask = [not bool(flag) for flag in user_active[:t_total]]
+    user_active = user_active_mask(input_wav, frame_rate=frame_rate, threshold=activity_threshold)
+    if len(user_active) < t_total:
+        user_active = list(user_active) + [False] * (t_total - len(user_active))
+    user_silent_mask = [not bool(flag) for flag in user_active[:t_total]]
 
     numerator_token_mask = [pad and silent for pad, silent in zip(pad_mask, user_silent_mask)]
 
