@@ -35,6 +35,7 @@ def visualize_wav_amplitude(input_wav):
     output_path = wav_path.with_name("input_amplitude.png")
     fig.savefig(output_path)
     plt.close(fig)
+    print(f"Saved amplitude visualization to {output_path}")
 
 
 def user_active_mask(input_wav, frame_rate, threshold):
