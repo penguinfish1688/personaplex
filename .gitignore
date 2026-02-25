@@ -11,6 +11,9 @@ QUICKSTART.md
 tmp/
 temp/
 
+#
+my_prompts/
+
 # C extensions
 *.so
 
