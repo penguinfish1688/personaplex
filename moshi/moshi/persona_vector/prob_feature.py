@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 SPECIAL_TOKEN_MAP: Dict[int, str] = {0: "EPAD", 1: "BOS", 2: "EOS", 3: "PAD"}
+PAD_TOKEN_ID = 3
 
 
 @dataclass
@@ -218,6 +219,36 @@ def hidden_to_probs(
     return F.softmax(logits.squeeze(0).float(), dim=-1).cpu()  # [T, V]
 
 
+def hidden_to_pad_probs_all_layers(
+    hidden: torch.Tensor,
+    projection: DecoderProjection,
+) -> torch.Tensor:
+    """Return PAD-token probability at every layer for every token.
+
+    Parameters
+    ----------
+    hidden : torch.Tensor
+        Shape ``[T, L, D]``.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``[T, L]`` – ``prob[t, l] = softmax(project(h[t,l]))[PAD]``.
+    """
+    T, L, D = hidden.shape
+    w = projection.text_linear.weight
+    # Flatten to [T*L, D], project, then reshape
+    x = hidden.reshape(T * L, D)
+    x = x.to(device=w.device, dtype=w.dtype).unsqueeze(0)  # type: ignore[arg-type]  # [1, T*L, D]
+    with torch.no_grad():
+        if projection.out_norm is not None:
+            x = projection.out_norm(x)
+        logits = projection.text_linear(x)  # [1, T*L, V]
+    probs = F.softmax(logits.squeeze(0).float(), dim=-1)  # [T*L, V]
+    pad_probs = probs[:, PAD_TOKEN_ID].reshape(T, L)  # [T, L]
+    return pad_probs.cpu()
+
+
 def _glob_hidden_paths(root: Path) -> List[Path]:
     """Glob ``*/output_hidden.pt`` under *root*, sorted numerically."""
     paths = list(root.glob("*/output_hidden.pt"))
@@ -245,6 +276,7 @@ def process_one(
     payload = torch.load(hidden_path, map_location="cpu", weights_only=True)
     hidden = payload["text_hidden_layers"]  # [T, L, D]
     probs = hidden_to_probs(hidden, projection, layer=layer)  # [T, V]
+    pad_probs = hidden_to_pad_probs_all_layers(hidden, projection)  # [T, L]
     T = probs.shape[0]
 
     # greedy token ids from the chosen layer
@@ -263,6 +295,7 @@ def process_one(
                 "token_id": token_id,
                 "token": _id_to_piece(token_id, tokenizer),
                 **feats,
+                "pad_prob_per_layer": pad_probs[t].tolist(),
             }
         )
     return results
@@ -300,12 +333,19 @@ def plot_prob_features(json_path: str, output_path: Optional[str] = None) -> Non
     tokens = [r["token"] for r in records]
     num_tokens = len(steps)
 
+    # Check if PAD-prob-per-layer data is present
+    has_pad = "pad_prob_per_layer" in records[0]
+    num_layers = len(records[0]["pad_prob_per_layer"]) if has_pad else 0
+    n_subplots = len(FEATURE_KEYS) + (1 if has_pad else 0)
+
     fig_w = max(12.0, num_tokens * 0.18)
     fig, axes = plt.subplots(
-        len(FEATURE_KEYS), 1, figsize=(fig_w, 2.2 * len(FEATURE_KEYS)),
+        n_subplots, 1,
+        figsize=(fig_w, 2.2 * n_subplots),
         sharex=True, dpi=150,
+        gridspec_kw={"height_ratios": [1] * len(FEATURE_KEYS) + ([2] if has_pad else [])},
     )
-    if len(FEATURE_KEYS) == 1:
+    if n_subplots == 1:
         axes = [axes]  # type: ignore[list-item]
 
     x = np.arange(num_tokens)
@@ -313,13 +353,42 @@ def plot_prob_features(json_path: str, output_path: Optional[str] = None) -> Non
     def _safe_text(t: str) -> str:
         return t.replace("\n", " ").replace("$", "\\$")
 
-    for ax, key, color in zip(axes, FEATURE_KEYS, FEATURE_COLORS):
+    for ax, key, color in zip(axes[:len(FEATURE_KEYS)], FEATURE_KEYS, FEATURE_COLORS):
         vals = [r[key] for r in records]
         ax.plot(x, vals, linewidth=0.8, color=color)
         ax.fill_between(x, vals, alpha=0.15, color=color)
         ax.set_ylabel(key, fontsize=9)
         ax.grid(axis="y", linewidth=0.3, alpha=0.5)
         ax.margins(x=0.002)
+
+    # PAD probability heatmap across layers
+    if has_pad:
+        from matplotlib.colors import LogNorm
+
+        pad_ax = axes[-1]
+        pad_grid = np.array(
+            [r["pad_prob_per_layer"] for r in records], dtype=np.float32,
+        ).T  # [L, T]
+
+        positive = pad_grid[pad_grid > 0]
+        vmin = max(float(np.min(positive)), 1e-8) if positive.size > 0 else 1e-8
+        vmax = max(float(np.max(pad_grid)), vmin)
+
+        im = pad_ax.imshow(
+            np.clip(pad_grid, vmin, vmax),
+            aspect="auto",
+            cmap="YlOrRd",
+            origin="upper",
+            norm=LogNorm(vmin=vmin, vmax=vmax),
+            extent=[-0.5, num_tokens - 0.5, num_layers - 0.5, -0.5],
+        )
+        fig.colorbar(im, ax=pad_ax, pad=0.01).set_label("P(<PAD>) [log]", fontsize=8)
+        pad_ax.set_ylabel("Layer", fontsize=9)
+        pad_ax.set_yticks(np.arange(0, num_layers, max(1, num_layers // 8)))
+        pad_ax.set_yticklabels(
+            [str(i + 1) for i in range(0, num_layers, max(1, num_layers // 8))],
+            fontsize=7,
+        )
 
     # Token labels on the bottom x-axis
     bottom_ax = axes[-1]
