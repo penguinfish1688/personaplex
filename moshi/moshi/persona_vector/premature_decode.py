@@ -155,13 +155,14 @@ def _resolve_token_range(t_total: int, start: int, end: int) -> tuple[int, int]:
 def _load_input_transcript_spans(
     hidden_path: Path,
     frame_rate_hz: float,
+    base: str = "input",
 ) -> list[tuple[float, float, str]]:
     """Load user transcript from sibling `input.json` and map time -> token index spans.
 
     Returns:
         List of `(start_token, end_token, text)` where token values are floats.
     """
-    input_json = hidden_path.with_name("input.json")
+    input_json = hidden_path.with_name(f"{base}.json")
     if not input_json.exists():
         return []
 
@@ -769,6 +770,7 @@ def main():
     ap.add_argument("--tokenizer", type=str, default=None)
     ap.add_argument("--moshi-weight", type=str, default=None)
     ap.add_argument("--device", type=str, default="cpu")
+    ap.add_argument("--transcript-base", type=str, default="input", help="Base name for user transcript JSON (default: 'input' for sibling input.json)")
     args = ap.parse_args()
 
     root_dir = Path(args.root_dir)
@@ -811,7 +813,7 @@ def main():
         t_total = int(payload["text_hidden_layers"].shape[0])
         start_idx, end_idx = _resolve_token_range(t_total, args.start, args.end)
         frame_rate_hz = float(payload.get("frame_rate", 12.5))
-        transcript_spans = _load_input_transcript_spans(hidden_path, frame_rate_hz)
+        transcript_spans = _load_input_transcript_spans(hidden_path, frame_rate_hz, base=args.transcript_base)
 
         print("Running premature decode...")
         decode_data = premature_decode(

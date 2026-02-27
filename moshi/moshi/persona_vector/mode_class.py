@@ -570,28 +570,40 @@ def plot_prediction(
         )
     token_names = token_names[:num_tokens]
 
-    # ---- user transcript from sibling input.json -----------------------------
+    # ---- user transcript from sibling transcript JSON -------------------------
+    # Transcript file: complete_sentence.json or incomplete_sentence.json
+    # (produced by ASR, same format as premature_decode's input.json:
+    #  {"text": "...", "chunks": [{"text": "word", "timestamp": [start, end]}, ...]})
     hidden_p = Path(hidden_path)
-    input_json = hidden_p.parent / "input.json"
-    user_text: Optional[str] = None
-    if input_json.exists():
-        with open(input_json, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-        # Pick the sentence that matches the hidden file name.
-        stem = hidden_p.stem  # e.g. "complete_sentence_hidden"
-        if "complete" in stem and "complete_sentence" in meta:
-            user_text = meta["complete_sentence"]
-        elif "incomplete" in stem and "incomplete_sentence" in meta:
-            user_text = meta["incomplete_sentence"]
-        elif "complete_sentence" in meta:
-            user_text = meta["complete_sentence"]
-        elif "incomplete_sentence" in meta:
-            user_text = meta["incomplete_sentence"]
+    stem = hidden_p.stem  # e.g. "complete_sentence_hidden"
+    # Strip "_hidden" suffix to get the sentence prefix
+    transcript_prefix = stem.replace("_hidden", "")  # "complete_sentence"
+    transcript_json = hidden_p.parent / f"{transcript_prefix}.json"
+
+    frame_rate_hz = float(payload.get("frame_rate", 12.5))
+    transcript_spans: list[tuple[float, float, str]] = []
+
+    if transcript_json.exists():
+        with open(transcript_json, "r", encoding="utf-8") as f:
+            transcript_data = json.load(f)
+        chunks = transcript_data.get("chunks", [])
+        for chunk in chunks:
+            word = str(chunk.get("text", "")).strip()
+            ts = chunk.get("timestamp", None)
+            if not word or not isinstance(ts, list) or len(ts) != 2:
+                continue
+            start_sec = float(ts[0])
+            end_sec = float(ts[1])
+            if end_sec <= start_sec:
+                continue
+            transcript_spans.append(
+                (start_sec * frame_rate_hz, end_sec * frame_rate_hz, word)
+            )
     else:
         import warnings
         warnings.warn(
-            f"No input.json found next to {hidden_path}. "
-            "User transcript will not be plotted."
+            f"No transcript file {transcript_json.name} found next to "
+            f"{hidden_path}. User transcript will not be plotted."
         )
 
     # ---- figure layout -------------------------------------------------------
@@ -634,69 +646,64 @@ def plot_prediction(
     ax.set_title("Mode prediction (listening=0, speaking=1)")
 
     # ---- user transcript lane ------------------------------------------------
-    if user_text:
-        # Split the sentence into words and distribute evenly across the
-        # token span — similar to premature_decode transcript lane.
-        words = user_text.split()
-        if words:
-            # We don't have per-word timestamps for mode_class data, so lay
-            # words evenly across the full token range.
-            total_w = num_tokens
-            span_per_word = total_w / len(words)
-
-            y_base = -0.18  # below the x-axis in data coords
-            lane_h = 0.08
-            for i, word in enumerate(words):
-                x_start = i * span_per_word - 0.5
-                x_end = (i + 1) * span_per_word - 0.5
-                rect = Rectangle(
-                    (x_start, y_base),
-                    x_end - x_start,
-                    lane_h,
-                    facecolor="#f3f3f3",
-                    edgecolor="#888888",
-                    linewidth=0.5,
-                    alpha=0.9,
-                    clip_on=False,
-                )
-                ax.add_patch(rect)
-                center_x = 0.5 * (x_start + x_end)
-                safe_word = _plot_safe_text(word)
-                try:
-                    ax.text(
-                        center_x,
-                        y_base + lane_h / 2,
-                        safe_word,
-                        ha="center",
-                        va="center",
-                        fontsize=5,
-                        color="black",
-                        clip_on=False,
-                        parse_math=False,
-                    )
-                except TypeError:
-                    ax.text(
-                        center_x,
-                        y_base + lane_h / 2,
-                        safe_word,
-                        ha="center",
-                        va="center",
-                        fontsize=5,
-                        color="black",
-                        clip_on=False,
-                    )
-
-            # "User" label.
-            ax.text(
-                -1.5,
-                y_base + lane_h / 2,
-                "User",
-                ha="right",
-                va="center",
-                fontsize=7,
-                color="black",
+    if transcript_spans:
+        y_base = -0.18  # below the x-axis in data coords
+        lane_h = 0.08
+        for start_tok, end_tok, word in transcript_spans:
+            if end_tok <= -0.5 or start_tok >= num_tokens - 0.5:
+                continue
+            draw_start = max(start_tok, -0.5)
+            draw_end = min(end_tok, num_tokens - 0.5)
+            if draw_end <= draw_start:
+                continue
+            rect = Rectangle(
+                (draw_start, y_base),
+                draw_end - draw_start,
+                lane_h,
+                facecolor="#f3f3f3",
+                edgecolor="#888888",
+                linewidth=0.5,
+                alpha=0.9,
                 clip_on=False,
             )
+            ax.add_patch(rect)
+            center_x = 0.5 * (draw_start + draw_end)
+            safe_word = _plot_safe_text(word)
+            try:
+                ax.text(
+                    center_x,
+                    y_base + lane_h / 2,
+                    safe_word,
+                    ha="center",
+                    va="center",
+                    fontsize=5,
+                    color="black",
+                    clip_on=False,
+                    parse_math=False,
+                )
+            except TypeError:
+                ax.text(
+                    center_x,
+                    y_base + lane_h / 2,
+                    safe_word,
+                    ha="center",
+                    va="center",
+                    fontsize=5,
+                    color="black",
+                    clip_on=False,
+                )
+
+        # "User" label.
+        ax.text(
+            -1.5,
+            y_base + lane_h / 2,
+            "User",
+            ha="right",
+            va="center",
+            fontsize=7,
+            color="black",
+            clip_on=False,
+        )
 
     fig.tight_layout()
     out_p = Path(output_path)
