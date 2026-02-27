@@ -44,7 +44,13 @@ def _load_hidden_payload(path: str) -> Dict[str, Any]:
     """Load a hidden payload ``.pt`` file and return its dict."""
     if not os.path.exists(path):
         raise FileNotFoundError(f"Hidden payload not found: {path}")
-    return torch.load(path, map_location="cpu", weights_only=False)
+    data = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(data, dict):
+        raise TypeError(
+            f"Expected dict payload from {path}, got {type(data).__name__}. "
+            "This file may not be a hidden payload."
+        )
+    return data
 
 
 def _extract_layer(payload: Dict[str, Any], layer: int) -> torch.Tensor:
@@ -603,22 +609,31 @@ def plot_prediction(
     token_names = token_names[:num_tokens]
 
     # ---- user transcript from sibling transcript JSON -------------------------
-    # Transcript file: complete_sentence.json or incomplete_sentence.json
-    # (produced by ASR, same format as premature_decode's input.json:
-    #  {"text": "...", "chunks": [{"text": "word", "timestamp": [start, end]}, ...]})
+    # For mode_class files like complete_sentence_hidden.pt -> complete_sentence.json
+    # For other datasets like output_hidden.pt -> try output.json, fall back to input.json
+    # Expected format: {"text": "...", "chunks": [{"text": "word", "timestamp": [start, end]}, ...]}
     hidden_p = Path(hidden_path)
     stem = hidden_p.stem  # e.g. "complete_sentence_hidden"
     # Strip "_hidden" suffix to get the sentence prefix
     transcript_prefix = stem.replace("_hidden", "")  # "complete_sentence"
-    transcript_json = hidden_p.parent / f"{transcript_prefix}.json"
+
+    # Candidate transcript files: derived name first, then input.json as fallback
+    candidates = [hidden_p.parent / f"{transcript_prefix}.json"]
+    if transcript_prefix != "input":
+        candidates.append(hidden_p.parent / "input.json")
 
     frame_rate_hz = float(payload.get("frame_rate", 12.5))
     transcript_spans: list[tuple[float, float, str]] = []
 
-    if transcript_json.exists():
+    for transcript_json in candidates:
+        if not transcript_json.exists():
+            continue
         with open(transcript_json, "r", encoding="utf-8") as f:
             transcript_data = json.load(f)
-        chunks = transcript_data.get("chunks", [])
+        if not isinstance(transcript_data, dict) or "chunks" not in transcript_data:
+            continue
+        # Found a valid transcript file
+        chunks = transcript_data["chunks"]
         for chunk in chunks:
             word = str(chunk.get("text", "")).strip()
             ts = chunk.get("timestamp", None)
@@ -631,12 +646,7 @@ def plot_prediction(
             transcript_spans.append(
                 (start_sec * frame_rate_hz, end_sec * frame_rate_hz, word)
             )
-    else:
-        import warnings
-        warnings.warn(
-            f"No transcript file {transcript_json.name} found next to "
-            f"{hidden_path}. User transcript will not be plotted."
-        )
+        break  # use first valid candidate
 
     # ---- figure layout -------------------------------------------------------
     fig_w = max(10.0, num_tokens * 0.45)
