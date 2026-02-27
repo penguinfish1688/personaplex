@@ -1,73 +1,644 @@
-# Linear classifier for listening mode vs. speaking mode
-# When 
+"""Linear classifier for listening mode vs. speaking mode.
+
+Determines whether Moshi is in *listening* mode (outputting PAD tokens while
+the user speaks) or *speaking* mode (generating real text) based on
+per-token hidden representations extracted during offline inference.
+
+Classes:
+    HiddenExtractor  – wraps ``run_batch_inference`` to generate hidden
+                       payloads (``*_hidden.pt``) for the mode-class dataset.
+    HiddenModeClassifier – trains, loads, and runs a ``nn.Linear(D, 1)``
+                           binary classifier on the extracted hiddens.
+
+CLI (``python -m moshi.persona_vector.mode_class``):
+    --gen-dataset-hidden <dataset_path>
+    --gen-sentence-hidden <wav_path> --output <path>
+    --train-mode-classifier <dataset_path> --output <dir> [--layer L]
+    --predict-mode <hidden.pt> --model <model.pt> --output <out.json>
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from glob import glob
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import torch
+import torch.nn as nn
+
+from moshi.offline import run_batch_inference, _get_voice_prompt_dir
+from moshi.models import loaders
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _load_hidden_payload(path: str) -> Dict[str, Any]:
+    """Load a hidden payload ``.pt`` file and return its dict."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Hidden payload not found: {path}")
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def _extract_layer(payload: Dict[str, Any], layer: int) -> torch.Tensor:
+    """Extract a single layer's hidden states from a payload.
+
+    Supports two payload formats:
+      1. Schema v1 (``text_hidden_layers: [T, L, D]``)
+      2. Simple  (``hidden_states: [T, D]``) – only ``layer == -1`` supported.
+
+    Returns:
+        ``[T, D]`` float tensor.
+    """
+    if "text_hidden_layers" in payload:
+        hidden = payload["text_hidden_layers"]  # [T, L, D]
+        num_layers = hidden.shape[1]
+        actual_layer = layer if layer >= 0 else num_layers + layer
+        if actual_layer < 0 or actual_layer >= num_layers:
+            raise ValueError(
+                f"Layer {layer} out of range for hidden with {num_layers} layers."
+            )
+        return hidden[:, actual_layer, :].float()
+    elif "hidden_states" in payload:
+        if layer != -1:
+            raise ValueError(
+                "Simple payload format only has the final layer (layer=-1). "
+                f"Requested layer={layer}."
+            )
+        return payload["hidden_states"].float()  # [T, D]
+    else:
+        raise KeyError(
+            "Payload has neither 'text_hidden_layers' nor 'hidden_states'."
+        )
+
+
+def _build_labels(
+    num_tokens: int,
+    listening_ranges: List[List[int]],
+    speaking_ranges: List[List[int]],
+) -> torch.Tensor:
+    """Build a per-token label tensor from inclusive ``[start, end]`` ranges.
+
+    0 = listening, 1 = speaking.  Tokens not covered by any range default to
+    listening (0).
+    """
+    labels = torch.zeros(num_tokens, dtype=torch.float32)
+    for start, end in listening_ranges:
+        if start < 0 or end >= num_tokens:
+            raise ValueError(
+                f"Listening range [{start}, {end}] out of bounds "
+                f"for {num_tokens} tokens."
+            )
+        labels[start : end + 1] = 0.0
+    for start, end in speaking_ranges:
+        if start < 0 or end >= num_tokens:
+            raise ValueError(
+                f"Speaking range [{start}, {end}] out of bounds "
+                f"for {num_tokens} tokens."
+            )
+        labels[start : end + 1] = 1.0
+    return labels
+
+
+def _derive_output_paths(hidden_path: str) -> tuple[str, str]:
+    """Derive output wav / text paths from a hidden payload path.
+
+    ``complete_sentence_hidden.pt`` → ``complete_sentence_output.wav``,
+    ``complete_sentence_output.json``.
+    """
+    base = hidden_path.replace("_hidden.pt", "")
+    return base + "_output.wav", base + "_output.json"
+
+
+# ---------------------------------------------------------------------------
+# HiddenExtractor
+# ---------------------------------------------------------------------------
+
 
 class HiddenExtractor:
-    def generate_batch(self, input_sentences: list[str], output_path: list[str]):
-        """Generate the output_hidden for each input sentecnce use inference_batch to process all
-        sentence in one session. and save as output_path. the outputp_path by default is output_hidden.pt
-        now it should be the give name
-        """
-    
-    def generate(self, input_sentence: str, output_path: str):
-        """Generate the output_hidden for each input sentecnce"""
+    """Generate hidden-state payloads via Moshi offline inference.
 
-    def class_mode_dataset(self, dataset_path):
-        """The dataset is at somewhere like Full-Duplex-Bench/data/mode_class/ and has 
-        the format of dataset_path/*/input.json, where each input.json has two fields: 
-        complete_sentence and incomplete_sentence (you can check the format yourself)
-        for each input.json, generate two output_hidden.pt files: complete_sentence_hidden.pt and incomplete_sentence_hidden.pt
+    Thin wrapper around :func:`run_batch_inference` with
+    ``save_hidden_payload=True``.
+
+    Args:
+        device: CUDA device string (default ``"cuda"``).
+        hf_repo: HuggingFace repo for model weights.
+        voice_prompt: Voice prompt filename (e.g. ``"NATF0.pt"``).
+        voice_prompt_dir: Optional directory containing voice prompts.
+        text_prompt: System text prompt.
+        tokenizer_path: Path to sentencepiece tokenizer.
+        moshi_weight: Path to Moshi LM weights.
+        mimi_weight: Path to Mimi codec weights.
+        seed: Random seed.
+    """
+
+    def __init__(
+        self,
+        *,
+        device: str = "cuda",
+        hf_repo: str = loaders.DEFAULT_REPO,
+        voice_prompt: str = "NATF0.pt",
+        voice_prompt_dir: Optional[str] = None,
+        text_prompt: str = "You are a helpful and friendly assistant.",
+        tokenizer_path: Optional[str] = None,
+        moshi_weight: Optional[str] = None,
+        mimi_weight: Optional[str] = None,
+        seed: int = 42,
+    ):
+        self.device = device
+        self.hf_repo = hf_repo
+        self.text_prompt = text_prompt
+        self.tokenizer_path = tokenizer_path
+        self.moshi_weight = moshi_weight
+        self.mimi_weight = mimi_weight
+        self.seed = seed
+
+        # Resolve voice prompt path
+        vp_dir = _get_voice_prompt_dir(voice_prompt_dir, hf_repo)
+        if vp_dir is None:
+            raise FileNotFoundError("Unable to resolve voice prompt directory.")
+        self.voice_prompt_path = os.path.join(vp_dir, voice_prompt)
+        if not os.path.exists(self.voice_prompt_path):
+            raise FileNotFoundError(
+                f"Voice prompt not found: {self.voice_prompt_path}"
+            )
+
+    def generate_batch(
+        self,
+        input_wavs: List[str],
+        output_hidden_paths: List[str],
+    ) -> None:
+        """Run batch inference and save hidden payloads.
+
+        For each ``input_wav``, a hidden payload is saved to the
+        corresponding entry in ``output_hidden_paths``.  Intermediate
+        output wav / text files are written alongside the hidden file.
         """
+        assert len(input_wavs) == len(output_hidden_paths), (
+            f"input_wavs ({len(input_wavs)}) and output_hidden_paths "
+            f"({len(output_hidden_paths)}) must have the same length"
+        )
+        if not input_wavs:
+            print("[mode_class] Nothing to process.")
+            return
+
+        out_wavs: List[str] = []
+        out_texts: List[str] = []
+        for h in output_hidden_paths:
+            wav, txt = _derive_output_paths(h)
+            out_wavs.append(wav)
+            out_texts.append(txt)
+
+        prompts = [self.text_prompt] * len(input_wavs)
+
+        with torch.no_grad():
+            run_batch_inference(
+                input_wavs=input_wavs,
+                output_wavs=out_wavs,
+                output_texts=out_texts,
+                text_prompts=prompts,
+                voice_prompt_path=self.voice_prompt_path,
+                tokenizer_path=self.tokenizer_path,
+                moshi_weight=self.moshi_weight,
+                mimi_weight=self.mimi_weight,
+                hf_repo=self.hf_repo,
+                device=self.device,
+                seed=self.seed,
+                temp_audio=0.8,
+                temp_text=0.7,
+                topk_audio=250,
+                topk_text=25,
+                greedy=False,
+                save_voice_prompt_embeddings=False,
+                cpu_offload=False,
+                return_hidden_layers=False,
+                save_hidden_payload=True,
+                output_hiddens=output_hidden_paths,
+            )
+
+    def generate(self, input_wav: str, output_hidden_path: str) -> None:
+        """Generate a single hidden payload for one WAV file."""
+        self.generate_batch([input_wav], [output_hidden_path])
+
+    def class_mode_dataset(self, dataset_path: str) -> None:
+        """Generate hidden payloads for every entry in a mode-class dataset.
+
+        Expects ``dataset_path/<id>/complete_sentence.wav`` and
+        ``dataset_path/<id>/incomplete_sentence.wav`` to exist (produced by
+        TTS).  Outputs ``complete_sentence_hidden.pt`` and
+        ``incomplete_sentence_hidden.pt`` next to each WAV.
+
+        Already-existing hidden files are skipped.
+        """
+        pattern = os.path.join(dataset_path, "*", "input.json")
+        entries = sorted(
+            glob(pattern),
+            key=lambda p: int(os.path.basename(os.path.dirname(p))),
+        )
+        if not entries:
+            raise FileNotFoundError(
+                f"No input.json found under {dataset_path}/*/"
+            )
+
+        input_wavs: List[str] = []
+        output_hiddens: List[str] = []
+
+        for entry_json in entries:
+            entry_dir = os.path.dirname(entry_json)
+            for prefix in ("complete_sentence", "incomplete_sentence"):
+                wav = os.path.join(entry_dir, f"{prefix}.wav")
+                hidden = os.path.join(entry_dir, f"{prefix}_hidden.pt")
+                if not os.path.exists(wav):
+                    raise FileNotFoundError(
+                        f"Expected WAV not found: {wav}. "
+                        "Run TTS (--mode-class) first."
+                    )
+                if os.path.exists(hidden):
+                    print(f"[SKIP] {hidden} already exists")
+                    continue
+                input_wavs.append(wav)
+                output_hiddens.append(hidden)
+
+        if not input_wavs:
+            print(
+                "[mode_class] All hiddens already exist, nothing to generate."
+            )
+            return
+
+        print(f"[mode_class] Generating {len(input_wavs)} hidden payloads …")
+        self.generate_batch(input_wavs, output_hiddens)
+        print("[mode_class] Done.")
+
+
+# ---------------------------------------------------------------------------
+# HiddenModeClassifier
+# ---------------------------------------------------------------------------
+
 
 class HiddenModeClassifier:
-    def __init__(self):
-        pass
+    """Binary linear classifier: listening (0) vs. speaking (1).
 
-    def train(self, dataset_path, output_dir, layer=-1):
-        """The dataset is at somewhere like Full-Duplex-Bench/data/mode_class/ and has 
-        the format of dataset_path/*/input.json, where each input.json has two fields: 
-        complete_sentence and incomplete_sentence (you can check the format yourself)
-        for each input.json, there are two output_hidden.pt files: complete_sentence_hidden.pt and incomplete_sentence_hidden.pt
-        if no exist error quit.
-
-        this is a simple linear classifier, that predict the mode (listening or speaking) for each token based on 
-        hidden representation of layer `layer`. ignore the sentece text in input.json, you will see
-        {
-            ...
-            "listening": [[4, 20], [31, 50], ...], # list of [start_token_id, end_token_id] for listening mode 
-                                                    #[3,5] means 3,4,5 token are in listening mode, index starts from 0
-            "speaking": [[0, 3], [21, 30], ...], # list of [start_token_id, end_token_id] for speaking mode
-            ...
-        }
-        make sure all the token ranges are within len(hidden[layer])
-
-        You take each hidden as input and predict its mode, and calculate the loss with the label.
-        The label is 0 for listening mode and 1 for speaking mode.
-
-        the output path should be output_dir/hidden_mode_classifier_layer_{layer}.pt
-        """
-        
-
-    def load(self, model_path):
-        """Load the trained model from model_path"""
-        pass
-
-    def predict(self, input_hidden_path, output_path):
-        """Predict the mode for a single input_hidden.pt and save the output to output_path
-        The output should be a text json file with the format:
-        {
-            1: {
-                "mode": "listening" or "speaking",
-                "confidence": float
-            }
-            2 ...
-        }
-        """
-        pass
-
-def main():
-    """The option should be stupid and simple
-    --gen-dataset-hidden <dataset path>: generate the hidden for the mode class dataset
-    --gen-sentence-hidden <sentence>: generate the hidden for a single sentence with --output <output path>
-    --train-mode-classifier <dataset path>: train the mode classifier with the mode class dataset with --output <trained model path>
-    --predict-mode <sentence> --model <trained model path> --output <output path>: predict the mode for a single sentence and save the output to output path
+    Operates on per-token hidden representations from a specified
+    transformer layer.
     """
+
+    def __init__(self) -> None:
+        self.model: Optional[nn.Linear] = None
+        self.layer: int = -1
+        self.hidden_dim: int = 0
+
+    # ---- training -----------------------------------------------------------
+
+    def train(
+        self,
+        dataset_path: str,
+        output_dir: str,
+        layer: int = -1,
+        *,
+        epochs: int = 50,
+        lr: float = 1e-3,
+        batch_size: int = 256,
+    ) -> None:
+        """Train the linear classifier on mode-class dataset hidden states.
+
+        For each entry under ``dataset_path/<id>/``:
+
+        * ``complete_sentence_hidden.pt`` is labeled using the
+          ``listening`` / ``speaking`` ranges from ``input.json``.
+        * ``incomplete_sentence_hidden.pt`` is labeled all-listening (0).
+
+        Saves the trained model to
+        ``output_dir/hidden_mode_classifier_layer_{layer}.pt``.
+        """
+        pattern = os.path.join(dataset_path, "*", "input.json")
+        entries = sorted(
+            glob(pattern),
+            key=lambda p: int(os.path.basename(os.path.dirname(p))),
+        )
+        if not entries:
+            raise FileNotFoundError(
+                f"No input.json found under {dataset_path}/*/"
+            )
+
+        all_hiddens: List[torch.Tensor] = []
+        all_labels: List[torch.Tensor] = []
+
+        for entry_json in entries:
+            entry_dir = os.path.dirname(entry_json)
+            entry_id = os.path.basename(entry_dir)
+
+            with open(entry_json, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+
+            # ---- complete_sentence_hidden --------------------------------
+            cs_path = os.path.join(entry_dir, "complete_sentence_hidden.pt")
+            if not os.path.exists(cs_path):
+                raise FileNotFoundError(
+                    f"Missing {cs_path}. "
+                    "Run --gen-dataset-hidden first."
+                )
+
+            if "listening" not in meta or "speaking" not in meta:
+                raise KeyError(
+                    f"input.json for entry {entry_id} is missing "
+                    "'listening' and/or 'speaking' label ranges."
+                )
+
+            cs_payload = _load_hidden_payload(cs_path)
+            cs_hidden = _extract_layer(cs_payload, layer)  # [T, D]
+            T_cs = cs_hidden.shape[0]
+            cs_labels = _build_labels(
+                T_cs, meta["listening"], meta["speaking"]
+            )
+            all_hiddens.append(cs_hidden)
+            all_labels.append(cs_labels)
+
+            # ---- incomplete_sentence_hidden (all listening) ---------------
+            is_path = os.path.join(
+                entry_dir, "incomplete_sentence_hidden.pt"
+            )
+            if not os.path.exists(is_path):
+                raise FileNotFoundError(
+                    f"Missing {is_path}. "
+                    "Run --gen-dataset-hidden first."
+                )
+
+            is_payload = _load_hidden_payload(is_path)
+            is_hidden = _extract_layer(is_payload, layer)  # [T, D]
+            T_is = is_hidden.shape[0]
+            is_labels = torch.zeros(T_is, dtype=torch.float32)
+            all_hiddens.append(is_hidden)
+            all_labels.append(is_labels)
+
+        # Aggregate all tokens
+        X = torch.cat(all_hiddens, dim=0)  # [N, D]
+        y = torch.cat(all_labels, dim=0)  # [N]
+        D = X.shape[1]
+
+        n_listen = int((y == 0).sum())
+        n_speak = int((y == 1).sum())
+        print(
+            f"[train] Collected {X.shape[0]} tokens, dim={D}, layer={layer}"
+        )
+        print(f"[train] Listening: {n_listen}, Speaking: {n_speak}")
+
+        # Build model
+        model = nn.Linear(D, 1)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        criterion = nn.BCEWithLogitsLoss()
+
+        N = X.shape[0]
+        model.train()
+        for epoch in range(1, epochs + 1):
+            perm = torch.randperm(N)
+            epoch_loss = 0.0
+            num_batches = 0
+            for i in range(0, N, batch_size):
+                idx = perm[i : i + batch_size]
+                xb = X[idx]
+                yb = y[idx]
+
+                logits = model(xb).squeeze(-1)
+                loss = criterion(logits, yb)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                epoch_loss += loss.item()
+                num_batches += 1
+
+            if epoch % 10 == 0 or epoch == 1:
+                avg_loss = epoch_loss / max(num_batches, 1)
+                with torch.no_grad():
+                    preds = (
+                        torch.sigmoid(model(X).squeeze(-1)) > 0.5
+                    ).float()
+                    acc = (preds == y).float().mean().item()
+                print(
+                    f"  epoch {epoch:3d}/{epochs}  "
+                    f"loss={avg_loss:.4f}  acc={acc:.4f}"
+                )
+
+        # Persist
+        self.model = model
+        self.layer = layer
+        self.hidden_dim = D
+
+        os.makedirs(output_dir, exist_ok=True)
+        save_path = os.path.join(
+            output_dir, f"hidden_mode_classifier_layer_{layer}.pt"
+        )
+        torch.save(
+            {
+                "state_dict": model.state_dict(),
+                "layer": layer,
+                "hidden_dim": D,
+            },
+            save_path,
+        )
+        print(f"[train] Saved classifier to {save_path}")
+
+    # ---- loading ------------------------------------------------------------
+
+    def load(self, model_path: str) -> None:
+        """Load a trained classifier from disk."""
+        ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
+        self.layer = ckpt["layer"]
+        self.hidden_dim = ckpt["hidden_dim"]
+        self.model = nn.Linear(self.hidden_dim, 1)
+        self.model.load_state_dict(ckpt["state_dict"])
+        self.model.eval()
+        print(
+            f"[load] Loaded classifier (layer={self.layer}, "
+            f"dim={self.hidden_dim}) from {model_path}"
+        )
+
+    # ---- prediction ---------------------------------------------------------
+
+    def predict(self, input_hidden_path: str, output_path: str) -> None:
+        """Predict per-token mode for a hidden payload and write JSON.
+
+        Output format::
+
+            {
+                "0": {"mode": "listening", "confidence": 0.95},
+                "1": {"mode": "speaking", "confidence": 0.87},
+                ...
+            }
+        """
+        if self.model is None:
+            raise RuntimeError("No model loaded. Call load() first.")
+
+        payload = _load_hidden_payload(input_hidden_path)
+        hidden = _extract_layer(payload, self.layer)  # [T, D]
+
+        self.model.eval()
+        with torch.no_grad():
+            logits = self.model(hidden).squeeze(-1)  # [T]
+            probs = torch.sigmoid(logits)  # [T]
+
+        result: Dict[str, Dict[str, Any]] = {}
+        for t in range(hidden.shape[0]):
+            p = probs[t].item()
+            mode = "speaking" if p > 0.5 else "listening"
+            confidence = p if mode == "speaking" else 1.0 - p
+            result[str(t)] = {
+                "mode": mode,
+                "confidence": round(confidence, 4),
+            }
+
+        os.makedirs(
+            os.path.dirname(os.path.abspath(output_path)), exist_ok=True
+        )
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+        print(
+            f"[predict] Saved predictions "
+            f"({hidden.shape[0]} tokens) to {output_path}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        prog="mode_class",
+        description="Linear classifier for Moshi listening/speaking mode.",
+    )
+
+    group = ap.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "--gen-dataset-hidden",
+        type=str,
+        metavar="DATASET",
+        help="Generate hidden payloads for a mode-class dataset directory.",
+    )
+    group.add_argument(
+        "--gen-sentence-hidden",
+        type=str,
+        metavar="WAV",
+        help="Generate a hidden payload for a single WAV file.",
+    )
+    group.add_argument(
+        "--train-mode-classifier",
+        type=str,
+        metavar="DATASET",
+        help="Train the mode classifier on a mode-class dataset.",
+    )
+    group.add_argument(
+        "--predict-mode",
+        type=str,
+        metavar="HIDDEN_PT",
+        help="Predict mode for a single hidden payload file.",
+    )
+
+    # Shared inference options (used by --gen-*)
+    ap.add_argument("--device", type=str, default="cuda")
+    ap.add_argument("--hf-repo", type=str, default=loaders.DEFAULT_REPO)
+    ap.add_argument("--voice-prompt", type=str, default="NATF0.pt")
+    ap.add_argument("--voice-prompt-dir", type=str, default=None)
+    ap.add_argument(
+        "--text-prompt",
+        type=str,
+        default="You are a helpful and friendly assistant.",
+    )
+    ap.add_argument("--tokenizer", type=str, default=None)
+    ap.add_argument("--moshi-weight", type=str, default=None)
+    ap.add_argument("--mimi-weight", type=str, default=None)
+    ap.add_argument("--seed", type=int, default=42)
+
+    # Training / prediction options
+    ap.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output path (dir for train, file for others).",
+    )
+    ap.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Path to trained classifier (for --predict-mode).",
+    )
+    ap.add_argument(
+        "--layer",
+        type=int,
+        default=-1,
+        help="Transformer layer index (default: -1, last layer).",
+    )
+    ap.add_argument(
+        "--epochs", type=int, default=50, help="Training epochs (default: 50)."
+    )
+    ap.add_argument(
+        "--lr", type=float, default=1e-3, help="Learning rate (default: 1e-3)."
+    )
+
+    args = ap.parse_args()
+
+    # ---- dispatch -----------------------------------------------------------
+
+    if args.gen_dataset_hidden:
+        extractor = HiddenExtractor(
+            device=args.device,
+            hf_repo=args.hf_repo,
+            voice_prompt=args.voice_prompt,
+            voice_prompt_dir=args.voice_prompt_dir,
+            text_prompt=args.text_prompt,
+            tokenizer_path=args.tokenizer,
+            moshi_weight=args.moshi_weight,
+            mimi_weight=args.mimi_weight,
+            seed=args.seed,
+        )
+        extractor.class_mode_dataset(args.gen_dataset_hidden)
+
+    elif args.gen_sentence_hidden:
+        if not args.output:
+            ap.error("--gen-sentence-hidden requires --output")
+        extractor = HiddenExtractor(
+            device=args.device,
+            hf_repo=args.hf_repo,
+            voice_prompt=args.voice_prompt,
+            voice_prompt_dir=args.voice_prompt_dir,
+            text_prompt=args.text_prompt,
+            tokenizer_path=args.tokenizer,
+            moshi_weight=args.moshi_weight,
+            mimi_weight=args.mimi_weight,
+            seed=args.seed,
+        )
+        extractor.generate(args.gen_sentence_hidden, args.output)
+
+    elif args.train_mode_classifier:
+        if not args.output:
+            ap.error("--train-mode-classifier requires --output")
+        classifier = HiddenModeClassifier()
+        classifier.train(
+            dataset_path=args.train_mode_classifier,
+            output_dir=args.output,
+            layer=args.layer,
+            epochs=args.epochs,
+            lr=args.lr,
+        )
+
+    elif args.predict_mode:
+        if not args.model:
+            ap.error("--predict-mode requires --model")
+        if not args.output:
+            ap.error("--predict-mode requires --output")
+        classifier = HiddenModeClassifier()
+        classifier.load(args.model)
+        classifier.predict(args.predict_mode, args.output)
+
+
+if __name__ == "__main__":
+    main()
