@@ -770,7 +770,7 @@ def main():
     ap.add_argument("--tokenizer", type=str, default=None)
     ap.add_argument("--moshi-weight", type=str, default=None)
     ap.add_argument("--device", type=str, default="cpu")
-    ap.add_argument("--transcript-base", type=str, default="input", help="Base name for user transcript JSON (default: 'input' for sibling input.json)")
+    ap.add_argument("--transcript-base", type=str, default="auto", help="Base name for user transcript JSON. 'auto' (default) derives from hidden stem by stripping '_hidden', e.g. complete_sentence_hidden.pt -> complete_sentence.json. Use 'input' for sibling input.json.")
     args = ap.parse_args()
 
     root_dir = Path(args.root_dir)
@@ -817,7 +817,13 @@ def main():
         t_total = int(payload["text_hidden_layers"].shape[0])
         start_idx, end_idx = _resolve_token_range(t_total, args.start, args.end)
         frame_rate_hz = float(payload.get("frame_rate", 12.5))
-        transcript_spans = _load_input_transcript_spans(hidden_path, frame_rate_hz, base=args.transcript_base)
+
+        # Derive transcript base: 'auto' strips '_hidden' from stem.
+        if args.transcript_base == "auto":
+            t_base = stem.removesuffix("_hidden") if stem.endswith("_hidden") else "input"
+        else:
+            t_base = args.transcript_base
+        transcript_spans = _load_input_transcript_spans(hidden_path, frame_rate_hz, base=t_base)
 
         print("Running premature decode...")
         decode_data = premature_decode(
