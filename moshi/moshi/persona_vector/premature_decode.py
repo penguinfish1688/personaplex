@@ -569,8 +569,15 @@ def decode_preview(token_names: Sequence[str], chunk: int = 10) -> str:
     return "\n".join(lines)
 
 
-def _resolve_hidden_path(root_dir: Path, sample_number: int) -> Path:
-    return root_dir / str(sample_number) / "output_hidden.pt"
+def _resolve_hidden_paths(root_dir: Path, sample_number: int) -> list[Path]:
+    """Return all ``.pt`` files under ``root_dir/<sample_number>/``."""
+    sample_dir = root_dir / str(sample_number)
+    if not sample_dir.is_dir():
+        raise FileNotFoundError(f"Sample directory not found: {sample_dir}")
+    pts = sorted(sample_dir.glob("*.pt"))
+    if not pts:
+        raise FileNotFoundError(f"No .pt files found in {sample_dir}")
+    return pts
 
 
 def _load_decoder_projection(
@@ -765,22 +772,19 @@ def main():
     args = ap.parse_args()
 
     root_dir = Path(args.root_dir)
-    hidden_path = Path(args.hidden_path) if args.hidden_path else _resolve_hidden_path(root_dir, args.sample_number)
-    if not hidden_path.exists():
-        raise FileNotFoundError(f"Hidden payload not found: {hidden_path}")
+    if args.hidden_path:
+        hidden_paths = [Path(args.hidden_path)]
+    else:
+        hidden_paths = _resolve_hidden_paths(root_dir, args.sample_number)
 
-    payload = torch.load(hidden_path, map_location="cpu", weights_only=True)
-    if "text_hidden_layers" not in payload:
-        raise ValueError("Unsupported payload: missing key 'text_hidden_layers'")
-
-    t_total = int(payload["text_hidden_layers"].shape[0])
-    start_idx, end_idx = _resolve_token_range(t_total, args.start, args.end)
-    frame_rate_hz = float(payload.get("frame_rate", 12.5))
-    transcript_spans = _load_input_transcript_spans(hidden_path, frame_rate_hz)
-
-    token_names = payload.get("token_names", [])
+    # Preview mode: just show token names from the first valid payload.
     if args.preview_output:
-        print(decode_preview(token_names))
+        for hp in hidden_paths:
+            payload = torch.load(hp, map_location="cpu", weights_only=True)
+            token_names = payload.get("token_names", [])
+            if token_names:
+                print(f"--- {hp.name} ---")
+                print(decode_preview(token_names))
         return
 
     print("Loading decoder projection and tokenizer...")
@@ -791,76 +795,95 @@ def main():
         device=args.device,
     )
 
-    print("Running premature decode...")
-    decode_data = premature_decode(
-        hidden_payload=payload,
-        projection=projection,
-        tokenizer=tokenizer,
-        start=start_idx,
-        end=end_idx,
-    )
+    for hidden_path in hidden_paths:
+        if not hidden_path.exists():
+            print(f"[SKIP] Hidden payload not found: {hidden_path}")
+            continue
 
-    if args.output:
-        output_path = Path(args.output)
-    else:
-        output_path = hidden_path.with_name(f"logits_evolution_{start_idx}_{end_idx}.png")
+        payload = torch.load(hidden_path, map_location="cpu", weights_only=True)
+        if "text_hidden_layers" not in payload:
+            print(f"[SKIP] {hidden_path.name}: missing key 'text_hidden_layers'")
+            continue
 
-    print("Plotting logits evolution heatmap...")
-    plot_logits_evolution(
-        decode_data,
-        str(output_path),
-        token_start_idx=start_idx,
-        transcript_spans=transcript_spans,
-    )
+        stem = hidden_path.stem  # e.g. "output_hidden"
+        print(f"\n=== Processing {hidden_path} ===")
 
-    if args.output:
-        prob_output_path = output_path.with_name(f"{output_path.stem}_final_token_prob{output_path.suffix}")
-    else:
-        prob_output_path = hidden_path.with_name(f"final_token_probability_{start_idx}_{end_idx}.png")
+        t_total = int(payload["text_hidden_layers"].shape[0])
+        start_idx, end_idx = _resolve_token_range(t_total, args.start, args.end)
+        frame_rate_hz = float(payload.get("frame_rate", 12.5))
+        transcript_spans = _load_input_transcript_spans(hidden_path, frame_rate_hz)
 
-    print("Plotting final token probability heatmap...")
-    plot_final_token_probability_heatmap(
-        decode_data,
-        str(prob_output_path),
-        token_start_idx=start_idx,
-        transcript_spans=transcript_spans,
-    )
+        print("Running premature decode...")
+        decode_data = premature_decode(
+            hidden_payload=payload,
+            projection=projection,
+            tokenizer=tokenizer,
+            start=start_idx,
+            end=end_idx,
+        )
 
-    if args.output:
-        pad_prob_output_path = output_path.with_name(f"{output_path.stem}_pad_token_prob{output_path.suffix}")
-    else:
-        pad_prob_output_path = hidden_path.with_name(f"pad_token_probability_{start_idx}_{end_idx}.png")
+        if args.output and len(hidden_paths) == 1:
+            output_path = Path(args.output)
+        else:
+            output_path = hidden_path.with_name(f"{stem}_logits_evolution_{start_idx}_{end_idx}.png")
 
-    print("Plotting <PAD> token probability heatmap...")
-    plot_pad_token_probability_heatmap(
-        decode_data,
-        str(pad_prob_output_path),
-        token_start_idx=start_idx,
-        transcript_spans=transcript_spans,
-    )
+        print("Plotting logits evolution heatmap...")
+        plot_logits_evolution(
+            decode_data,
+            str(output_path),
+            token_start_idx=start_idx,
+            transcript_spans=transcript_spans,
+        )
 
-    if args.output:
-        pad_lookback_output_path = output_path.with_name(f"{output_path.stem}_pad_lookback_ratio{output_path.suffix}")
-    else:
-        pad_lookback_output_path = hidden_path.with_name(f"pad_lookback_ratio_{start_idx}_{end_idx}.png")
+        if args.output and len(hidden_paths) == 1:
+            prob_output_path = output_path.with_name(f"{output_path.stem}_final_token_prob{output_path.suffix}")
+        else:
+            prob_output_path = hidden_path.with_name(f"{stem}_final_token_probability_{start_idx}_{end_idx}.png")
 
-    input_wav_path = hidden_path.with_name("input.wav")
-    if not input_wav_path.exists():
-        raise FileNotFoundError(f"Input wav not found for PAD lookback ratio: {input_wav_path}")
+        print("Plotting final token probability heatmap...")
+        plot_final_token_probability_heatmap(
+            decode_data,
+            str(prob_output_path),
+            token_start_idx=start_idx,
+            transcript_spans=transcript_spans,
+        )
 
-    print("Plotting PAD lookback ratio heatmap...")
-    plot_pad_lookback_ratio(
-        decode_data,
-        str(pad_lookback_output_path),
-        input_wav=str(input_wav_path),
-        token_offset=start_idx,
-        token_start_idx=start_idx,
-        transcript_spans=transcript_spans,
-    )
-    print(f"Saved figure to {output_path}")
-    print(f"Saved figure to {prob_output_path}")
-    print(f"Saved figure to {pad_prob_output_path}")
-    print(f"Saved figure to {pad_lookback_output_path}")
+        if args.output and len(hidden_paths) == 1:
+            pad_prob_output_path = output_path.with_name(f"{output_path.stem}_pad_token_prob{output_path.suffix}")
+        else:
+            pad_prob_output_path = hidden_path.with_name(f"{stem}_pad_token_probability_{start_idx}_{end_idx}.png")
+
+        print("Plotting <PAD> token probability heatmap...")
+        plot_pad_token_probability_heatmap(
+            decode_data,
+            str(pad_prob_output_path),
+            token_start_idx=start_idx,
+            transcript_spans=transcript_spans,
+        )
+
+        if args.output and len(hidden_paths) == 1:
+            pad_lookback_output_path = output_path.with_name(f"{output_path.stem}_pad_lookback_ratio{output_path.suffix}")
+        else:
+            pad_lookback_output_path = hidden_path.with_name(f"{stem}_pad_lookback_ratio_{start_idx}_{end_idx}.png")
+
+        input_wav_path = hidden_path.with_name("input.wav")
+        if not input_wav_path.exists():
+            print(f"[SKIP] Input wav not found for PAD lookback ratio: {input_wav_path}")
+        else:
+            print("Plotting PAD lookback ratio heatmap...")
+            plot_pad_lookback_ratio(
+                decode_data,
+                str(pad_lookback_output_path),
+                input_wav=str(input_wav_path),
+                token_offset=start_idx,
+                token_start_idx=start_idx,
+                transcript_spans=transcript_spans,
+            )
+            print(f"Saved figure to {pad_lookback_output_path}")
+
+        print(f"Saved figure to {output_path}")
+        print(f"Saved figure to {prob_output_path}")
+        print(f"Saved figure to {pad_prob_output_path}")
 
 
 if __name__ == "__main__":

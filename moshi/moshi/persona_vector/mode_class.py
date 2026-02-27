@@ -15,6 +15,7 @@ CLI (``python -m moshi.persona_vector.mode_class``):
     --gen-sentence-hidden <wav_path> --output <path>
     --train-mode-classifier <dataset_path> --output <dir> [--layer L]
     --predict-mode <hidden.pt> --model <model.pt> --output <out.json>
+    --plot-prediction <prediction.json> --hidden <hidden.pt> --output <out.png>
 """
 
 from __future__ import annotations
@@ -507,6 +508,205 @@ class HiddenModeClassifier:
 
 
 # ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+
+
+def _plot_safe_text(text: str) -> str:
+    """Sanitize text for matplotlib rendering."""
+    return text.replace("\n", " ").replace("$", "\\$")
+
+
+def plot_prediction(
+    prediction_path: str,
+    hidden_path: str,
+    output_path: str,
+) -> None:
+    """Plot mode prediction results.
+
+    * **Y-axis**: continuous score in ``[0, 1]`` where 0 = listening and
+      1 = speaking.  Derived from the predicted class and confidence:
+      ``score = confidence`` if speaking else ``1 - confidence``.
+    * **X-axis**: token index.  Each tick is labeled with the decoded
+      token name from the hidden payload (``token_names``).
+    * **User transcript lane**: if a sibling ``input.json`` exists next
+      to *hidden_path*, its ``complete_sentence`` / ``incomplete_sentence``
+      is shown as a text band below the plot.
+
+    Args:
+        prediction_path: JSON file produced by ``HiddenModeClassifier.predict``.
+        hidden_path: The ``*_hidden.pt`` file used for prediction (supplies
+            ``token_names``).
+        output_path: Output image path (PNG).
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.patches import Rectangle
+
+    # ---- load prediction JSON ------------------------------------------------
+    with open(prediction_path, "r", encoding="utf-8") as f:
+        predictions: Dict[str, Dict[str, Any]] = json.load(f)
+
+    num_tokens = len(predictions)
+    if num_tokens == 0:
+        raise ValueError("Prediction file is empty.")
+
+    scores = np.zeros(num_tokens, dtype=np.float32)
+    for t in range(num_tokens):
+        entry = predictions[str(t)]
+        conf = float(entry["confidence"])
+        if entry["mode"] == "speaking":
+            scores[t] = conf
+        else:
+            scores[t] = 1.0 - conf
+
+    # ---- load token names from hidden payload --------------------------------
+    payload = _load_hidden_payload(hidden_path)
+    token_names: List[str] = payload.get("token_names", [])
+    if len(token_names) < num_tokens:
+        # Pad with index strings if payload has fewer names.
+        token_names.extend(
+            [str(i) for i in range(len(token_names), num_tokens)]
+        )
+    token_names = token_names[:num_tokens]
+
+    # ---- user transcript from sibling input.json -----------------------------
+    hidden_p = Path(hidden_path)
+    input_json = hidden_p.parent / "input.json"
+    user_text: Optional[str] = None
+    if input_json.exists():
+        with open(input_json, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        # Pick the sentence that matches the hidden file name.
+        stem = hidden_p.stem  # e.g. "complete_sentence_hidden"
+        if "complete" in stem and "complete_sentence" in meta:
+            user_text = meta["complete_sentence"]
+        elif "incomplete" in stem and "incomplete_sentence" in meta:
+            user_text = meta["incomplete_sentence"]
+        elif "complete_sentence" in meta:
+            user_text = meta["complete_sentence"]
+        elif "incomplete_sentence" in meta:
+            user_text = meta["incomplete_sentence"]
+    else:
+        import warnings
+        warnings.warn(
+            f"No input.json found next to {hidden_path}. "
+            "User transcript will not be plotted."
+        )
+
+    # ---- figure layout -------------------------------------------------------
+    fig_w = max(10.0, num_tokens * 0.45)
+    fig_h = 5.0
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
+
+    xs = np.arange(num_tokens)
+
+    # Color each bar by predicted mode (blue = listening, orange = speaking).
+    colors = [
+        "#e67e22" if s > 0.5 else "#3498db" for s in scores
+    ]
+    ax.bar(xs, scores, color=colors, width=0.8, edgecolor="none", alpha=0.85)
+
+    # Horizontal reference line at 0.5 threshold.
+    ax.axhline(0.5, color="#888888", linewidth=0.8, linestyle="--")
+
+    # Token name labels on x-axis (rotated).
+    safe_names = [_plot_safe_text(n) for n in token_names]
+    ax.set_xticks(xs)
+    try:
+        ax.set_xticklabels(
+            safe_names,
+            rotation=90,
+            fontsize=5,
+            ha="center",
+            parse_math=False,
+        )
+    except TypeError:
+        # Older matplotlib without parse_math.
+        ax.set_xticklabels(
+            safe_names, rotation=90, fontsize=5, ha="center"
+        )
+
+    ax.set_xlim(-0.5, num_tokens - 0.5)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_ylabel("P(speaking)")
+    ax.set_xlabel("Token index")
+    ax.set_title("Mode prediction (listening=0, speaking=1)")
+
+    # ---- user transcript lane ------------------------------------------------
+    if user_text:
+        # Split the sentence into words and distribute evenly across the
+        # token span — similar to premature_decode transcript lane.
+        words = user_text.split()
+        if words:
+            # We don't have per-word timestamps for mode_class data, so lay
+            # words evenly across the full token range.
+            total_w = num_tokens
+            span_per_word = total_w / len(words)
+
+            y_base = -0.18  # below the x-axis in data coords
+            lane_h = 0.08
+            for i, word in enumerate(words):
+                x_start = i * span_per_word - 0.5
+                x_end = (i + 1) * span_per_word - 0.5
+                rect = Rectangle(
+                    (x_start, y_base),
+                    x_end - x_start,
+                    lane_h,
+                    facecolor="#f3f3f3",
+                    edgecolor="#888888",
+                    linewidth=0.5,
+                    alpha=0.9,
+                    clip_on=False,
+                )
+                ax.add_patch(rect)
+                center_x = 0.5 * (x_start + x_end)
+                safe_word = _plot_safe_text(word)
+                try:
+                    ax.text(
+                        center_x,
+                        y_base + lane_h / 2,
+                        safe_word,
+                        ha="center",
+                        va="center",
+                        fontsize=5,
+                        color="black",
+                        clip_on=False,
+                        parse_math=False,
+                    )
+                except TypeError:
+                    ax.text(
+                        center_x,
+                        y_base + lane_h / 2,
+                        safe_word,
+                        ha="center",
+                        va="center",
+                        fontsize=5,
+                        color="black",
+                        clip_on=False,
+                    )
+
+            # "User" label.
+            ax.text(
+                -1.5,
+                y_base + lane_h / 2,
+                "User",
+                ha="right",
+                va="center",
+                fontsize=7,
+                color="black",
+                clip_on=False,
+            )
+
+    fig.tight_layout()
+    out_p = Path(output_path)
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_p, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] Saved prediction plot ({num_tokens} tokens) to {output_path}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -542,6 +742,12 @@ def main() -> None:
         metavar="HIDDEN_PT",
         help="Predict mode for a single hidden payload file.",
     )
+    group.add_argument(
+        "--plot-prediction",
+        type=str,
+        metavar="PRED_JSON",
+        help="Plot prediction results from a JSON file.",
+    )
 
     # Shared inference options (used by --gen-*)
     ap.add_argument("--device", type=str, default="cuda")
@@ -570,6 +776,12 @@ def main() -> None:
         type=str,
         default=None,
         help="Path to trained classifier (for --predict-mode).",
+    )
+    ap.add_argument(
+        "--hidden",
+        type=str,
+        default=None,
+        help="Path to hidden payload .pt (for --plot-prediction).",
     )
     ap.add_argument(
         "--layer",
@@ -638,6 +850,13 @@ def main() -> None:
         classifier = HiddenModeClassifier()
         classifier.load(args.model)
         classifier.predict(args.predict_mode, args.output)
+
+    elif args.plot_prediction:
+        if not args.hidden:
+            ap.error("--plot-prediction requires --hidden")
+        if not args.output:
+            ap.error("--plot-prediction requires --output")
+        plot_prediction(args.plot_prediction, args.hidden, args.output)
 
 
 if __name__ == "__main__":
