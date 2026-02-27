@@ -745,6 +745,58 @@ def plot_prediction(
     print(f"[plot] Saved prediction plot ({num_tokens} tokens) to {output_path}")
 
 
+def plot_prediction_dataset(
+    root_dir: str,
+    model_path: str,
+) -> None:
+    """Predict + plot for every ``*_hidden.pt`` under ``root_dir/*/``.
+
+    For each hidden file:
+    1. Run ``HiddenModeClassifier.predict`` → save prediction JSON next to it.
+    2. Run ``plot_prediction`` → save PNG next to it.
+
+    Args:
+        root_dir: Dataset root (e.g. ``data/mode_class_mini``).
+        model_path: Path to trained classifier ``.pt``.
+    """
+    root = Path(root_dir)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Root directory not found: {root}")
+
+    classifier = HiddenModeClassifier()
+    classifier.load(model_path)
+
+    # Gather all *_hidden.pt files
+    hidden_files = sorted(root.glob("*/*_hidden.pt"))
+    if not hidden_files:
+        raise FileNotFoundError(f"No *_hidden.pt files found under {root}/*/")
+
+    print(f"[plot-dataset] Found {len(hidden_files)} hidden files under {root}")
+
+    for hp in hidden_files:
+        stem = hp.stem  # e.g. "complete_sentence_hidden"
+        pred_json = hp.with_name(f"{stem}_prediction.json")
+        plot_png = hp.with_name(f"{stem}_mode_prediction.png")
+
+        print(f"\n--- {hp.parent.name}/{hp.name} ---")
+
+        # Predict
+        try:
+            classifier.predict(str(hp), str(pred_json))
+        except Exception as exc:
+            print(f"  [SKIP] predict failed: {exc}")
+            continue
+
+        # Plot
+        try:
+            plot_prediction(str(pred_json), str(hp), str(plot_png))
+        except Exception as exc:
+            print(f"  [SKIP] plot failed: {exc}")
+            continue
+
+    print(f"\n[plot-dataset] Done. Processed {len(hidden_files)} files.")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -786,6 +838,12 @@ def main() -> None:
         type=str,
         metavar="PRED_JSON",
         help="Plot prediction results from a JSON file.",
+    )
+    group.add_argument(
+        "--plot-prediction-dataset",
+        type=str,
+        metavar="ROOT_DIR",
+        help="Predict + plot for all *_hidden.pt under ROOT_DIR/*/.",
     )
 
     # Shared inference options (used by --gen-*)
@@ -896,6 +954,14 @@ def main() -> None:
         if not args.output:
             ap.error("--plot-prediction requires --output")
         plot_prediction(args.plot_prediction, args.hidden, args.output)
+
+    elif args.plot_prediction_dataset:
+        if not args.model:
+            ap.error("--plot-prediction-dataset requires --model")
+        plot_prediction_dataset(
+            root_dir=args.plot_prediction_dataset,
+            model_path=args.model,
+        )
 
 
 if __name__ == "__main__":
