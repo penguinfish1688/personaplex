@@ -824,6 +824,7 @@ def main():
         else:
             t_base = args.transcript_base
         transcript_spans = _load_input_transcript_spans(hidden_path, frame_rate_hz, base=t_base)
+        print(f"[DEBUG] stem={stem!r}, transcript_base={t_base!r}, spans={len(transcript_spans)}")
 
         print("Running premature decode...")
         decode_data = premature_decode(
