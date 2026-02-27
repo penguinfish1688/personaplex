@@ -312,8 +312,11 @@ class HiddenModeClassifier:
         For each entry under ``dataset_path/<id>/``:
 
         * ``complete_sentence_hidden.pt`` is labeled using the
-          ``listening`` / ``speaking`` ranges from ``input.json``.
-        * ``incomplete_sentence_hidden.pt`` is labeled all-listening (0).
+          ``complete_modes.listening`` / ``complete_modes.speaking`` ranges
+          from ``input.json``.
+        * ``incomplete_sentence_hidden.pt`` is labeled using the
+          ``incomplete_modes.listening`` / ``incomplete_modes.speaking``
+          ranges from ``input.json``.
 
         Saves the trained model to
         ``output_dir/hidden_mode_classifier_layer_{layer}.pt``.
@@ -346,22 +349,23 @@ class HiddenModeClassifier:
                     "Run --gen-dataset-hidden first."
                 )
 
-            if "listening" not in meta or "speaking" not in meta:
+            if "complete_modes" not in meta:
                 raise KeyError(
                     f"input.json for entry {entry_id} is missing "
-                    "'listening' and/or 'speaking' label ranges."
+                    "'complete_modes' label ranges."
                 )
+            cs_modes = meta["complete_modes"]
 
             cs_payload = _load_hidden_payload(cs_path)
             cs_hidden = _extract_layer(cs_payload, layer)  # [T, D]
             T_cs = cs_hidden.shape[0]
             cs_labels = _build_labels(
-                T_cs, meta["listening"], meta["speaking"]
+                T_cs, cs_modes["listening"], cs_modes["speaking"]
             )
             all_hiddens.append(cs_hidden)
             all_labels.append(cs_labels)
 
-            # ---- incomplete_sentence_hidden (all listening) ---------------
+            # ---- incomplete_sentence_hidden ------------------------------
             is_path = os.path.join(
                 entry_dir, "incomplete_sentence_hidden.pt"
             )
@@ -371,10 +375,19 @@ class HiddenModeClassifier:
                     "Run --gen-dataset-hidden first."
                 )
 
+            if "incomplete_modes" not in meta:
+                raise KeyError(
+                    f"input.json for entry {entry_id} is missing "
+                    "'incomplete_modes' label ranges."
+                )
+            is_modes = meta["incomplete_modes"]
+
             is_payload = _load_hidden_payload(is_path)
             is_hidden = _extract_layer(is_payload, layer)  # [T, D]
             T_is = is_hidden.shape[0]
-            is_labels = torch.zeros(T_is, dtype=torch.float32)
+            is_labels = _build_labels(
+                T_is, is_modes["listening"], is_modes["speaking"]
+            )
             all_hiddens.append(is_hidden)
             all_labels.append(is_labels)
 
