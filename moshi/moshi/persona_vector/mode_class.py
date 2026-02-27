@@ -408,16 +408,29 @@ class HiddenModeClassifier:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         criterion = nn.BCEWithLogitsLoss()
 
+        # Train/val split (80/20)
         N = X.shape[0]
+        perm_all = torch.randperm(N)
+        n_train = int(N * 0.8)
+        train_idx = perm_all[:n_train]
+        val_idx = perm_all[n_train:]
+        X_train, y_train = X[train_idx], y[train_idx]
+        X_val, y_val = X[val_idx], y[val_idx]
+        print(
+            f"[train] Split: {X_train.shape[0]} train, "
+            f"{X_val.shape[0]} val"
+        )
+
+        N_train = X_train.shape[0]
         model.train()
         for epoch in range(1, epochs + 1):
-            perm = torch.randperm(N)
+            perm = torch.randperm(N_train)
             epoch_loss = 0.0
             num_batches = 0
-            for i in range(0, N, batch_size):
+            for i in range(0, N_train, batch_size):
                 idx = perm[i : i + batch_size]
-                xb = X[idx]
-                yb = y[idx]
+                xb = X_train[idx]
+                yb = y_train[idx]
 
                 logits = model(xb).squeeze(-1)
                 loss = criterion(logits, yb)
@@ -429,17 +442,23 @@ class HiddenModeClassifier:
                 epoch_loss += loss.item()
                 num_batches += 1
 
-            if epoch % 10 == 0 or epoch == 1:
-                avg_loss = epoch_loss / max(num_batches, 1)
-                with torch.no_grad():
-                    preds = (
-                        torch.sigmoid(model(X).squeeze(-1)) > 0.5
-                    ).float()
-                    acc = (preds == y).float().mean().item()
-                print(
-                    f"  epoch {epoch:3d}/{epochs}  "
-                    f"loss={avg_loss:.4f}  acc={acc:.4f}"
-                )
+            avg_loss = epoch_loss / max(num_batches, 1)
+            with torch.no_grad():
+                train_preds = (
+                    torch.sigmoid(model(X_train).squeeze(-1)) > 0.5
+                ).float()
+                train_acc = (train_preds == y_train).float().mean().item()
+                val_preds = (
+                    torch.sigmoid(model(X_val).squeeze(-1)) > 0.5
+                ).float()
+                val_acc = (val_preds == y_val).float().mean().item()
+                val_logits = model(X_val).squeeze(-1)
+                val_loss = criterion(val_logits, y_val).item()
+            print(
+                f"  epoch {epoch:3d}/{epochs}  "
+                f"train_loss={avg_loss:.4f}  train_acc={train_acc:.4f}  "
+                f"val_loss={val_loss:.4f}  val_acc={val_acc:.4f}"
+            )
 
         # Persist
         self.model = model
