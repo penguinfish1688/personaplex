@@ -571,13 +571,13 @@ def decode_preview(token_names: Sequence[str], chunk: int = 10) -> str:
 
 
 def _resolve_hidden_paths(root_dir: Path, sample_number: int) -> list[Path]:
-    """Return all ``.pt`` files under ``root_dir/<sample_number>/``."""
+    """Return all ``*_hidden.pt`` files under ``root_dir/<sample_number>/``."""
     sample_dir = root_dir / str(sample_number)
     if not sample_dir.is_dir():
         raise FileNotFoundError(f"Sample directory not found: {sample_dir}")
-    pts = sorted(sample_dir.glob("*.pt"))
+    pts = sorted(sample_dir.glob("*_hidden.pt"))
     if not pts:
-        raise FileNotFoundError(f"No .pt files found in {sample_dir}")
+        raise FileNotFoundError(f"No *_hidden.pt files found in {sample_dir}")
     return pts
 
 
@@ -802,7 +802,11 @@ def main():
             print(f"[SKIP] Hidden payload not found: {hidden_path}")
             continue
 
-        payload = torch.load(hidden_path, map_location="cpu", weights_only=True)
+        try:
+            payload = torch.load(hidden_path, map_location="cpu", weights_only=True)
+        except (EOFError, RuntimeError) as exc:
+            print(f"[SKIP] {hidden_path.name}: failed to load ({exc.__class__.__name__}: {exc})")
+            continue
         if "text_hidden_layers" not in payload:
             print(f"[SKIP] {hidden_path.name}: missing key 'text_hidden_layers'")
             continue
