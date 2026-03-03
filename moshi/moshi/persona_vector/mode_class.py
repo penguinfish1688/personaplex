@@ -754,6 +754,136 @@ def plot_prediction(
     plt.close(fig)
     print(f"[plot] Saved prediction plot ({num_tokens} tokens) to {output_path}")
 
+def plot_hidden_self_similarity(
+    hidden_path: str,
+    output_path: str,
+    *,
+    layer: int = -1,
+    window: int = 5,
+) -> None:
+    """Plot a token-token hidden-state self-similarity heatmap.
+
+    Steps:
+    1. Load hidden activations from ``hidden_path``.
+    2. Convert to a 2D matrix ``X`` of shape ``[T, D]`` (auto-handle batch dim).
+    3. Smooth token activations with a sliding window ``[i-window, i+window]``.
+    4. Remove anisotropy by centering over time.
+    5. L2-normalize each token vector.
+    6. Compute cosine self-similarity matrix ``M = X_norm @ X_norm.T``.
+    7. Save a high-resolution seaborn heatmap.
+
+    Args:
+        hidden_path: Path to ``.pt`` file containing either a tensor or a
+            payload dict with ``text_hidden_layers`` / ``hidden_states``.
+        output_path: Output PNG path.
+        layer: Layer index for ``text_hidden_layers`` (default ``-1``).
+        window: Half-window size for sliding mean smoothing (default ``5``).
+    """
+    import importlib
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    sns = importlib.import_module("seaborn")
+
+    if window < 0:
+        raise ValueError(f"window must be >= 0, got {window}")
+
+    if not os.path.exists(hidden_path):
+        raise FileNotFoundError(f"Hidden tensor/payload not found: {hidden_path}")
+
+    raw = torch.load(hidden_path, map_location="cpu", weights_only=False)
+
+    if isinstance(raw, dict):
+        if "text_hidden_layers" in raw:
+            hidden = raw["text_hidden_layers"]
+            if hidden.ndim != 3:
+                raise ValueError(
+                    "Expected 'text_hidden_layers' shape [T, L, D], "
+                    f"got {tuple(hidden.shape)}"
+                )
+            n_layers = hidden.shape[1]
+            use_layer = layer if layer >= 0 else n_layers + layer
+            if use_layer < 0 or use_layer >= n_layers:
+                raise ValueError(
+                    f"Layer {layer} out of range for {n_layers} layers."
+                )
+            X = hidden[:, use_layer, :].float()  # [T, D]
+        elif "hidden_states" in raw:
+            X = raw["hidden_states"].float()
+        else:
+            keys = ", ".join(sorted(raw.keys()))
+            raise KeyError(
+                "Unsupported payload dict. Expected one of "
+                f"'text_hidden_layers'/'hidden_states', got keys: [{keys}]"
+            )
+    elif isinstance(raw, torch.Tensor):
+        X = raw.float()
+    else:
+        raise TypeError(
+            f"Unsupported .pt content type: {type(raw).__name__}. "
+            "Expected tensor or dict payload."
+        )
+
+    if X.ndim == 3:
+        # [B, T, D] -> first sample
+        X = X[0]
+    if X.ndim != 2:
+        raise ValueError(
+            f"Expected hidden shape [T, D] or [B, T, D], got {tuple(X.shape)}"
+        )
+
+    T, D = X.shape
+    if T == 0 or D == 0:
+        raise ValueError(f"Empty hidden matrix shape: {tuple(X.shape)}")
+
+    # Sliding-window smoothing: X_smooth[i] = mean(X[j]) for j in [i-window, i+window].
+    if window > 0:
+        X_np = X.numpy()
+        X_smooth_np = np.empty_like(X_np)
+        for i in range(T):
+            start = max(0, i - window)
+            end = min(T, i + window + 1)
+            X_smooth_np[i] = X_np[start:end].mean(axis=0)
+        X_smooth = torch.from_numpy(X_smooth_np)
+    else:
+        X_smooth = X
+
+    # Isotropy removal (centering over token/time dimension).
+    mu = X_smooth.mean(dim=0, keepdim=True)
+    X_centered = X_smooth - mu
+
+    # Row-wise L2 normalization for cosine similarity via dot product.
+    X_norm = X_centered / X_centered.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12)
+
+    # Self-similarity matrix [T, T].
+    M = X_norm @ X_norm.T
+    M_np = M.numpy()
+
+    sns.set_theme(context="paper", style="white", font="serif")
+    fig_size = max(6.0, min(14.0, T / 30.0))
+    fig, ax = plt.subplots(figsize=(fig_size, fig_size), dpi=300)
+    sns.heatmap(
+        M_np,
+        cmap="RdBu_r",
+        center=0.0,
+        square=True,
+        linewidths=0.0,
+        cbar_kws={"label": "Cosine similarity"},
+        ax=ax,
+    )
+    ax.set_title("Hidden-State Self-Similarity")
+    ax.set_xlabel("Token index")
+    ax.set_ylabel("Token index")
+
+    out_p = Path(output_path)
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_p, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(
+        "[plot] Saved self-similarity heatmap "
+        f"(T={T}, D={D}, layer={layer}, window={window}) to {output_path}"
+    )
 
 def plot_prediction_dataset(
     root_dir: str,
@@ -855,6 +985,12 @@ def main() -> None:
         metavar="ROOT_DIR",
         help="Predict + plot for all *_hidden.pt under ROOT_DIR/*/.",
     )
+    group.add_argument(
+        "--plot-hidden-self-similarity",
+        type=str,
+        metavar="HIDDEN_PT",
+        help="Plot token-token hidden self-similarity heatmap for a hidden .pt file.",
+    )
 
     # Shared inference options (used by --gen-*)
     ap.add_argument("--device", type=str, default="cuda")
@@ -901,6 +1037,12 @@ def main() -> None:
     )
     ap.add_argument(
         "--lr", type=float, default=1e-3, help="Learning rate (default: 1e-3)."
+    )
+    ap.add_argument(
+        "--window",
+        type=int,
+        default=5,
+        help="Half-window size for hidden smoothing (default: 5).",
     )
 
     args = ap.parse_args()
@@ -971,6 +1113,16 @@ def main() -> None:
         plot_prediction_dataset(
             root_dir=args.plot_prediction_dataset,
             model_path=args.model,
+        )
+
+    elif args.plot_hidden_self_similarity:
+        if not args.output:
+            ap.error("--plot-hidden-self-similarity requires --output")
+        plot_hidden_self_similarity(
+            hidden_path=args.plot_hidden_self_similarity,
+            output_path=args.output,
+            layer=args.layer,
+            window=args.window,
         )
 
 
