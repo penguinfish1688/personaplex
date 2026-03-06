@@ -120,6 +120,102 @@ def mode_class_dataset_tts(dataset_path: str, answer_time: float = 10.0) -> None
 
     print(f"\nDone. Generated audio for {len(input_files)} entries.")
 
+def user_interrupt_dataset_tts(dataset_path: str, initial_silence: float = 0.0) -> None:
+    """
+    take dataset path as arg for reference the dataset would be somethign like /home/penguinfish/personaplex/Full-Duplex-Bench/data/user_interrupt/interrupt_dataset
+    in each json you have
+    {
+    "initial_silence": 3.0,
+    "question_1": "Can you explain how the internet works from home routers to global data centers?",
+    "response_duration_1": 6.261823826770641,
+    "question_2": "goat is a building for people to live in, is this information correct?",
+    "question_2_starting_word": "goat",
+    "question_2_describing_word": "house",
+    "question_2_consistent": false,
+    "question_2_answer": false,
+    "response_duration_2": 15.0
+    }
+    you synthesize input.wav that contains these in time order with the following structure:
+    1) initial_silence seconds of silence (if >0, otherwise skip)
+    2) question_1
+    3) response_duration_1 seconds of silence
+    4) question_2
+    5) response_duration_2 seconds of silence
+    and save the results input.wav to the same dir as <root>/*/user_interrupt_text.json
+
+    
+    """
+    import scipy.io.wavfile as wavfile
+
+    pattern_a = os.path.join(dataset_path, "*", "user_interrupts_text.json")
+    pattern_b = os.path.join(dataset_path, "*", "user_interrupt_text.json")
+    input_files = sorted(set(glob.glob(pattern_a) + glob.glob(pattern_b)), key=lambda p: os.path.basename(os.path.dirname(p)))
+
+    if not input_files:
+        print(f"No user interrupt JSON files found under {dataset_path}/*/")
+        return
+
+    tts = TTS()
+    print(f"Found {len(input_files)} entries in {dataset_path}")
+
+    for input_json_path in input_files:
+        entry_dir = os.path.dirname(input_json_path)
+        entry_id = os.path.basename(entry_dir)
+
+        with open(input_json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        q1 = data["question_1"]
+        q2 = data["question_2"]
+        entry_initial_silence = float(data.get("initial_silence", initial_silence))
+        response_duration_1 = float(data["response_duration_1"])
+        response_duration_2 = float(data["response_duration_2"])
+
+        q1_wav = os.path.join(entry_dir, "_q1_tmp.wav")
+        q2_wav = os.path.join(entry_dir, "_q2_tmp.wav")
+        output_wav = os.path.join(entry_dir, "input.wav")
+
+        print(f"\n--- Entry {entry_id} ---")
+        tts.synthesize(f"[S1]{q1}", q1_wav)
+        tts.synthesize(f"[S1]{q2}", q2_wav)
+
+        sr1, q1_audio = wavfile.read(q1_wav)
+        sr2, q2_audio = wavfile.read(q2_wav)
+        q1_audio = np.asarray(q1_audio)
+        q2_audio = np.asarray(q2_audio)
+        if sr1 != sr2:
+            raise ValueError(f"Sample rate mismatch for entry {entry_id}: q1={sr1}, q2={sr2}")
+
+        if q1_audio.ndim != q2_audio.ndim:
+            raise ValueError(f"Channel mismatch for entry {entry_id}: q1 ndim={q1_audio.ndim}, q2 ndim={q2_audio.ndim}")
+        if q1_audio.ndim == 2 and q1_audio.shape[-1] != q2_audio.shape[-1]:
+            raise ValueError(
+                f"Channel count mismatch for entry {entry_id}: q1={q1_audio.shape[-1]}, q2={q2_audio.shape[-1]}"
+            )
+
+        if q1_audio.ndim == 1:
+            shape_initial = (int(max(0.0, entry_initial_silence) * sr1),)
+            shape_mid = (int(max(0.0, response_duration_1) * sr1),)
+            shape_end = (int(max(0.0, response_duration_2) * sr1),)
+        else:
+            channels = int(q1_audio.shape[-1])
+            shape_initial = (int(max(0.0, entry_initial_silence) * sr1), channels)
+            shape_mid = (int(max(0.0, response_duration_1) * sr1), channels)
+            shape_end = (int(max(0.0, response_duration_2) * sr1), channels)
+
+        initial_pad = np.zeros(shape_initial, dtype=q1_audio.dtype)
+        mid_pad = np.zeros(shape_mid, dtype=q1_audio.dtype)
+        end_pad = np.zeros(shape_end, dtype=q1_audio.dtype)
+
+        combined = np.concatenate([initial_pad, q1_audio, mid_pad, q2_audio, end_pad], axis=0)
+        wavfile.write(output_wav, sr1, combined)
+        print(f"Saved {output_wav}")
+
+        for tmp_wav in [q1_wav, q2_wav]:
+            if os.path.exists(tmp_wav):
+                os.remove(tmp_wav)
+
+    print(f"\nDone. Generated input.wav for {len(input_files)} entries.")
 
 def trait_tts(trait: str, type: str = "extract"):
     """
