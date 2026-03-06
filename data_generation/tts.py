@@ -17,16 +17,42 @@ DIA2_SAMPLE_RATE = 44100
 
 
 class TTS:
-    def __init__(self, model_id: str = "nari-labs/Dia2-2B", dtype: str = "bfloat16"):
+    def __init__(
+        self,
+        model_id: str = "nari-labs/Dia2-2B",
+        dtype: str = "bfloat16",
+        prefix_speaker_1: str | None = None,
+        prefix_speaker_2: str | None = None,
+        include_prefix: bool = False,
+    ):
         """
         Initialize the Dia2 TTS model.
+
+        To fix the voice template, export the voice template audio paths as environment variables:
+
+        export DIA2_PREFIX_SPEAKER_1="<some path>/dia2/example_prefix1.wav"
+        export DIA2_PREFIX_SPEAKER_2="<some path>/dia2/example_prefix2.wav"
 
         Args:
             model_id: HuggingFace model ID (nari-labs/Dia2-1B or nari-labs/Dia2-2B)
             dtype: Model dtype (bfloat16, float16, or float32)
+            prefix_speaker_1: Optional reference audio path for [S1] voice conditioning.
+            prefix_speaker_2: Optional reference audio path for [S2] voice conditioning.
+            include_prefix: Whether to keep prefix audio in final waveform.
         """
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Loading Dia2 model: {model_id} on {self.device}...")
+
+        # Voice conditioning defaults come from environment variables.
+        env_prefix_1 = os.environ.get("DIA2_PREFIX_SPEAKER_1")
+        env_prefix_2 = os.environ.get("DIA2_PREFIX_SPEAKER_2")
+        self.prefix_speaker_1 = prefix_speaker_1 if prefix_speaker_1 is not None else env_prefix_1
+        self.prefix_speaker_2 = prefix_speaker_2 if prefix_speaker_2 is not None else env_prefix_2
+        self.include_prefix = include_prefix
+
+        for label, path in (("prefix_speaker_1", self.prefix_speaker_1), ("prefix_speaker_2", self.prefix_speaker_2)):
+            if path and not os.path.exists(path):
+                raise FileNotFoundError(f"{label} file not found: {path}")
 
         try:
             self.model = Dia2.from_repo(model_id, device=self.device, dtype=dtype)
@@ -51,8 +77,16 @@ class TTS:
 
         os.makedirs(os.path.dirname(os.path.abspath(output_wav_path)), exist_ok=True)
 
-        # Generate audio using Dia2
-        result = self.model.generate(prompt, config=self.config, output_wav=output_wav_path, verbose=True)
+        # Optional prefix conditioning stabilizes voice identity across runs.
+        result = self.model.generate(
+            prompt,
+            config=self.config,
+            output_wav=output_wav_path,
+            prefix_speaker_1=self.prefix_speaker_1,
+            prefix_speaker_2=self.prefix_speaker_2,
+            include_prefix=self.include_prefix,
+            verbose=True,
+        )
 
         print(f"Saved audio to {output_wav_path}")
 
