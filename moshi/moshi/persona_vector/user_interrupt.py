@@ -32,7 +32,15 @@ def inference(root_dir: str, save_hidden: bool = False) -> None:
     output_wavs = [str(path.with_name("output.wav")) for path in input_paths]
     output_texts = [str(path.with_name("output.json")) for path in input_paths]
     output_hiddens = [str(path.with_name("output_hidden.pt")) for path in input_paths]
-    prompts = ["You are a helpful and friendly assistant."] * len(input_paths)
+
+    SYSTEM_PROMPT = (
+        "You are a sharp, highly attentive, and strictly factual AI assistant. "
+        "You prioritize truth over politeness. Listen carefully to the user. "
+        "If the user makes a factually incorrect claim or asks a question based on a false premise, "
+        "you must immediately say 'No' or 'False' and briefly correct them. "
+        "Under no circumstances should you agree with incorrect information."
+    )
+    prompts = [SYSTEM_PROMPT] * len(input_paths)
 
     print(f"[user_interrupt] Processing {len(input_paths)} files from {root_dir}")
     with torch.no_grad():
