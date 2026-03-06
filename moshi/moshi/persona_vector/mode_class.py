@@ -545,6 +545,44 @@ class HiddenModeClassifier:
         )
 
 
+def extract_normal_vector(mode_path):
+    """
+    Eetract decision boundary normal vector from a trained linear classifier checkpoint.
+    return normal vector as a numpy array of shape (D,)
+    """
+    if not os.path.exists(mode_path):
+        raise FileNotFoundError(f"Mode classifier checkpoint not found: {mode_path}")
+
+    ckpt = torch.load(mode_path, map_location="cpu", weights_only=False)
+    if not isinstance(ckpt, dict):
+        raise TypeError(
+            f"Expected checkpoint dict at {mode_path}, got {type(ckpt).__name__}."
+        )
+
+    state_dict = ckpt.get("state_dict")
+    if not isinstance(state_dict, dict):
+        raise KeyError(
+            f"Checkpoint {mode_path} does not contain a valid 'state_dict'."
+        )
+
+    weight = state_dict.get("weight")
+    if weight is None:
+        raise KeyError(
+            f"Checkpoint {mode_path} does not contain 'weight' in state_dict."
+        )
+
+    if not isinstance(weight, torch.Tensor):
+        raise TypeError(
+            f"Expected state_dict['weight'] to be a tensor, got {type(weight).__name__}."
+        )
+
+    # nn.Linear(D, 1) has weight shape [1, D]; flatten to decision-boundary normal [D].
+    normal = weight.detach().cpu().float().reshape(-1)
+    if normal.numel() == 0:
+        raise ValueError(f"Extracted empty normal vector from checkpoint: {mode_path}")
+
+    return normal.numpy()
+
 # ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
