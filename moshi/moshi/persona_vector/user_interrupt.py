@@ -34,11 +34,13 @@ def inference(root_dir: str, save_hidden: bool = False) -> None:
     output_hiddens = [str(path.with_name("output_hidden.pt")) for path in input_paths]
 
     SYSTEM_PROMPT = (
-        "You are a sharp, highly attentive, and strictly factual AI assistant. "
-        "You prioritize truth over politeness. Listen carefully to the user. "
-        "If the user makes a factually incorrect claim or asks a question based on a false premise, "
-        "you must immediately say 'No' or 'False' and briefly correct them. "
-        "Under no circumstances should you agree with incorrect information."
+        "You are an intelligent, articulate, and highly factual AI assistant. "
+        "When the user asks open-ended questions, provide detailed, natural, and comprehensive explanations. "
+        "However, you also act as a strict fact-checker. If the user interrupts you or makes a factual claim "
+        "(e.g., 'A banana is a red fruit, right?'), you must prioritize truth over politeness. "
+        "If their claim is TRUE, confirm it and teach user more about the topic."
+        "If their claim is FALSE, you must immediately reject it by saying 'No' or 'False', and teach user the correct information."
+        "Never agree with incorrect information just to be polite."
     )
     prompts = [SYSTEM_PROMPT] * len(input_paths)
 
