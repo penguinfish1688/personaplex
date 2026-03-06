@@ -48,6 +48,14 @@ class TTS:
         env_prefix_2 = os.environ.get("DIA2_PREFIX_SPEAKER_2")
         self.prefix_speaker_1 = prefix_speaker_1 if prefix_speaker_1 is not None else env_prefix_1
         self.prefix_speaker_2 = prefix_speaker_2 if prefix_speaker_2 is not None else env_prefix_2
+
+        def _normalize_path(path: str | None) -> str | None:
+            if not path:
+                return None
+            return os.path.abspath(os.path.expanduser(path))
+
+        self.prefix_speaker_1 = _normalize_path(self.prefix_speaker_1)
+        self.prefix_speaker_2 = _normalize_path(self.prefix_speaker_2)
         self.include_prefix = include_prefix
 
         for label, path in (("prefix_speaker_1", self.prefix_speaker_1), ("prefix_speaker_2", self.prefix_speaker_2)):
