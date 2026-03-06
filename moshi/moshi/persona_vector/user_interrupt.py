@@ -8,7 +8,7 @@ from moshi.offline import run_batch_inference, _get_voice_prompt_dir
 from moshi.models import loaders
 
 
-def inference(root_dir: str):
+def inference(root_dir: str, save_hidden: bool = False) -> None:
     """
     Take root_dir as input there will be <root_dir>/*/input.wav file
     For each input.wav file, run inference and save to <root_dir>/*/output.wav
@@ -31,6 +31,7 @@ def inference(root_dir: str):
     input_wavs = [str(path) for path in input_paths]
     output_wavs = [str(path.with_name("output.wav")) for path in input_paths]
     output_texts = [str(path.with_name("output.json")) for path in input_paths]
+    output_hiddens = [str(path.with_name("output_hidden.pt")) for path in input_paths]
     prompts = ["You are a helpful and friendly assistant."] * len(input_paths)
 
     print(f"[user_interrupt] Processing {len(input_paths)} files from {root_dir}")
@@ -55,10 +56,16 @@ def inference(root_dir: str):
             save_voice_prompt_embeddings=False,
             cpu_offload=False,
             return_hidden_layers=False,
-            save_hidden_payload=False,
-            output_hiddens=None,
+            save_hidden_payload=bool(save_hidden),
+            output_hiddens=output_hiddens if save_hidden else None,
         )
-    print(f"[user_interrupt] Done. Wrote {len(output_wavs)} output.wav files.")
+    if save_hidden:
+        print(
+            f"[user_interrupt] Done. Wrote {len(output_wavs)} output.wav files and "
+            f"{len(output_hiddens)} output_hidden.pt files."
+        )
+    else:
+        print(f"[user_interrupt] Done. Wrote {len(output_wavs)} output.wav files.")
 
 def inference_with_steering():
     """Don't implement this yet."""
@@ -73,8 +80,14 @@ def main() -> None:
         required=True,
         help="Root directory containing */input.wav files",
     )
+    parser.add_argument(
+        "--save-hidden",
+        action="store_true",
+        help="If set, save hidden payload to root-dir/*/output_hidden.pt",
+    )
+    
     args = parser.parse_args()
-    inference(args.root_dir)
+    inference(args.root_dir, save_hidden=args.save_hidden)
 
 
 if __name__ == "__main__":
