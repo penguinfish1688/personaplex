@@ -751,10 +751,33 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
         x: torch.Tensor,
         return_hidden_layers: bool = False,
         return_attention_weights: bool = False,
+        steering: bool = False,
+        steering_vector: torch.Tensor | None = None,
+        steering_layer: int | None = None,
         *args,
         **kwargs,
     ):
         B, T, C = x.shape
+
+        if steering:
+            if steering_vector is None:
+                raise ValueError("steering=True requires steering_vector")
+            if steering_layer is None:
+                raise ValueError("steering=True requires steering_layer")
+            if steering_layer < 0 or steering_layer >= len(self.layers):
+                raise ValueError(
+                    f"steering_layer out of range: {steering_layer}. Expected [0, {len(self.layers) - 1}]"
+                )
+            if steering_vector.dim() != 1:
+                steering_vector = steering_vector.reshape(-1)
+            if int(steering_vector.numel()) != C:
+                raise ValueError(
+                    f"Steering vector dimension mismatch: got {int(steering_vector.numel())}, expected {C}"
+                )
+            steering_vector = steering_vector.to(device=x.device, dtype=x.dtype)
+            steering_view_shape = (1,) * (x.dim() - 1) + (C,)
+        else:
+            steering_view_shape = None
 
         state = self._streaming_state
         if state is None:
@@ -773,7 +796,10 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
         hidden_layers = [] if return_hidden_layers else None
         attention_weights = [] if return_attention_weights else None
         
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
+            if steering and layer_idx == steering_layer:
+                assert steering_view_shape is not None
+                x = x + steering_vector.view(steering_view_shape)
             if return_attention_weights:
                 x, layer_attn = layer(x, return_attention_weights=True, *args, **kwargs)
                 attention_weights.append(layer_attn.clone() if isinstance(layer_attn, torch.Tensor) else layer_attn)

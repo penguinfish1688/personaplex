@@ -70,6 +70,15 @@ class LMOutput:
     text_mask: torch.Tensor  # [B, 1, T]
 
 
+@dataclass
+class ForwardCodesOutput:
+    """Structured return for LMModel.forward_codes/forward_embeddings."""
+    transformer_out: torch.Tensor
+    text_logits: torch.Tensor
+    hidden_layers: Optional[List[torch.Tensor]] = None
+    attention_weights: Optional[List[torch.Tensor]] = None
+
+
 @dataclass  
 class HiddenLayerOutputs:
     """Container for hidden layer outputs from both text and depth transformers."""
@@ -455,11 +464,17 @@ class LMModel(StreamingContainer):
         sequence: torch.Tensor,
         return_hidden_layers: bool = False,
         return_attention_weights: bool = False,
+        steering: bool = False,
+        steering_vector: torch.Tensor | None = None,
+        steering_layer: int | None = None,
     ):
         return self.forward_embeddings(
             self.embed_codes(sequence),
             return_hidden_layers=return_hidden_layers,
             return_attention_weights=return_attention_weights,
+            steering=steering,
+            steering_vector=steering_vector,
+            steering_layer=steering_layer,
         )
     
     def forward_embeddings(
@@ -467,25 +482,45 @@ class LMModel(StreamingContainer):
         input: torch.Tensor,
         return_hidden_layers: bool = False,
         return_attention_weights: bool = False,
-    ):
+        steering: bool = False,
+        steering_vector: torch.Tensor | None = None,
+        steering_layer: int | None = None,
+    ) -> ForwardCodesOutput:
         # print("EMBED:", input[0, 0, :10].float().cpu().tolist()) # DEBUG
         if return_hidden_layers and return_attention_weights:
             transformer_out, hidden_layers, attention_weights = self.transformer(
                 input,
                 return_hidden_layers=True,
                 return_attention_weights=True,
+                steering=steering,
+                steering_vector=steering_vector,
+                steering_layer=steering_layer,
             )
         elif return_hidden_layers:
-            transformer_out, hidden_layers = self.transformer(input, return_hidden_layers=True)
+            transformer_out, hidden_layers = self.transformer(
+                input,
+                return_hidden_layers=True,
+                steering=steering,
+                steering_vector=steering_vector,
+                steering_layer=steering_layer,
+            )
             attention_weights = None
         elif return_attention_weights:
             transformer_out, attention_weights = self.transformer(
                 input,
                 return_attention_weights=True,
+                steering=steering,
+                steering_vector=steering_vector,
+                steering_layer=steering_layer,
             )
             hidden_layers = None
         else:
-            transformer_out = self.transformer(input)
+            transformer_out = self.transformer(
+                input,
+                steering=steering,
+                steering_vector=steering_vector,
+                steering_layer=steering_layer,
+            )
             hidden_layers = None
             attention_weights = None
         if self.out_norm:
@@ -493,13 +528,12 @@ class LMModel(StreamingContainer):
         assert isinstance(transformer_out, torch.Tensor)
         text_logits = self.text_linear(transformer_out)
         text_logits = text_logits[:, None]
-        if return_hidden_layers and return_attention_weights:
-            return transformer_out, text_logits, hidden_layers, attention_weights
-        if return_hidden_layers:
-            return transformer_out, text_logits, hidden_layers
-        if return_attention_weights:
-            return transformer_out, text_logits, attention_weights
-        return transformer_out, text_logits
+        return ForwardCodesOutput(
+            transformer_out=transformer_out,
+            text_logits=text_logits,
+            hidden_layers=hidden_layers,
+            attention_weights=attention_weights,
+        )
 
     def forward_depformer(
         self,
@@ -591,7 +625,9 @@ class LMModel(StreamingContainer):
         delayed_codes = torch.cat([initial, delayed_codes], dim=2)
 
         # LLM Backbone
-        transformer_out, text_logits = self.forward_codes(delayed_codes[:, :, :-1])
+        backbone_out = self.forward_codes(delayed_codes[:, :, :-1])
+        transformer_out = backbone_out.transformer_out
+        text_logits = backbone_out.text_logits
         logits = self.forward_depformer_training(delayed_codes[:, :, 1:], transformer_out)
 
         # map back the logits on pattern sequence to logits on original codes: [B, K, S, card] -> [B, K, T, card]
@@ -890,7 +926,9 @@ class LMGen(StreamingModule[_LMGenState]):
 
     @torch.no_grad()
     def step(self, input_tokens: torch.Tensor=None, moshi_tokens:torch.Tensor=None, text_token:torch.Tensor=None,
-               return_embeddings: bool=False, return_hidden_layers: bool=False, return_attention_weights: bool=False, check_silence_token: bool=False) \
+               return_embeddings: bool=False, return_hidden_layers: bool=False, return_attention_weights: bool=False,
+               check_silence_token: bool=False, steering: bool=False, steering_vector: torch.Tensor | None = None,
+               steering_layer: int | None = None) \
         -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]] | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]] | tuple[torch.Tensor, HiddenLayerOutputs] | tuple[torch.Tensor, HiddenLayerOutputs, bool]:
         """Run a single step of the language model.
         
@@ -902,6 +940,9 @@ class LMGen(StreamingModule[_LMGenState]):
             return_hidden_layers: If True, return hidden layer outputs
             return_attention_weights: If True, return text transformer attention weights
             check_silence_token: If True, also return a boolean indicating if silence was detected
+            steering: If True, steer activations at steering_layer during transformer forward.
+            steering_vector: 1D steering vector with length equal to model hidden size.
+            steering_layer: Main transformer layer index where steering is injected.
             
         Returns:
             Generated tokens and optionally embeddings, hidden layers, and silence detection flag
@@ -915,13 +956,17 @@ class LMGen(StreamingModule[_LMGenState]):
         # print("INPUT:", None if input_tokens is None else input_tokens.squeeze().cpu().tolist()) # DEBUG
         # print("MOSHI:", None if moshi_tokens is None else moshi_tokens.squeeze().cpu().tolist()) # DEBUG
         if prepared_inputs is None:
-            return_tuple_size = sum([self.report_loss or self.return_logits, return_embeddings, capture_hidden, check_silence_token])
-            if return_tuple_size == 0:
+            requested_extras = int(return_embeddings) + int(capture_hidden) + int(check_silence_token)
+            if requested_extras == 0:
                 return None
-            elif return_tuple_size == 1:
-                return (None,)
-            else:
-                return tuple([None] * (return_tuple_size + 1))
+            pending: list[object] = [None]
+            if return_embeddings:
+                pending.append(None)
+            if capture_hidden:
+                pending.append(None)
+            if check_silence_token:
+                pending.append(None)
+            return tuple(pending)
         input_, provided_, target_, model_input_position, target_position = prepared_inputs
         if self.check:
             # Check that we are not feeding in any value that is not generated yet.
@@ -935,23 +980,43 @@ class LMGen(StreamingModule[_LMGenState]):
         embeddings = None
         if return_embeddings:
             embeddings = self.lm_model.embed_codes(input_)
+
+        if steering:
+            if steering_vector is None:
+                raise ValueError("steering=True requires a non-empty steering_vector")
+            if steering_layer is None:
+                raise ValueError("steering=True requires steering_layer")
         
-        # For hidden layers, we need to bypass the graphed version
-        if capture_hidden and return_attention_weights:
-            result = lm_model.forward_codes(
+        # Hidden/attention requests bypass graphed_main so we can return requested internals.
+        if capture_hidden:
+            forward_out = lm_model.forward_codes(
                 input_,
-                return_hidden_layers=True,
-                return_attention_weights=True,
+                return_hidden_layers=return_hidden_layers,
+                return_attention_weights=return_attention_weights,
+                steering=steering,
+                steering_vector=steering_vector,
+                steering_layer=steering_layer,
             )
-            transformer_out, text_logits, text_hidden_layers, text_attention_weights = result
-        elif capture_hidden:
-            result = lm_model.forward_codes(input_, return_hidden_layers=True)
-            transformer_out, text_logits, text_hidden_layers = result
-            text_attention_weights = None
+            transformer_out = forward_out.transformer_out
+            text_logits = forward_out.text_logits
+            text_hidden_layers = forward_out.hidden_layers
+            text_attention_weights = forward_out.attention_weights
         else:
-            transformer_out, text_logits = state.graphed_main(input_)
-            text_hidden_layers = None
-            text_attention_weights = None
+            if steering:
+                forward_out = lm_model.forward_codes(
+                    input_,
+                    steering=steering,
+                    steering_vector=steering_vector,
+                    steering_layer=steering_layer,
+                )
+                transformer_out = forward_out.transformer_out
+                text_logits = forward_out.text_logits
+            else:
+                forward_out = state.graphed_main(input_)
+                transformer_out = forward_out.transformer_out
+                text_logits = forward_out.text_logits
+            text_hidden_layers = forward_out.hidden_layers
+            text_attention_weights = forward_out.attention_weights
 
         # Process transformer output and get depth hidden layers if requested
         if capture_hidden:
@@ -1017,7 +1082,9 @@ class LMGen(StreamingModule[_LMGenState]):
             if prepared_inputs is not None:
                 break
         _, provided_, target_, model_input_position, target_position = prepared_inputs
-        transformer_out, text_logits = state.graphed_embeddings(embeddings)
+        forward_out = state.graphed_embeddings(embeddings)
+        transformer_out = forward_out.transformer_out
+        text_logits = forward_out.text_logits
         return self.process_transformer_output(
             transformer_out,
             text_logits,
