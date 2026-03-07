@@ -702,12 +702,13 @@ def plot_prediction(
     # Horizontal reference line at 0.5 threshold.
     ax.axhline(0.5, color="#888888", linewidth=0.8, linestyle="--")
 
-    # Token name labels on x-axis (rotated).
+    # X-axis labels explicitly include 0-based token index.
     safe_names = [_plot_safe_text(n) for n in token_names]
+    xtick_labels = [f"{i}:{safe_names[i]}" for i in range(num_tokens)]
     ax.set_xticks(xs)
     try:
         ax.set_xticklabels(
-            safe_names,
+            xtick_labels,
             rotation=90,
             fontsize=5,
             ha="center",
@@ -716,7 +717,7 @@ def plot_prediction(
     except TypeError:
         # Older matplotlib without parse_math.
         ax.set_xticklabels(
-            safe_names, rotation=90, fontsize=5, ha="center"
+            xtick_labels, rotation=90, fontsize=5, ha="center"
         )
 
     ax.set_xlim(-0.5, num_tokens - 0.5)
