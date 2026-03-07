@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import re
 import wave
@@ -176,7 +177,8 @@ def calculate_steering_vector(root_dir, classifier_path, decay_span, alpha):
 
         interrupt_start = float(timing_payload["interrupt_start"])
         duration_s = _wav_duration_seconds(input_wav)
-        total_tokens = int(round(duration_s * token_rate_hz))
+        # Use ceil to avoid occasional tail under-allocation vs. streaming steps.
+        total_tokens = int(math.ceil(duration_s * token_rate_hz))
         if total_tokens <= 0:
             raise ValueError(
                 f"Computed non-positive token count for {input_wav}: duration={duration_s:.6f}s"
@@ -332,9 +334,25 @@ def inference_with_steering(
             raise ValueError(f"Expected dict in {steering_json}, got {type(steering_payload)}")
 
         steering_vectors = _extract_layer_vectors(steering_payload, int(inject_layer))
+
+        # Guard against one-step tail mismatch by ensuring vectors cover at least
+        # the WAV-derived token count at 12.5 Hz.
+        try:
+            with wave.open(input_wav, "rb") as wf:
+                duration_s = float(wf.getnframes()) / float(wf.getframerate())
+        except wave.Error:
+            import soundfile as sf
+
+            info = sf.info(input_wav)
+            duration_s = float(info.frames) / float(info.samplerate)
+        min_tokens = int(math.ceil(duration_s * 12.5))
+        if len(steering_vectors) < min_tokens:
+            steering_vectors.extend([None] * (min_tokens - len(steering_vectors)))
+
         non_null = sum(1 for v in steering_vectors if v is not None)
         print(
-            f"[user_interrupt] {entry_dir.name}: loaded steering vectors len={len(steering_vectors)}, non_null={non_null}"
+            f"[user_interrupt] {entry_dir.name}: loaded steering vectors len={len(steering_vectors)}, "
+            f"min_tokens={min_tokens}, non_null={non_null}"
         )
 
         with torch.no_grad():
