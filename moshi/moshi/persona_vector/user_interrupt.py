@@ -35,7 +35,7 @@ def inference(root_dir: str, save_hidden: bool = False) -> None:
 
     SYSTEM_PROMPT = (
         "You are an intelligent, articulate, and highly factual AI assistant. "
-        "When the user asks open-ended questions, provide detailed, natural, and comprehensive explanations. "
+        "When the user asks open-ended questions, provide detailed, natural, and comprehensive explanations, and talk for a long time."
         "However, you also act as a strict fact-checker. If the user interrupts you or makes a factual claim "
         "(e.g., 'A banana is a red fruit, right?'), you must prioritize truth over politeness. "
         "If their claim is TRUE, confirm it and teach user more about the topic."
@@ -77,8 +77,11 @@ def inference(root_dir: str, save_hidden: bool = False) -> None:
     else:
         print(f"[user_interrupt] Done. Wrote {len(output_wavs)} output.wav files.")
 
-def inference_with_steering():
-    """Don't implement this yet."""
+def inference_with_steering(root_dir, classifier_path, alpha=0.01, save_hidden=False):
+    """
+    do inference with activation steering
+    
+    """
     pass
 
 
