@@ -464,7 +464,6 @@ class LMModel(StreamingContainer):
         sequence: torch.Tensor,
         return_hidden_layers: bool = False,
         return_attention_weights: bool = False,
-        steering: bool = False,
         steering_vector: torch.Tensor | None = None,
         steering_layer: int | None = None,
     ):
@@ -472,7 +471,6 @@ class LMModel(StreamingContainer):
             self.embed_codes(sequence),
             return_hidden_layers=return_hidden_layers,
             return_attention_weights=return_attention_weights,
-            steering=steering,
             steering_vector=steering_vector,
             steering_layer=steering_layer,
         )
@@ -482,7 +480,6 @@ class LMModel(StreamingContainer):
         input: torch.Tensor,
         return_hidden_layers: bool = False,
         return_attention_weights: bool = False,
-        steering: bool = False,
         steering_vector: torch.Tensor | None = None,
         steering_layer: int | None = None,
     ) -> ForwardCodesOutput:
@@ -492,7 +489,6 @@ class LMModel(StreamingContainer):
                 input,
                 return_hidden_layers=True,
                 return_attention_weights=True,
-                steering=steering,
                 steering_vector=steering_vector,
                 steering_layer=steering_layer,
             )
@@ -500,7 +496,6 @@ class LMModel(StreamingContainer):
             transformer_out, hidden_layers = self.transformer(
                 input,
                 return_hidden_layers=True,
-                steering=steering,
                 steering_vector=steering_vector,
                 steering_layer=steering_layer,
             )
@@ -509,7 +504,6 @@ class LMModel(StreamingContainer):
             transformer_out, attention_weights = self.transformer(
                 input,
                 return_attention_weights=True,
-                steering=steering,
                 steering_vector=steering_vector,
                 steering_layer=steering_layer,
             )
@@ -517,7 +511,6 @@ class LMModel(StreamingContainer):
         else:
             transformer_out = self.transformer(
                 input,
-                steering=steering,
                 steering_vector=steering_vector,
                 steering_layer=steering_layer,
             )
@@ -927,7 +920,7 @@ class LMGen(StreamingModule[_LMGenState]):
     @torch.no_grad()
     def step(self, input_tokens: torch.Tensor=None, moshi_tokens:torch.Tensor=None, text_token:torch.Tensor=None,
                return_embeddings: bool=False, return_hidden_layers: bool=False, return_attention_weights: bool=False,
-               check_silence_token: bool=False, steering: bool=False, steering_vector: torch.Tensor | None = None,
+               check_silence_token: bool=False, steering_vector: torch.Tensor | None = None,
                steering_layer: int | None = None) \
         -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]] | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]] | tuple[torch.Tensor, HiddenLayerOutputs] | tuple[torch.Tensor, HiddenLayerOutputs, bool]:
         """Run a single step of the language model.
@@ -940,8 +933,7 @@ class LMGen(StreamingModule[_LMGenState]):
             return_hidden_layers: If True, return hidden layer outputs
             return_attention_weights: If True, return text transformer attention weights
             check_silence_token: If True, also return a boolean indicating if silence was detected
-            steering: If True, steer activations at steering_layer during transformer forward.
-            steering_vector: 1D steering vector with length equal to model hidden size.
+            steering_vector: 1D steering vector for this token step. If None, no steering is applied.
             steering_layer: Main transformer layer index where steering is injected.
             
         Returns:
@@ -981,11 +973,10 @@ class LMGen(StreamingModule[_LMGenState]):
         if return_embeddings:
             embeddings = self.lm_model.embed_codes(input_)
 
-        if steering:
-            if steering_vector is None:
-                raise ValueError("steering=True requires a non-empty steering_vector")
+        do_steer = steering_vector is not None
+        if do_steer:
             if steering_layer is None:
-                raise ValueError("steering=True requires steering_layer")
+                raise ValueError("steering_vector provided but steering_layer is None")
         
         # Hidden/attention requests bypass graphed_main so we can return requested internals.
         if capture_hidden:
@@ -993,7 +984,6 @@ class LMGen(StreamingModule[_LMGenState]):
                 input_,
                 return_hidden_layers=return_hidden_layers,
                 return_attention_weights=return_attention_weights,
-                steering=steering,
                 steering_vector=steering_vector,
                 steering_layer=steering_layer,
             )
@@ -1002,10 +992,9 @@ class LMGen(StreamingModule[_LMGenState]):
             text_hidden_layers = forward_out.hidden_layers
             text_attention_weights = forward_out.attention_weights
         else:
-            if steering:
+            if do_steer:
                 forward_out = lm_model.forward_codes(
                     input_,
-                    steering=steering,
                     steering_vector=steering_vector,
                     steering_layer=steering_layer,
                 )

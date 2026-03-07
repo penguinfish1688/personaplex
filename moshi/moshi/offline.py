@@ -258,39 +258,74 @@ def _build_hidden_payload(
     return payload
 
 
-def _load_steering_vector(steering_vector_path: str) -> torch.Tensor:
-    """Load a 1D steering vector tensor from disk.
+def _load_steering_vectors(steering_vectors_path: str) -> list[Optional[torch.Tensor]]:
+    """Load per-token steering vectors from disk.
 
-    Supported files:
-    - `.npy` containing a single vector
-    - `.pt` / `.pth` containing either a tensor or a dict with key `steering_vector` or `vector`
+    Expected semantics:
+    - `len(steering_vectors)` is number of token steps (~audio_seconds * 12.5Hz).
+    - element is `None` => no steering at that token.
+    - element tensor => 1D steering vector for that token.
+
+    Supported file contents:
+    - `.npy`:
+      - shape `[T, D]` => list of `T` vectors.
+      - shape `[D]` => single-token list.
+    - `.pt` / `.pth` containing:
+      - tensor `[T, D]` or `[D]`
+      - list/tuple of tensors / `None`
+      - dict key `steering_vectors` (preferred), `steering_vector`, or `vector`
     """
-    if not os.path.exists(steering_vector_path):
-        raise FileNotFoundError(f"Steering vector file not found: {steering_vector_path}")
+    if not os.path.exists(steering_vectors_path):
+        raise FileNotFoundError(f"Steering vectors file not found: {steering_vectors_path}")
 
-    suffix = Path(steering_vector_path).suffix.lower()
+    suffix = Path(steering_vectors_path).suffix.lower()
     if suffix == ".npy":
-        vec = torch.from_numpy(np.load(steering_vector_path))
+        loaded: Any = torch.from_numpy(np.load(steering_vectors_path))
     else:
-        loaded = torch.load(steering_vector_path, map_location="cpu")
-        if isinstance(loaded, torch.Tensor):
-            vec = loaded
-        elif isinstance(loaded, dict):
-            if "steering_vector" in loaded and isinstance(loaded["steering_vector"], torch.Tensor):
-                vec = loaded["steering_vector"]
-            elif "vector" in loaded and isinstance(loaded["vector"], torch.Tensor):
-                vec = loaded["vector"]
-            else:
-                raise ValueError(
-                    "Steering vector .pt must be a tensor or dict containing 'steering_vector' or 'vector' tensor."
-                )
-        else:
-            raise ValueError(f"Unsupported steering vector content type: {type(loaded)}")
+        loaded = torch.load(steering_vectors_path, map_location="cpu")
 
-    vec = vec.detach().float().reshape(-1)
-    if vec.numel() == 0:
-        raise ValueError("Loaded steering vector is empty.")
-    return vec
+    if isinstance(loaded, dict):
+        for key in ("steering_vectors", "steering_vector", "vector"):
+            if key in loaded:
+                loaded = loaded[key]
+                break
+        else:
+            raise ValueError(
+                "Steering .pt dict must contain one of: 'steering_vectors', 'steering_vector', 'vector'."
+            )
+
+    out: list[Optional[torch.Tensor]] = []
+
+    if isinstance(loaded, torch.Tensor):
+        t = loaded.detach().float()
+        if t.dim() == 1:
+            out = [t.reshape(-1)]
+        elif t.dim() == 2:
+            out = [t[i].reshape(-1) for i in range(t.shape[0])]
+        else:
+            raise ValueError(f"Tensor steering vectors must be 1D or 2D, got shape {tuple(t.shape)}")
+    elif isinstance(loaded, (list, tuple)):
+        for idx, elem in enumerate(loaded):
+            if elem is None:
+                out.append(None)
+                continue
+            if isinstance(elem, torch.Tensor):
+                vec = elem.detach().float().reshape(-1)
+            else:
+                try:
+                    vec = torch.as_tensor(elem, dtype=torch.float32).reshape(-1)
+                except Exception as exc:
+                    raise ValueError(f"Invalid steering vector at index {idx}: {type(elem)}") from exc
+            if vec.numel() == 0:
+                raise ValueError(f"Steering vector at index {idx} is empty")
+            out.append(vec)
+    else:
+        raise ValueError(f"Unsupported steering vectors content type: {type(loaded)}")
+
+    if len(out) == 0:
+        raise ValueError("Loaded steering_vectors is empty")
+
+    return out
 
 
 def warmup(mimi: MimiModel, other_mimi: MimiModel, lm_gen: LMGen, device: str, frame_size: int):
@@ -566,8 +601,7 @@ def run_batch_inference(
     return_hidden_layers: bool = False,
     save_hidden_payload: bool = False,
     output_hiddens: Optional[List[str]] = None,
-    steering: bool = False,
-    steering_vector: Optional[torch.Tensor] = None,
+    steering_vectors: Optional[list[Optional[torch.Tensor]]] = None,
     steering_layer: Optional[int] = None,
 ) -> Optional[List[List[HiddenLayerOutputs]]]:
     """Run batch offline inference using multiple input WAVs and text prompts.
@@ -598,10 +632,8 @@ def run_batch_inference(
         log("warning", "Empty input lists provided")
         return [] if return_hidden_layers else None
 
-    if steering and steering_vector is None:
-        raise ValueError("steering=True requires steering_vector")
-    if steering and steering_layer is None:
-        raise ValueError("steering=True requires steering_layer")
+    if steering_vectors is not None and steering_layer is None:
+        raise ValueError("steering_vectors provided but steering_layer is None")
     
     log("info", f"Starting batch inference with {len(input_wavs)} instances")
     
@@ -691,10 +723,30 @@ def run_batch_inference(
         generated_text_tokens: List[str] = []
         generated_text_token_ids: List[int] = []
         total_target_samples = user_audio.shape[-1]
+
+        # Token-rate sanity check for steering vectors.
+        if steering_vectors is not None:
+            expected_tokens = int(round((total_target_samples / float(sample_rate)) * float(mimi.frame_rate)))
+            actual_tokens = len(steering_vectors)
+            if abs(actual_tokens - expected_tokens) > 2:
+                raise AssertionError(
+                    f"steering_vectors length mismatch: len={actual_tokens}, expected~{expected_tokens} "
+                    f"(audio_seconds={total_target_samples / float(sample_rate):.3f}, frame_rate={float(mimi.frame_rate):.3f})"
+                )
+
+            hidden_dim = int(lm.dim)
+            for idx, sv in enumerate(steering_vectors):
+                if sv is None:
+                    continue
+                if int(sv.numel()) != hidden_dim:
+                    raise AssertionError(
+                        f"steering_vectors[{idx}] dim mismatch: got {int(sv.numel())}, expected {hidden_dim}"
+                    )
         
         hidden_layers_list: List[HiddenLayerOutputs] = []
         text_hidden_layers_per_token: list[torch.Tensor] = []
         text_attention_layers_per_token: list[Optional[torch.Tensor]] = []
+        steer_idx = 0
         for user_encoded in lm_encode_from_sphn(
             mimi,
             lm_iterate_audio(
@@ -706,14 +758,21 @@ def run_batch_inference(
             # Store hidden layers for each step
             for c in range(steps):
                 step_in = user_encoded[:, :, c : c + 1]
+                step_steering_vector: Optional[torch.Tensor] = None
+                if steering_vectors is not None:
+                    if steer_idx >= len(steering_vectors):
+                        raise AssertionError(
+                            f"Steering index out of range at step {steer_idx} with len={len(steering_vectors)}"
+                        )
+                    step_steering_vector = steering_vectors[steer_idx]
+                    steer_idx += 1
                 
                 if capture_hidden:
                     result = lm_gen.step(
                         step_in,
                         return_hidden_layers=True,
                         return_attention_weights=save_hidden_payload,
-                        steering=steering,
-                        steering_vector=steering_vector,
+                        steering_vector=step_steering_vector,
                         steering_layer=steering_layer,
                     )
                     tokens, hidden_layers = result  # type: ignore
@@ -721,8 +780,7 @@ def run_batch_inference(
                 else:
                     tokens = lm_gen.step(
                         step_in,
-                        steering=steering,
-                        steering_vector=steering_vector,
+                        steering_vector=step_steering_vector,
                         steering_layer=steering_layer,
                     )
                     hidden_layers = None
@@ -752,6 +810,16 @@ def run_batch_inference(
                 else:
                     text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
                     generated_text_tokens.append(text_token_map[text_token])
+
+        if steering_vectors is not None:
+            # `lm_iterate_audio(..., pad=True)` can introduce a small boundary mismatch,
+            # so we allow a tiny slack instead of requiring exact equality.
+            unused = len(steering_vectors) - steer_idx
+            if abs(unused) > 2:
+                raise AssertionError(
+                    f"Steering token consumption mismatch: used={steer_idx}, provided={len(steering_vectors)}, "
+                    f"unused={unused}"
+                )
 
         if len(generated_frames) == 0:
             log("error", f"No audio frames were generated for instance {i+1}. Check input file: {input_wav}")
@@ -860,7 +928,7 @@ def run_batch_inference_two_phase(
     
     if len(question_wavs) == 0:
         log("warning", "Empty input lists provided")
-        return []
+        return
     
     log("info", f"Starting two-phase batch inference with {len(question_wavs)} instances")
     if start_instance_idx > 0:
@@ -1237,21 +1305,16 @@ def main():
     parser.add_argument("--return-hidden-layers", action="store_true",
                         help="If set, the model will return hidden layer activations at each step.")
     parser.add_argument(
-        "--steering",
-        action="store_true",
-        help="If set, run inference with activation steering by adding --steering-vector to hidden activations.",
-    )
-    parser.add_argument(
-        "--steering-vector",
+        "--steering-vectors",
         type=str,
         default=None,
-        help="Path to steering vector file (.npy or .pt/.pth tensor). Required when --steering is set.",
+        help="Path to per-token steering vectors (.npy/.pt). If provided, steering is enabled token-wise.",
     )
     parser.add_argument(
         "--steering-layer",
         type=int,
         default=None,
-        help="Main transformer layer index (0-31) where steering is injected. Required when --steering is set.",
+        help="Main transformer layer index (0-31) where steering is injected. Required with --steering-vectors.",
     )
 
     args = parser.parse_args()
@@ -1276,14 +1339,16 @@ def main():
     # Normalize greedy flag behavior (True if present, False otherwise)
     greedy = bool(args.greedy)
 
-    steering_vector = None
-    if args.steering:
-        if not args.steering_vector:
-            parser.error("--steering requires --steering-vector")
+    steering_vectors: Optional[list[Optional[torch.Tensor]]] = None
+    if args.steering_vectors is not None:
         if args.steering_layer is None:
-            parser.error("--steering requires --steering-layer")
-        steering_vector = _load_steering_vector(args.steering_vector)
-        log("info", f"Loaded steering vector dim={int(steering_vector.numel())} from {args.steering_vector}")
+            parser.error("--steering-vectors requires --steering-layer")
+        steering_vectors = _load_steering_vectors(args.steering_vectors)
+        num_non_null = sum(1 for v in steering_vectors if v is not None)
+        log(
+            "info",
+            f"Loaded steering_vectors: total={len(steering_vectors)}, non_null={num_non_null} from {args.steering_vectors}",
+        )
 
     with torch.no_grad():
         run_batch_inference(
@@ -1306,8 +1371,7 @@ def main():
             save_voice_prompt_embeddings=False,
             cpu_offload=args.cpu_offload,
             return_hidden_layers=args.return_hidden_layers,
-            steering=args.steering,
-            steering_vector=steering_vector,
+            steering_vectors=steering_vectors,
             steering_layer=args.steering_layer,
         )
 

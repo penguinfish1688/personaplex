@@ -1,11 +1,16 @@
 import argparse
+import json
 import os
+import re
+import wave
 from pathlib import Path
+from typing import Optional
 
 import torch
 
 from moshi.offline import run_batch_inference, _get_voice_prompt_dir
 from moshi.models import loaders
+from moshi.persona_vector.mode_class import extract_normal_vector
 
 
 def inference(root_dir: str, save_hidden: bool = False) -> None:
@@ -77,12 +82,292 @@ def inference(root_dir: str, save_hidden: bool = False) -> None:
     else:
         print(f"[user_interrupt] Done. Wrote {len(output_wavs)} output.wav files.")
 
-def inference_with_steering(root_dir, classifier_path, alpha=0.01, save_hidden=False):
+def calculate_steering_vector(root_dir, classifier_path, decay_span, alpha):
+    """At interrupt_start, we calculate the steering vector with length alpha, 
+    and linearly decay to 0 over decay_span tokens.
+
+    Read input_timing.json for each <root_dir>/*/input_timing.json
+    {
+        "interrupt_start": 1.54, # in seconds, when user starts interrupting
+    }
+
+    The output is saved to <root_dir>/*/steering_vector.json with the format:
+    {
+        "layer_10": {
+            "0": [0.1, 0.2, ...],   # vector for token 0 (first generated token)
+            "1": [0.05, -0.1, ...], # vector for token 1
+            ...
+            "2": null               # if token 2 doesn't need to be steered
+        },
+        "layer_22": {
+            "0": null,
+            "1": [0.01, -0.02, ...],
+            ...
+            "2": [0.03, 0.04, ...]
+        },
+    }
     """
-    do inference with activation steering
+    token_rate_hz = 12.5
+    root = Path(root_dir)
+    classifier_path = str(classifier_path)
+
+    if decay_span < 0:
+        raise ValueError(f"decay_span must be >= 0, got {decay_span}")
+
+    # Extract normalized decision-boundary normal vector from the trained classifier.
+    normal_vector = torch.as_tensor(
+        extract_normal_vector(classifier_path), dtype=torch.float32
+    ).reshape(-1)
+    if normal_vector.numel() == 0:
+        raise ValueError(f"Extracted empty normal vector from classifier: {classifier_path}")
+
+    ckpt = torch.load(classifier_path, map_location="cpu", weights_only=False)
+    if not isinstance(ckpt, dict):
+        raise TypeError(
+            f"Expected checkpoint dict at {classifier_path}, got {type(ckpt).__name__}"
+        )
+
+    layer = ckpt.get("layer")
+    if layer is None:
+        # Backward-compatible fallback from filename if metadata is missing.
+        m = re.search(r"layer_(-?\d+)", Path(classifier_path).stem)
+        if m is None:
+            raise KeyError(
+                f"Classifier checkpoint {classifier_path} missing 'layer' field and filename does not contain layer index"
+            )
+        layer = int(m.group(1))
+    layer_key = f"layer_{int(layer)}"
+
+    input_paths = [p for p in root.glob("*/input.wav") if p.is_file()]
+    input_paths.sort(key=lambda p: int(p.parent.name) if p.parent.name.isdigit() else p.parent.name)
+    if not input_paths:
+        raise FileNotFoundError(f"No files matched pattern {root_dir}/*/input.wav")
+
+    def _wav_duration_seconds(wav_path: Path) -> float:
+        try:
+            with wave.open(str(wav_path), "rb") as wf:
+                nframes = wf.getnframes()
+                framerate = wf.getframerate()
+            if framerate <= 0:
+                raise ValueError(f"Invalid sample rate in WAV: {wav_path}")
+            return float(nframes) / float(framerate)
+        except wave.Error:
+            # Some WAV encodings are not supported by stdlib wave; fall back to soundfile.
+            import soundfile as sf
+
+            info = sf.info(str(wav_path))
+            if info.samplerate <= 0:
+                raise ValueError(f"Invalid sample rate in WAV: {wav_path}")
+            return float(info.frames) / float(info.samplerate)
+
+    updated = 0
+    for input_wav in input_paths:
+        entry_dir = input_wav.parent
+        timing_path = entry_dir / "input_timing.json"
+        if not timing_path.exists():
+            raise FileNotFoundError(f"Missing timing file: {timing_path}")
+
+        with timing_path.open("r", encoding="utf-8") as f:
+            timing_payload = json.load(f)
+        if not isinstance(timing_payload, dict):
+            raise ValueError(f"Expected dict in {timing_path}, got {type(timing_payload)}")
+        if "interrupt_start" not in timing_payload:
+            raise KeyError(f"Missing 'interrupt_start' in {timing_path}")
+
+        interrupt_start = float(timing_payload["interrupt_start"])
+        duration_s = _wav_duration_seconds(input_wav)
+        total_tokens = int(round(duration_s * token_rate_hz))
+        if total_tokens <= 0:
+            raise ValueError(
+                f"Computed non-positive token count for {input_wav}: duration={duration_s:.6f}s"
+            )
+
+        start_idx = int(interrupt_start * token_rate_hz)
+        # Keep start index in valid range so token 0..N-1 schema remains intact.
+        start_idx = max(0, min(start_idx, total_tokens - 1))
+
+        layer_payload: dict[str, Optional[list[float]]] = {
+            str(i): None for i in range(total_tokens)
+        }
+
+        base_vec = (normal_vector * float(alpha)).tolist()
+        layer_payload[str(start_idx)] = base_vec
+
+        for k in range(1, int(decay_span) + 1):
+            token_idx = start_idx + k
+            if token_idx >= total_tokens:
+                break
+            decay_factor = 1.0 - (float(k) / float(decay_span)) if decay_span > 0 else 0.0
+            if decay_factor <= 0.0:
+                layer_payload[str(token_idx)] = None
+                continue
+            vec = (normal_vector * float(alpha * decay_factor)).tolist()
+            layer_payload[str(token_idx)] = vec
+
+        steering_path = entry_dir / "steering_vector.json"
+        if steering_path.exists():
+            with steering_path.open("r", encoding="utf-8") as f:
+                existing = json.load(f)
+            if not isinstance(existing, dict):
+                raise ValueError(f"Expected dict in {steering_path}, got {type(existing)}")
+        else:
+            existing = {}
+
+        # Merge/update only the target layer while preserving other layers.
+        existing[layer_key] = layer_payload
+        with steering_path.open("w", encoding="utf-8") as f:
+            json.dump(existing, f, indent=2, ensure_ascii=False)
+
+        non_null = sum(1 for v in layer_payload.values() if v is not None)
+        print(
+            f"[user_interrupt] {entry_dir.name}: wrote {steering_path.name} {layer_key} "
+            f"(tokens={total_tokens}, start_idx={start_idx}, non_null={non_null})"
+        )
+        updated += 1
+
+    print(f"[user_interrupt] Done. Updated steering vectors for {updated} items at {root_dir}")
+
+def inference_with_steering(
+        root_dir, 
+        inject_layer,
+        save_hidden=False
+    ) -> None:
+    """
+    In the root_dir/*/steering_vector.json, we have the steering vectors calculated from calculate_steering_vector() for each input.wav file.
+    During inference, we read the steering vector for each token and inject it into the specified layer
+    Run batch inference with steering vector injection. The format of steering_vector.json is described in calculate_steering_vector(). The steering vector injection logic would be implemented in moshi.offline.run_batch_inference()
     
     """
-    pass
+    root = Path(root_dir)
+    input_paths = [p for p in root.glob("*/input.wav") if p.is_file()]
+    input_paths.sort(key=lambda p: int(p.parent.name) if p.parent.name.isdigit() else p.parent.name)
+
+    if not input_paths:
+        raise FileNotFoundError(f"No files matched pattern {root_dir}/*/input.wav")
+
+    voice_prompt_dir = _get_voice_prompt_dir(None, loaders.DEFAULT_REPO)
+    if voice_prompt_dir is None:
+        raise FileNotFoundError("Unable to resolve voice prompt directory.")
+
+    voice_prompt_path = os.path.join(voice_prompt_dir, "NATF0.pt")
+    if not os.path.exists(voice_prompt_path):
+        raise FileNotFoundError(f"Voice prompt not found: {voice_prompt_path}")
+
+    SYSTEM_PROMPT = (
+        "You are an intelligent, articulate, and highly factual AI assistant. "
+        "When the user asks open-ended questions, provide detailed, natural, and comprehensive explanations, and talk for a long time."
+        "However, you also act as a strict fact-checker. If the user interrupts you or makes a factual claim "
+        "(e.g., 'A banana is a red fruit, right?'), you must prioritize truth over politeness. "
+        "If their claim is TRUE, confirm it and teach user more about the topic."
+        "If their claim is FALSE, you must immediately reject it by saying 'No' or 'False', and teach user the correct information."
+        "Never agree with incorrect information just to be polite."
+    )
+
+    def _extract_layer_vectors(raw: dict, layer: int) -> list[Optional[torch.Tensor]]:
+        candidate_keys = [
+            f"layer_{layer}",
+            f"layer{layer}",
+            str(layer),
+            layer,
+        ]
+        layer_payload = None
+        for key in candidate_keys:
+            if key in raw:
+                layer_payload = raw[key]
+                break
+        if layer_payload is None:
+            available = ", ".join([str(k) for k in raw.keys()])
+            raise KeyError(
+                f"Layer {layer} not found in steering file. Available keys: {available}"
+            )
+        if not isinstance(layer_payload, dict):
+            raise ValueError(
+                f"Expected dict for layer payload at layer {layer}, got {type(layer_payload)}"
+            )
+
+        # Input JSON uses 0-based token indices.
+        token_entries: dict[int, Optional[torch.Tensor]] = {}
+        max_idx = 0
+        for token_key, token_vec in layer_payload.items():
+            try:
+                token_idx = int(token_key)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Token index must be an integer-like key, got '{token_key}'") from exc
+            if token_idx < 0:
+                raise ValueError(f"Token indices must be >= 0, got {token_idx}")
+            if token_vec is None:
+                token_entries[token_idx] = None
+            else:
+                token_entries[token_idx] = torch.as_tensor(token_vec, dtype=torch.float32).reshape(-1)
+            max_idx = max(max_idx, token_idx)
+
+        if len(token_entries) == 0:
+            raise ValueError("Layer payload is empty; no token steering vectors provided")
+        if 0 not in token_entries:
+            raise ValueError("Token indices must start from 0. Missing token index 0 in steering payload.")
+
+        vectors: list[Optional[torch.Tensor]] = [None] * (max_idx + 1)
+        for token_idx, token_vec in token_entries.items():
+            vectors[token_idx] = token_vec
+        return vectors
+
+    print(
+        f"[user_interrupt] Processing {len(input_paths)} files from {root_dir} with steering at layer {inject_layer}"
+    )
+
+    for path in input_paths:
+        entry_dir = path.parent
+        input_wav = str(path)
+        output_wav = str(entry_dir / "output.wav")
+        output_text = str(entry_dir / "output.json")
+        output_hidden = str(entry_dir / "output_hidden.pt")
+        steering_json = entry_dir / "steering_vector.json"
+
+        if not steering_json.exists():
+            raise FileNotFoundError(f"Missing steering vector file: {steering_json}")
+
+        with steering_json.open("r", encoding="utf-8") as f:
+            steering_payload = json.load(f)
+        if not isinstance(steering_payload, dict):
+            raise ValueError(f"Expected dict in {steering_json}, got {type(steering_payload)}")
+
+        steering_vectors = _extract_layer_vectors(steering_payload, int(inject_layer))
+        non_null = sum(1 for v in steering_vectors if v is not None)
+        print(
+            f"[user_interrupt] {entry_dir.name}: loaded steering vectors len={len(steering_vectors)}, non_null={non_null}"
+        )
+
+        with torch.no_grad():
+            run_batch_inference(
+                input_wavs=[input_wav],
+                output_wavs=[output_wav],
+                output_texts=[output_text],
+                text_prompts=[SYSTEM_PROMPT],
+                voice_prompt_path=voice_prompt_path,
+                tokenizer_path=None,
+                moshi_weight=None,
+                mimi_weight=None,
+                hf_repo=loaders.DEFAULT_REPO,
+                device="cuda",
+                seed=42,
+                temp_audio=0.8,
+                temp_text=0.7,
+                topk_audio=250,
+                topk_text=25,
+                greedy=False,
+                save_voice_prompt_embeddings=False,
+                cpu_offload=False,
+                return_hidden_layers=False,
+                save_hidden_payload=bool(save_hidden),
+                output_hiddens=[output_hidden] if save_hidden else None,
+                steering_vectors=steering_vectors,
+                steering_layer=int(inject_layer),
+            )
+
+    if save_hidden:
+        print(f"[user_interrupt] Done. Wrote output.wav/output.json/output_hidden.pt for {len(input_paths)} items.")
+    else:
+        print(f"[user_interrupt] Done. Wrote output.wav/output.json for {len(input_paths)} items.")
 
 
 def main() -> None:
@@ -93,13 +378,76 @@ def main() -> None:
         required=True,
         help="Root directory containing */input.wav files",
     )
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--inference",
+        action="store_true",
+        help="Run normal inference without steering (default behavior if no mode is selected).",
+    )
+    mode_group.add_argument(
+        "--generate-steering-vectors",
+        action="store_true",
+        help="Generate/Update root-dir/*/steering_vector.json from input_timing.json and classifier.",
+    )
+    mode_group.add_argument(
+        "--inference-with-steering",
+        action="store_true",
+        help="Run inference using steering vectors loaded from root-dir/*/steering_vector.json.",
+    )
+
+    parser.add_argument(
+        "--classifier-path",
+        type=str,
+        default=None,
+        help="Path to mode classifier checkpoint (.pt). Required for --generate-steering-vectors.",
+    )
+    parser.add_argument(
+        "--decay-span",
+        type=int,
+        default=10,
+        help="Linear decay span in tokens for steering vector generation.",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=0.05,
+        help="Steering strength multiplier for steering vector generation.",
+    )
+    parser.add_argument(
+        "--inject-layer",
+        type=int,
+        default=None,
+        help="Layer index to inject steering vectors during --inference-with-steering.",
+    )
     parser.add_argument(
         "--save-hidden",
         action="store_true",
-        help="If set, save hidden payload to root-dir/*/output_hidden.pt",
+        help="If set, save hidden payload to root-dir/*/output_hidden.pt (works for both inference modes).",
     )
-    
+
     args = parser.parse_args()
+
+    if args.generate_steering_vectors:
+        if args.classifier_path is None:
+            parser.error("--generate-steering-vectors requires --classifier-path")
+        calculate_steering_vector(
+            root_dir=args.root_dir,
+            classifier_path=args.classifier_path,
+            decay_span=args.decay_span,
+            alpha=args.alpha,
+        )
+        return
+
+    if args.inference_with_steering:
+        if args.inject_layer is None:
+            parser.error("--inference-with-steering requires --inject-layer")
+        inference_with_steering(
+            root_dir=args.root_dir,
+            inject_layer=args.inject_layer,
+            save_hidden=args.save_hidden,
+        )
+        return
+
     inference(args.root_dir, save_hidden=args.save_hidden)
 
 

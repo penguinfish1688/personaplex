@@ -751,7 +751,6 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
         x: torch.Tensor,
         return_hidden_layers: bool = False,
         return_attention_weights: bool = False,
-        steering: bool = False,
         steering_vector: torch.Tensor | None = None,
         steering_layer: int | None = None,
         *args,
@@ -759,15 +758,16 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
     ):
         B, T, C = x.shape
 
-        if steering:
-            if steering_vector is None:
-                raise ValueError("steering=True requires steering_vector")
+        do_steer = steering_vector is not None
+
+        if do_steer:
             if steering_layer is None:
-                raise ValueError("steering=True requires steering_layer")
+                raise ValueError("steering_vector provided but steering_layer is None")
             if steering_layer < 0 or steering_layer >= len(self.layers):
                 raise ValueError(
                     f"steering_layer out of range: {steering_layer}. Expected [0, {len(self.layers) - 1}]"
                 )
+            assert steering_vector is not None
             if steering_vector.dim() != 1:
                 steering_vector = steering_vector.reshape(-1)
             if int(steering_vector.numel()) != C:
@@ -797,7 +797,7 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
         attention_weights = [] if return_attention_weights else None
         
         for layer_idx, layer in enumerate(self.layers):
-            if steering and layer_idx == steering_layer:
+            if do_steer and layer_idx == steering_layer:
                 assert steering_view_shape is not None
                 x = x + steering_vector.view(steering_view_shape)
             if return_attention_weights:
