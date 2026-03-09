@@ -232,6 +232,7 @@ def calculate_steering_vector(root_dir, classifier_path, decay_span, alpha):
 def inference_with_steering(
         root_dir, 
         inject_layer,
+    offset=0,
         save_hidden=False
     ) -> None:
     """
@@ -265,7 +266,7 @@ def inference_with_steering(
         "Never agree with incorrect information just to be polite."
     )
 
-    def _extract_layer_vectors(raw: dict, layer: int) -> list[Optional[torch.Tensor]]:
+    def _extract_layer_vector(raw: dict, layer: int, offset: int = 0) -> list[Optional[torch.Tensor]]:
         candidate_keys = [
             f"layer_{layer}",
             f"layer{layer}",
@@ -287,7 +288,7 @@ def inference_with_steering(
                 f"Expected dict for layer payload at layer {layer}, got {type(layer_payload)}"
             )
 
-        # Input JSON uses 0-based token indices.
+        # Input JSON uses 0-based token indices. Shift to i+offset at inference time.
         token_entries: dict[int, Optional[torch.Tensor]] = {}
         max_idx = 0
         for token_key, token_vec in layer_payload.items():
@@ -297,16 +298,20 @@ def inference_with_steering(
                 raise ValueError(f"Token index must be an integer-like key, got '{token_key}'") from exc
             if token_idx < 0:
                 raise ValueError(f"Token indices must be >= 0, got {token_idx}")
+            shifted_idx = token_idx + int(offset)
+            if shifted_idx < 0:
+                # Negative target index cannot be injected; clip by dropping.
+                continue
             if token_vec is None:
-                token_entries[token_idx] = None
+                token_entries[shifted_idx] = None
             else:
-                token_entries[token_idx] = torch.as_tensor(token_vec, dtype=torch.float32).reshape(-1)
-            max_idx = max(max_idx, token_idx)
+                token_entries[shifted_idx] = torch.as_tensor(token_vec, dtype=torch.float32).reshape(-1)
+            max_idx = max(max_idx, shifted_idx)
 
         if len(token_entries) == 0:
-            raise ValueError("Layer payload is empty; no token steering vectors provided")
-        if 0 not in token_entries:
-            raise ValueError("Token indices must start from 0. Missing token index 0 in steering payload.")
+            raise ValueError(
+                f"Layer payload has no usable steering vectors after applying offset={offset}"
+            )
 
         vectors: list[Optional[torch.Tensor]] = [None] * (max_idx + 1)
         for token_idx, token_vec in token_entries.items():
@@ -314,7 +319,8 @@ def inference_with_steering(
         return vectors
 
     print(
-        f"[user_interrupt] Processing {len(input_paths)} files from {root_dir} with steering at layer {inject_layer}"
+        f"[user_interrupt] Processing {len(input_paths)} files from {root_dir} "
+        f"with steering at layer {inject_layer} and offset {offset}"
     )
 
     for path in input_paths:
@@ -333,7 +339,11 @@ def inference_with_steering(
         if not isinstance(steering_payload, dict):
             raise ValueError(f"Expected dict in {steering_json}, got {type(steering_payload)}")
 
-        steering_vectors = _extract_layer_vectors(steering_payload, int(inject_layer))
+        steering_vectors = _extract_layer_vector(
+            steering_payload,
+            int(inject_layer),
+            int(offset),
+        )
 
         # Guard against one-step tail mismatch by ensuring vectors cover at least
         # the WAV-derived token count at 12.5 Hz.
@@ -438,6 +448,12 @@ def main() -> None:
         help="Layer index to inject steering vectors during --inference-with-steering.",
     )
     parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Shift steering injection target from token i to i+offset (can be negative).",
+    )
+    parser.add_argument(
         "--save-hidden",
         action="store_true",
         help="If set, save hidden payload to root-dir/*/output_hidden.pt (works for both inference modes).",
@@ -462,6 +478,7 @@ def main() -> None:
         inference_with_steering(
             root_dir=args.root_dir,
             inject_layer=args.inject_layer,
+            offset=args.offset,
             save_hidden=args.save_hidden,
         )
         return
