@@ -193,6 +193,14 @@ def user_interrupt_dataset_tts(dataset_path: str, initial_silence: float = 0.0, 
     4) question_2
     5) response_duration_2 seconds of silence
     and save the results input.wav to the same dir as <root>/*/user_interrupt_text.json
+
+    save conversation_time.json under <dataset_path>/*/ with the following structure:
+    {
+        "Q1_start": initial_silence,
+        "Q1_end": initial_silence + duration of question_1 audio,
+        "Q2_start": Q1_end + response_duration_1,
+        "Q2_end": Q2_start + duration of question_2 audio
+    }
     """
     import scipy.io.wavfile as wavfile
 
@@ -236,8 +244,16 @@ def user_interrupt_dataset_tts(dataset_path: str, initial_silence: float = 0.0, 
 
         sr2, q2_audio = wavfile.read(q2_wav)
         q2_audio = np.asarray(q2_audio)
+        q2_duration_sec = float(q2_audio.shape[0]) / float(sr2)
 
         if no_interrupt:
+            # In no_interrupt mode, question 1 is omitted from the waveform timeline.
+            q1_duration_sec = 0.0
+            q1_start = float(max(0.0, entry_initial_silence))
+            q1_end = q1_start
+            q2_start = q1_end
+            q2_end = q2_start + q2_duration_sec
+
             if q2_audio.ndim == 1:
                 shape_initial = (int(max(0.0, entry_initial_silence) * sr2),)
                 shape_end = (int(max(0.0, response_duration_2) * sr2),)
@@ -254,6 +270,7 @@ def user_interrupt_dataset_tts(dataset_path: str, initial_silence: float = 0.0, 
         else:
             sr1, q1_audio = wavfile.read(q1_wav)
             q1_audio = np.asarray(q1_audio)
+            q1_duration_sec = float(q1_audio.shape[0]) / float(sr1)
             if sr1 != sr2:
                 raise ValueError(f"Sample rate mismatch for entry {entry_id}: q1={sr1}, q2={sr2}")
 
@@ -281,6 +298,22 @@ def user_interrupt_dataset_tts(dataset_path: str, initial_silence: float = 0.0, 
             combined = np.concatenate([initial_pad, q1_audio, mid_pad, q2_audio, end_pad], axis=0)
             wavfile.write(output_wav, sr1, combined)
             print(f"Saved {output_wav}")
+
+            q1_start = float(max(0.0, entry_initial_silence))
+            q1_end = q1_start + q1_duration_sec
+            q2_start = q1_end + float(max(0.0, response_duration_1))
+            q2_end = q2_start + q2_duration_sec
+
+        conversation_time = {
+            "Q1_start": q1_start,
+            "Q1_end": q1_end,
+            "Q2_start": q2_start,
+            "Q2_end": q2_end,
+        }
+        conversation_time_path = os.path.join(entry_dir, "conversation_time.json")
+        with open(conversation_time_path, "w", encoding="utf-8") as f:
+            json.dump(conversation_time, f, indent=2, ensure_ascii=False)
+        print(f"Saved {conversation_time_path}")
 
         for tmp_wav in tmp_wavs:
             if os.path.exists(tmp_wav):
