@@ -44,6 +44,7 @@ import os
 import tarfile
 import gc
 import pickle
+import math
 from pathlib import Path
 import json
 from typing import Optional, List, Dict, Any
@@ -196,6 +197,133 @@ def _extract_text_attention_per_layer(step_hidden: HiddenLayerOutputs) -> Option
     return torch.stack(per_layer, dim=0)
 
 
+def _extract_target_layer_text_keys_and_positions(
+    target_layer_module: Any,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, int]]:
+    """Extract chronological key cache and absolute positions from a target layer.
+
+    Returns:
+      - text_keys: [1, H, K, D_h] on CPU (chronological order)
+      - text_key_positions: [K] int64 absolute positions
+      - text_key_cache_meta: scalar cache coverage metadata
+    """
+    attn = target_layer_module.self_attn
+    state = getattr(attn, "_streaming_state", None)
+    if state is None or getattr(state, "kv_cache", None) is None:
+        raise RuntimeError("Target layer has no streaming KV cache state.")
+
+    kv_cache = state.kv_cache
+    keys = kv_cache.cache[0]  # [B, H, C, D]
+    end_offset = int(kv_cache.end_offset.item())
+    capacity = int(kv_cache.capacity)
+    valid_len = min(end_offset, capacity)
+    if valid_len <= 0:
+        raise RuntimeError("Target layer KV cache is empty.")
+
+    # Mirror RingKVCache.complete() position mapping, then reorder to chronological.
+    ring_indexes = torch.arange(capacity, device=keys.device, dtype=torch.long)
+    invalid = ring_indexes >= end_offset
+    end_index = end_offset % capacity
+    delta = ring_indexes - end_index
+    ring_positions = torch.where(
+        delta <= 0,
+        torch.full_like(ring_indexes, end_offset) + delta,
+        torch.full_like(ring_indexes, end_offset) + delta - capacity,
+    )
+    ring_positions = torch.where(invalid, torch.full_like(ring_positions, -1), ring_positions)
+
+    valid_ring_indices = torch.where(ring_positions >= 0)[0]
+    if valid_ring_indices.numel() <= 0:
+        raise RuntimeError("Target layer KV cache has no valid key positions.")
+    valid_positions = ring_positions.index_select(0, valid_ring_indices)
+    _, sort_order = valid_positions.sort()
+    chrono_ring_indices = valid_ring_indices.index_select(0, sort_order)
+
+    ordered_keys = keys.index_select(2, chrono_ring_indices)
+    ordered_positions = ring_positions.index_select(0, chrono_ring_indices)
+
+    text_key_cache_meta = {
+        "capacity": int(capacity),
+        "end_offset": int(end_offset),
+        "valid_len": int(valid_len),
+        "dropped_prefix_tokens": int(max(0, end_offset - valid_len)),
+    }
+    return (
+        ordered_keys.detach().cpu().float(),
+        ordered_positions.detach().cpu().long(),
+        text_key_cache_meta,
+    )
+
+
+def _extract_target_layer_wq(
+    target_layer_module: Any,
+    step_index: Optional[int] = None,
+) -> tuple[torch.Tensor, int, int]:
+    """Extract raw query projection weights from target attention layer.
+
+    Supports packed QKV in `in_proj_weight` with optional weights-per-step layout.
+    Returns:
+      - W_q: [embed_dim, embed_dim] on CPU
+      - selected_step_index: effective step index used for W_q selection
+      - weights_per_step: number of available per-step projections (0 means shared)
+    """
+    attn = target_layer_module.self_attn
+    w = attn.in_proj_weight.detach().cpu().float()
+    embed_dim = int(attn.embed_dim)
+    weights_per_step = int(getattr(attn, "weights_per_step", 0))
+    selected_step_index = 0
+
+    if weights_per_step > 0 and w.dim() == 2 and w.shape[0] == weights_per_step * 3 * embed_dim:
+        w_steps = w.view(weights_per_step, 3 * embed_dim, embed_dim)
+        if step_index is None:
+            state = getattr(attn, "_streaming_state", None)
+            if state is not None and hasattr(state, "offset_cpu"):
+                step_index = int(state.offset_cpu) - 1
+        if step_index is None:
+            step_index = 0
+        if step_index < 0:
+            step_index = 0
+        if step_index >= weights_per_step:
+            raise RuntimeError(
+                f"Step index {step_index} out of range for weights_per_step={weights_per_step}"
+            )
+        selected_step_index = int(step_index)
+        w = w_steps[selected_step_index]
+
+    if w.dim() != 2 or w.shape[0] != 3 * embed_dim or w.shape[1] != embed_dim:
+        raise RuntimeError(f"Unexpected in_proj_weight shape for packed QKV: {tuple(w.shape)}")
+
+    return w[:embed_dim, :].contiguous(), selected_step_index, weights_per_step
+
+
+def _extract_target_layer_rope_cache(target_layer_module: Any, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract compact RoPE cos/sin caches (not dense rotation matrices).
+
+    Returns:
+      rope_cos: [K, D_h/2]
+      rope_sin: [K, D_h/2]
+    """
+    attn = target_layer_module.self_attn
+    rope = getattr(attn, "rope", None)
+    if rope is None:
+        return torch.empty(0), torch.empty(0)
+    if seq_len <= 0:
+        return torch.empty(0), torch.empty(0)
+
+    head_dim = int(attn.embed_dim // attn.num_heads)
+    if head_dim % 2 != 0:
+        raise RuntimeError(f"Expected even head_dim for RoPE, got {head_dim}")
+
+    half_dim = head_dim // 2
+    ds = torch.arange(half_dim, dtype=torch.float32)
+    freqs = torch.exp(ds * (-math.log(float(rope.max_period)) * 2.0 / float(head_dim)))
+    ts = torch.arange(int(seq_len), dtype=torch.float32).view(-1, 1)
+    angles = ts * freqs.view(1, -1)
+    rope_cos = torch.cos(angles).contiguous()
+    rope_sin = torch.sin(angles).contiguous()
+    return rope_cos, rope_sin
+
+
 def _build_hidden_payload(
     *,
     input_wav: str,
@@ -206,10 +334,18 @@ def _build_hidden_payload(
     text_token_pieces: list[str],
     text_hidden_layers_per_token: list[torch.Tensor],
     text_attention_layers_per_token: list[Optional[torch.Tensor]],
+    text_target_layer_keys: torch.Tensor,
+    text_key_positions: torch.Tensor,
+    text_key_cache_meta: dict[str, int],
+    target_layer_W_q: torch.Tensor,
+    w_q_step_index: int,
+    w_q_weights_per_step: int,
+    rope_cos: torch.Tensor,
+    rope_sin: torch.Tensor,
 ) -> Dict[str, Any]:
     """Build the serialized `.pt` payload consumed by premature decode tools.
 
-    Saved schema (`schema_version=1`):
+    Saved schema (`schema_version=3`):
         - `text_hidden_layers`: `torch.FloatTensor[T, L, D]`
           - `T`: number of generated output tokens from `input.wav` processing only.
           - `L`: number of main text transformer layers.
@@ -224,6 +360,15 @@ def _build_hidden_payload(
         - `token_time_ranges_sec`: `torch.FloatTensor[T, 2]` token `[start, end)`.
         - `hidden_states`: `torch.FloatTensor[T, D]` final-layer hidden states (compat key).
         - `frame_rate`: scalar float, default 12.5 for Moshi.
+        - `text_keys`: `torch.FloatTensor[1, H, K, D_h]` final accumulated text KV-cache keys.
+                - `text_key_positions`: `torch.LongTensor[K]` absolute key positions aligned to `text_keys`.
+                - `text_key_cache_meta`: scalar cache metadata (`capacity`, `end_offset`, `valid_len`,
+                    `dropped_prefix_tokens`).
+        - `W_q`: `torch.FloatTensor[D, D]` query projection weight matrix for target layer.
+                - `W_q_step_index`: int step index used when selecting per-step query projection weights.
+                - `W_q_weights_per_step`: int number of available per-step query projections (0 means shared).
+        - `rope_cos`: compact RoPE cosine cache, typically `[K, D_h/2]`.
+        - `rope_sin`: compact RoPE sine cache, typically `[K, D_h/2]`.
 
     Token-time alignment:
         token `0` corresponds to `[0, 1/frame_rate_hz)` seconds of generated response,
@@ -242,7 +387,7 @@ def _build_hidden_payload(
     )
 
     payload: Dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 3,
         "input_wav": input_wav,
         "output_wav": output_wav,
         "output_text": output_text,
@@ -254,6 +399,14 @@ def _build_hidden_payload(
         "text_hidden_layers": hidden_tensor,
         "text_attention_weights": text_attention_layers_per_token,
         "hidden_states": hidden_tensor[:, -1, :],
+        "text_keys": text_target_layer_keys,
+        "text_key_positions": text_key_positions,
+        "text_key_cache_meta": text_key_cache_meta,
+        "W_q": target_layer_W_q,
+        "W_q_step_index": int(w_q_step_index),
+        "W_q_weights_per_step": int(w_q_weights_per_step),
+        "rope_cos": rope_cos,
+        "rope_sin": rope_sin,
     }
     return payload
 
@@ -603,6 +756,7 @@ def run_batch_inference(
     output_hiddens: Optional[List[str]] = None,
     steering_vectors: Optional[list[Optional[torch.Tensor]]] = None,
     steering_layer: Optional[int] = None,
+    payload_target_layer: Optional[int] = None,
 ) -> Optional[List[List[HiddenLayerOutputs]]]:
     """Run batch offline inference using multiple input WAVs and text prompts.
     
@@ -698,6 +852,17 @@ def run_batch_inference(
     batch_hidden_layers: List[List[HiddenLayerOutputs]] = []
     capture_hidden = return_hidden_layers or save_hidden_payload
     
+    if payload_target_layer is not None:
+        target_layer_idx = int(payload_target_layer)
+    elif steering_layer is not None:
+        target_layer_idx = int(steering_layer)
+    else:
+        target_layer_idx = len(lm.transformer.layers) - 1
+    if target_layer_idx < 0 or target_layer_idx >= len(lm.transformer.layers):
+        raise ValueError(
+            f"target_layer_idx out of range: {target_layer_idx}, valid [0, {len(lm.transformer.layers)-1}]"
+        )
+
     # 7) Process each instance
     for i, (input_wav, output_wav, output_text, text_prompt) in tqdm(enumerate(zip(input_wavs, output_wavs, output_texts, text_prompts))):
         log("info", f"Processing instance {i+1}/{len(input_wavs)}: {input_wav}")
@@ -850,6 +1015,33 @@ def run_batch_inference(
         if save_hidden_payload:
             output_hidden = output_hiddens[i] if output_hiddens is not None else str(Path(output_wav).with_name("output_hidden.pt"))
             Path(output_hidden).parent.mkdir(parents=True, exist_ok=True)
+
+            target_layer = lm.transformer.layers[target_layer_idx]
+            text_target_layer_keys, text_key_positions, text_key_cache_meta = _extract_target_layer_text_keys_and_positions(target_layer)
+            target_layer_W_q, w_q_step_index, w_q_weights_per_step = _extract_target_layer_wq(target_layer)
+            rope_cache_len = int(text_key_positions.max().item()) + 1 if text_key_positions.numel() > 0 else 0
+            rope_cos, rope_sin = _extract_target_layer_rope_cache(
+                target_layer,
+                seq_len=rope_cache_len,
+            )
+            key_pos_start = int(text_key_positions[0].item()) if text_key_positions.numel() > 0 else -1
+            key_pos_end = int(text_key_positions[-1].item()) if text_key_positions.numel() > 0 else -1
+
+            log(
+                "info",
+                (
+                    f"Target layer {target_layer_idx} shapes: "
+                    f"text_keys={tuple(text_target_layer_keys.shape)}, "
+                    f"text_key_positions={tuple(text_key_positions.shape)} [{key_pos_start}..{key_pos_end}], "
+                    f"W_q={tuple(target_layer_W_q.shape)}, "
+                    f"W_q_step_index={w_q_step_index}, "
+                    f"W_q_weights_per_step={w_q_weights_per_step}, "
+                    f"text_key_cache_meta={text_key_cache_meta}, "
+                    f"rope_cos={tuple(rope_cos.shape)}, "
+                    f"rope_sin={tuple(rope_sin.shape)}"
+                ),
+            )
+
             payload = _build_hidden_payload(
                 input_wav=input_wav,
                 output_wav=output_wav,
@@ -859,6 +1051,14 @@ def run_batch_inference(
                 text_token_pieces=generated_text_tokens,
                 text_hidden_layers_per_token=text_hidden_layers_per_token,
                 text_attention_layers_per_token=text_attention_layers_per_token,
+                text_target_layer_keys=text_target_layer_keys,
+                text_key_positions=text_key_positions,
+                text_key_cache_meta=text_key_cache_meta,
+                target_layer_W_q=target_layer_W_q,
+                w_q_step_index=w_q_step_index,
+                w_q_weights_per_step=w_q_weights_per_step,
+                rope_cos=rope_cos,
+                rope_sin=rope_sin,
             )
             torch.save(payload, output_hidden)
             log("info", f"Wrote hidden payload to {output_hidden}")
@@ -1316,6 +1516,16 @@ def main():
         default=None,
         help="Main transformer layer index (0-31) where steering is injected. Required with --steering-vectors.",
     )
+    parser.add_argument(
+        "--payload-target-layer",
+        type=int,
+        default=None,
+        help=(
+            "Text transformer layer index used to extract payload fields "
+            "(text_keys, W_q, rope_cos, rope_sin). "
+            "If not set, defaults to steering_layer (if provided) else last layer."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1373,6 +1583,7 @@ def main():
             return_hidden_layers=args.return_hidden_layers,
             steering_vectors=steering_vectors,
             steering_layer=args.steering_layer,
+            payload_target_layer=args.payload_target_layer,
         )
 
 

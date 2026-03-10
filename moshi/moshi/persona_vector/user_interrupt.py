@@ -83,6 +83,116 @@ def inference(root_dir: str, save_hidden: bool = False) -> None:
     else:
         print(f"[user_interrupt] Done. Wrote {len(output_wavs)} output.wav files.")
 
+def compute_attention_nullspace_steering_vector(
+    W_q_weights: torch.Tensor,
+    K_listen: torch.Tensor,
+    V_svm: torch.Tensor,
+    alpha: float = 1.0,
+    lambda_reg: float = 1e-5,
+    rope_cos: Optional[torch.Tensor] = None,
+    rope_sin: Optional[torch.Tensor] = None,
+    position_id: Optional[int] = None
+) -> torch.Tensor:
+    if K_listen.dim() != 4:
+        raise ValueError(f"K_listen must be [B,H,T,Dh], got {tuple(K_listen.shape)}")
+    if K_listen.shape[0] != 1:
+        raise ValueError(f"Only batch size 1 is supported, got B={K_listen.shape[0]}")
+
+    _b, num_heads, _seq_len, head_dim = K_listen.shape
+    d_model = num_heads * head_dim
+
+    if V_svm.dim() == 2 and V_svm.shape[0] == 1:
+        v_svm = V_svm.reshape(-1)
+    elif V_svm.dim() == 1:
+        v_svm = V_svm
+    else:
+        raise ValueError(f"V_svm must be [d_model] or [1,d_model], got {tuple(V_svm.shape)}")
+
+    if v_svm.numel() != d_model:
+        raise ValueError(
+            f"V_svm dim mismatch: got {int(v_svm.numel())}, expected {d_model}"
+        )
+
+    # Normalize W_q into [H, Dh, D_model].
+    if W_q_weights.dim() == 3:
+        if tuple(W_q_weights.shape) != (num_heads, head_dim, d_model):
+            raise ValueError(
+                "W_q_weights 3D shape mismatch. "
+                f"Got {tuple(W_q_weights.shape)}, expected {(num_heads, head_dim, d_model)}"
+            )
+        w_q = W_q_weights
+    elif W_q_weights.dim() == 2:
+        if tuple(W_q_weights.shape) != (d_model, d_model):
+            raise ValueError(
+                "W_q_weights 2D shape mismatch. "
+                f"Got {tuple(W_q_weights.shape)}, expected {(d_model, d_model)}"
+            )
+        w_q = W_q_weights.reshape(num_heads, head_dim, d_model)
+    else:
+        raise ValueError(
+            f"W_q_weights must be 2D or 3D, got shape {tuple(W_q_weights.shape)}"
+        )
+
+    if (rope_cos is None) != (rope_sin is None):
+        raise ValueError("rope_cos and rope_sin must be provided together or both be None")
+
+    device = W_q_weights.device
+    # Use float32 for covariance and pinv stability, then cast output back.
+    out_dtype = W_q_weights.dtype
+    dtype = torch.float32
+    k_listen = K_listen.to(device=device, dtype=dtype)
+    w_q = w_q.to(device=device, dtype=dtype)
+    v_svm = v_svm.to(device=device, dtype=dtype)
+
+    # Optional RoPE rotation on the query projection side.
+    if rope_cos is not None and rope_sin is not None:
+        if position_id is None:
+            raise ValueError("position_id is required when rope_cos/rope_sin are provided")
+        if head_dim % 2 != 0:
+            raise ValueError(f"head_dim must be even for RoPE, got {head_dim}")
+
+        cos = rope_cos.to(device=device, dtype=dtype)
+        sin = rope_sin.to(device=device, dtype=dtype)
+        if cos.dim() != 2 or sin.dim() != 2:
+            raise ValueError(
+                f"rope_cos/rope_sin must be 2D [seq, head_dim/2], got {tuple(cos.shape)} and {tuple(sin.shape)}"
+            )
+        if position_id < 0 or position_id >= cos.shape[0] or position_id >= sin.shape[0]:
+            raise ValueError(
+                f"position_id={position_id} out of range for rope caches with length {cos.shape[0]}"
+            )
+        if cos.shape[1] * 2 != head_dim or sin.shape[1] * 2 != head_dim:
+            raise ValueError(
+                "RoPE cache width mismatch: expected head_dim/2 columns. "
+                f"Got cos={tuple(cos.shape)}, sin={tuple(sin.shape)}, head_dim={head_dim}"
+            )
+
+        c = cos[position_id]  # [Dh/2]
+        s = sin[position_id]  # [Dh/2]
+
+        w_even = w_q[:, 0::2, :]  # [H, Dh/2, D]
+        w_odd = w_q[:, 1::2, :]   # [H, Dh/2, D]
+        w_even_rot = (c.view(1, -1, 1) * w_even) - (s.view(1, -1, 1) * w_odd)
+        w_odd_rot = (s.view(1, -1, 1) * w_even) + (c.view(1, -1, 1) * w_odd)
+        w_q_tilde = torch.empty_like(w_q)
+        w_q_tilde[:, 0::2, :] = w_even_rot
+        w_q_tilde[:, 1::2, :] = w_odd_rot
+    else:
+        w_q_tilde = w_q
+
+    m_listen = torch.zeros((d_model, d_model), device=device, dtype=dtype)
+    for h in range(num_heads):
+        w_h = w_q_tilde[h]          # [Dh, D]
+        k_h = k_listen[0, h]        # [T, Dh]
+        proj_h = w_h.transpose(0, 1) @ k_h.transpose(0, 1)  # [D, T]
+        cov_h = proj_h @ proj_h.transpose(0, 1)             # [D, D]
+        m_listen += cov_h
+
+    m_listen = m_listen + (float(lambda_reg) * torch.eye(d_model, device=device, dtype=dtype))
+    m_inv = torch.linalg.pinv(m_listen)
+    v = float(alpha) * (v_svm @ m_inv)
+    return v.reshape(1, -1).to(dtype=out_dtype)
+
 def calculate_steering_vector(root_dir, classifier_path, decay_span, alpha):
     """At interrupt_start, we calculate the steering vector with length alpha, 
     and linearly decay to 0 over decay_span tokens.
