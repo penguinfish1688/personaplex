@@ -14,7 +14,11 @@ from moshi.models import loaders
 from moshi.persona_vector.mode_class import extract_normal_vector
 
 
-def inference(root_dir: str, save_hidden: bool = False) -> None:
+def inference(
+    root_dir: str,
+    save_hidden: bool = False,
+    payload_target_layer: Optional[int] = None,
+) -> None:
     """
     Take root_dir as input there will be <root_dir>/*/input.wav file
     For each input.wav file, run inference and save to <root_dir>/*/output.wav
@@ -74,6 +78,7 @@ def inference(root_dir: str, save_hidden: bool = False) -> None:
             return_hidden_layers=False,
             save_hidden_payload=bool(save_hidden),
             output_hiddens=output_hiddens if save_hidden else None,
+            payload_target_layer=payload_target_layer,
         )
     if save_hidden:
         print(
@@ -568,6 +573,16 @@ def main() -> None:
         action="store_true",
         help="If set, save hidden payload to root-dir/*/output_hidden.pt (works for both inference modes).",
     )
+    parser.add_argument(
+        "--payload-target-layer",
+        type=int,
+        default=0,
+        help=(
+            "Text transformer layer index used to extract payload fields "
+            "(text_keys, W_q, rope_cos, rope_sin). "
+            "If not set, defaults to steering_layer (if provided) else last layer."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -593,7 +608,11 @@ def main() -> None:
         )
         return
 
-    inference(args.root_dir, save_hidden=args.save_hidden)
+    inference(
+        args.root_dir,
+        save_hidden=args.save_hidden,
+        payload_target_layer=args.payload_target_layer,
+    )
 
 
 if __name__ == "__main__":
