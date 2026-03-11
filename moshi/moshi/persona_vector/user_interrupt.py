@@ -5,9 +5,11 @@ import os
 import re
 import wave
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, cast
 
 import torch
+import torch.nn.functional as F
+from huggingface_hub import hf_hub_download
 
 from moshi.offline import run_batch_inference, _get_voice_prompt_dir
 from moshi.models import loaders
@@ -88,115 +90,229 @@ def inference(
     else:
         print(f"[user_interrupt] Done. Wrote {len(output_wavs)} output.wav files.")
 
-def compute_attention_nullspace_steering_vector(
-    W_q_weights: torch.Tensor,
-    K_listen: torch.Tensor,
+def compute_attention_mapped_steering_vector(root_dir, classifier_path, decay_span, alpha):
+    """Just like calculate_steering_vector()
+    but instead of just using the normal vector from the SVM classifier
+    use _compute_attention_mapped_steering_vector() to optimize of the 
+    steering vector by mapping it. Then save the mapped vector and decay logic
+    as calculate_steering_vector() does, so that it can be injected during inference.
+    """
+    token_rate_hz = 12.5
+    root = Path(root_dir)
+    classifier_path = str(classifier_path)
+
+    if decay_span < 0:
+        raise ValueError(f"decay_span must be >= 0, got {decay_span}")
+
+    normal_vector = torch.as_tensor(
+        extract_normal_vector(classifier_path), dtype=torch.float32
+    ).reshape(-1)
+    if normal_vector.numel() == 0:
+        raise ValueError(f"Extracted empty normal vector from classifier: {classifier_path}")
+
+    ckpt = torch.load(classifier_path, map_location="cpu", weights_only=False)
+    if not isinstance(ckpt, dict):
+        raise TypeError(
+            f"Expected checkpoint dict at {classifier_path}, got {type(ckpt).__name__}"
+        )
+
+    layer = ckpt.get("layer")
+    if layer is None:
+        m = re.search(r"layer_(-?\d+)", Path(classifier_path).stem)
+        if m is None:
+            raise KeyError(
+                f"Classifier checkpoint {classifier_path} missing 'layer' field and filename does not contain layer index"
+            )
+        layer = int(m.group(1))
+    layer = int(layer)
+    layer_key = f"layer_{layer}"
+
+    moshi_weight = hf_hub_download(loaders.DEFAULT_REPO, loaders.MOSHI_NAME)
+    lm = loaders.get_moshi_lm(moshi_weight, device="cpu", cpu_offload=False)
+    lm.eval()
+
+    num_layers = len(lm.transformer.layers)
+    layer_idx = layer if layer >= 0 else num_layers + layer
+    if layer_idx < 0 or layer_idx >= num_layers:
+        raise ValueError(
+            f"Layer index {layer} (resolved to {layer_idx}) out of range for model with {num_layers} layers"
+        )
+
+    target_layer = lm.transformer.layers[layer_idx]
+    attn = cast(Any, target_layer.self_attn)
+    w = attn.in_proj_weight.detach().cpu().float()
+    embed_dim = int(attn.embed_dim)
+    weights_per_step = int(getattr(attn, "weights_per_step", 0))
+
+    if weights_per_step > 0 and w.dim() == 2 and w.shape[0] == weights_per_step * 3 * embed_dim:
+        # Use step 0 for offline steering-vector generation.
+        w = w.view(weights_per_step, 3 * embed_dim, embed_dim)[0]
+
+    if w.dim() != 2 or w.shape[0] != 3 * embed_dim or w.shape[1] != embed_dim:
+        raise RuntimeError(f"Unexpected in_proj_weight shape for packed QKV: {tuple(w.shape)}")
+
+    w_q = w[:embed_dim, :].contiguous()
+    w_k = w[embed_dim : 2 * embed_dim, :].contiguous()
+
+    mapped_vector = _compute_attention_mapped_steering_vector(
+        V_svm=normal_vector,
+        W_q_weights=w_q,
+        W_k_weights=w_k,
+        alpha=float(alpha),
+    ).reshape(-1)
+
+    input_paths = [p for p in root.glob("*/input.wav") if p.is_file()]
+    input_paths.sort(key=lambda p: int(p.parent.name) if p.parent.name.isdigit() else p.parent.name)
+    if not input_paths:
+        raise FileNotFoundError(f"No files matched pattern {root_dir}/*/input.wav")
+
+    def _wav_duration_seconds(wav_path: Path) -> float:
+        try:
+            with wave.open(str(wav_path), "rb") as wf:
+                nframes = wf.getnframes()
+                framerate = wf.getframerate()
+            if framerate <= 0:
+                raise ValueError(f"Invalid sample rate in WAV: {wav_path}")
+            return float(nframes) / float(framerate)
+        except wave.Error:
+            import soundfile as sf
+
+            info = sf.info(str(wav_path))
+            if info.samplerate <= 0:
+                raise ValueError(f"Invalid sample rate in WAV: {wav_path}")
+            return float(info.frames) / float(info.samplerate)
+
+    updated = 0
+    for input_wav in input_paths:
+        entry_dir = input_wav.parent
+        timing_path = entry_dir / "input_timing.json"
+        if not timing_path.exists():
+            raise FileNotFoundError(f"Missing timing file: {timing_path}")
+
+        with timing_path.open("r", encoding="utf-8") as f:
+            timing_payload = json.load(f)
+        if not isinstance(timing_payload, dict):
+            raise ValueError(f"Expected dict in {timing_path}, got {type(timing_payload)}")
+        if "interrupt_start" not in timing_payload:
+            raise KeyError(f"Missing 'interrupt_start' in {timing_path}")
+
+        interrupt_start = float(timing_payload["interrupt_start"])
+        duration_s = _wav_duration_seconds(input_wav)
+        total_tokens = int(math.ceil(duration_s * token_rate_hz))
+        if total_tokens <= 0:
+            raise ValueError(
+                f"Computed non-positive token count for {input_wav}: duration={duration_s:.6f}s"
+            )
+
+        start_idx = int(interrupt_start * token_rate_hz)
+        start_idx = max(0, min(start_idx, total_tokens - 1))
+
+        layer_payload: dict[str, Optional[list[float]]] = {
+            str(i): None for i in range(total_tokens)
+        }
+
+        base_vec = mapped_vector.tolist()
+        layer_payload[str(start_idx)] = base_vec
+
+        for k in range(1, int(decay_span) + 1):
+            token_idx = start_idx + k
+            if token_idx >= total_tokens:
+                break
+            decay_factor = 1.0 - (float(k) / float(decay_span)) if decay_span > 0 else 0.0
+            if decay_factor <= 0.0:
+                layer_payload[str(token_idx)] = None
+                continue
+            vec = (mapped_vector * float(decay_factor)).tolist()
+            layer_payload[str(token_idx)] = vec
+
+        steering_path = entry_dir / "steering_vector.json"
+        if steering_path.exists():
+            with steering_path.open("r", encoding="utf-8") as f:
+                existing = json.load(f)
+            if not isinstance(existing, dict):
+                raise ValueError(f"Expected dict in {steering_path}, got {type(existing)}")
+        else:
+            existing = {}
+
+        existing[layer_key] = layer_payload
+        with steering_path.open("w", encoding="utf-8") as f:
+            json.dump(existing, f, indent=2, ensure_ascii=False)
+
+        non_null = sum(1 for v in layer_payload.values() if v is not None)
+        print(
+            f"[user_interrupt] {entry_dir.name}: wrote {steering_path.name} {layer_key} "
+            f"(tokens={total_tokens}, start_idx={start_idx}, non_null={non_null})"
+        )
+        updated += 1
+
+    print(f"[user_interrupt] Done. Updated attention-mapped steering vectors for {updated} items at {root_dir}")
+
+
+def _compute_attention_mapped_steering_vector(
     V_svm: torch.Tensor,
-    alpha: float = 1.0,
-    lambda_reg: float = 1e-5,
-    rope_cos: Optional[torch.Tensor] = None,
-    rope_sin: Optional[torch.Tensor] = None,
-    position_id: Optional[int] = None
+    W_q_weights: torch.Tensor,
+    W_k_weights: torch.Tensor,
+    alpha: float = 1.0
 ) -> torch.Tensor:
-    if K_listen.dim() != 4:
-        raise ValueError(f"K_listen must be [B,H,T,Dh], got {tuple(K_listen.shape)}")
-    if K_listen.shape[0] != 1:
-        raise ValueError(f"Only batch size 1 is supported, got B={K_listen.shape[0]}")
+    """
+    Computes the Attention-Mapped Persona Vector for global state steering.
 
-    _b, num_heads, _seq_len, head_dim = K_listen.shape
-    d_model = num_heads * head_dim
+    What this calculates:
+    Based on the theoretical derivation: v* = (mu_s - mu_l) * W_K * W_Q^T
+    Instead of enforcing strict orthogonalization (which over-constrains the problem),
+    we take the contrastive persona vector (V_svm) from the hidden space and map it 
+    directly through the attention metric tensor (W_K * W_Q^T). This mathematically 
+    transforms the vector to maximize the attention on the target state (Speaking Mode).
 
-    if V_svm.dim() == 2 and V_svm.shape[0] == 1:
-        v_svm = V_svm.reshape(-1)
-    elif V_svm.dim() == 1:
-        v_svm = V_svm
-    else:
-        raise ValueError(f"V_svm must be [d_model] or [1,d_model], got {tuple(V_svm.shape)}")
+    Args:
+        V_svm: The initial, raw steering motive vector. 
+               NOTE: Expected to come from `calculate_steering_vector` 
+               (e.g., the SVM normal vector or mu_s - mu_l difference vector).
+        W_q_weights: The Query projection weights of the target attention layer.
+        W_k_weights: The Key projection weights of the target attention layer.
+        alpha: Scaling factor applied to the final mapped vector.
 
-    if v_svm.numel() != d_model:
-        raise ValueError(
-            f"V_svm dim mismatch: got {int(v_svm.numel())}, expected {d_model}"
-        )
-
-    # Normalize W_q into [H, Dh, D_model].
-    if W_q_weights.dim() == 3:
-        if tuple(W_q_weights.shape) != (num_heads, head_dim, d_model):
-            raise ValueError(
-                "W_q_weights 3D shape mismatch. "
-                f"Got {tuple(W_q_weights.shape)}, expected {(num_heads, head_dim, d_model)}"
-            )
-        w_q = W_q_weights
-    elif W_q_weights.dim() == 2:
-        if tuple(W_q_weights.shape) != (d_model, d_model):
-            raise ValueError(
-                "W_q_weights 2D shape mismatch. "
-                f"Got {tuple(W_q_weights.shape)}, expected {(d_model, d_model)}"
-            )
+    Returns:
+        v_opt: The refined steering vector (v*), transformed to maximize attention 
+               on the target persona. Shape: [1, d_model].
+    """
+    # 1. Shape Verification & Normalization
+    if W_q_weights.dim() == 2:
+        d_model = W_q_weights.shape[0]
+        # Moshi/Llama default heuristics: head_dim is usually 128
+        head_dim = 128 
+        num_heads = d_model // head_dim
         w_q = W_q_weights.reshape(num_heads, head_dim, d_model)
+        w_k = W_k_weights.reshape(num_heads, head_dim, d_model)
     else:
-        raise ValueError(
-            f"W_q_weights must be 2D or 3D, got shape {tuple(W_q_weights.shape)}"
-        )
+        num_heads, head_dim, d_model = W_q_weights.shape
+        w_q = W_q_weights
+        w_k = W_k_weights
 
-    if (rope_cos is None) != (rope_sin is None):
-        raise ValueError("rope_cos and rope_sin must be provided together or both be None")
-
-    device = W_q_weights.device
-    # Use float32 for covariance and pinv stability, then cast output back.
-    out_dtype = W_q_weights.dtype
-    dtype = torch.float32
-    k_listen = K_listen.to(device=device, dtype=dtype)
+    device = w_q.device
+    out_dtype = w_q.dtype
+    dtype = torch.float32  # High precision for tensor accumulation
+    
+    # V_svm represents our persona contrast vector (mu_s - mu_l)
+    v_svm = V_svm.reshape(-1).to(device=device, dtype=dtype)
     w_q = w_q.to(device=device, dtype=dtype)
-    v_svm = v_svm.to(device=device, dtype=dtype)
+    w_k = w_k.to(device=device, dtype=dtype)
 
-    # Optional RoPE rotation on the query projection side.
-    if rope_cos is not None and rope_sin is not None:
-        if position_id is None:
-            raise ValueError("position_id is required when rope_cos/rope_sin are provided")
-        if head_dim % 2 != 0:
-            raise ValueError(f"head_dim must be even for RoPE, got {head_dim}")
+    # 2. Transform the persona vector through the attention metric tensor (W_K * W_Q^T)
+    # Step A: Map into Key space -> k_vec = V_svm @ W_K^T (Shape: [H, Dh])
+    k_vec = torch.einsum('d, h m d -> h m', v_svm, w_k)
+    
+    # Step B: Map from Key space back to residual stream via Query weights 
+    # v_star = k_vec @ W_Q (Shape: [D])
+    v_star = torch.einsum('h m, h m d -> d', k_vec, w_q)
 
-        cos = rope_cos.to(device=device, dtype=dtype)
-        sin = rope_sin.to(device=device, dtype=dtype)
-        if cos.dim() != 2 or sin.dim() != 2:
-            raise ValueError(
-                f"rope_cos/rope_sin must be 2D [seq, head_dim/2], got {tuple(cos.shape)} and {tuple(sin.shape)}"
-            )
-        if position_id < 0 or position_id >= cos.shape[0] or position_id >= sin.shape[0]:
-            raise ValueError(
-                f"position_id={position_id} out of range for rope caches with length {cos.shape[0]}"
-            )
-        if cos.shape[1] * 2 != head_dim or sin.shape[1] * 2 != head_dim:
-            raise ValueError(
-                "RoPE cache width mismatch: expected head_dim/2 columns. "
-                f"Got cos={tuple(cos.shape)}, sin={tuple(sin.shape)}, head_dim={head_dim}"
-            )
+    # 3. Apply steering strength
+    v_star_norm = F.normalize(v_star, dim=0)
+    v_opt = v_star_norm * float(alpha)
 
-        c = cos[position_id]  # [Dh/2]
-        s = sin[position_id]  # [Dh/2]
+    return v_opt.reshape(1, -1).to(dtype=out_dtype)
 
-        w_even = w_q[:, 0::2, :]  # [H, Dh/2, D]
-        w_odd = w_q[:, 1::2, :]   # [H, Dh/2, D]
-        w_even_rot = (c.view(1, -1, 1) * w_even) - (s.view(1, -1, 1) * w_odd)
-        w_odd_rot = (s.view(1, -1, 1) * w_even) + (c.view(1, -1, 1) * w_odd)
-        w_q_tilde = torch.empty_like(w_q)
-        w_q_tilde[:, 0::2, :] = w_even_rot
-        w_q_tilde[:, 1::2, :] = w_odd_rot
-    else:
-        w_q_tilde = w_q
 
-    m_listen = torch.zeros((d_model, d_model), device=device, dtype=dtype)
-    for h in range(num_heads):
-        w_h = w_q_tilde[h]          # [Dh, D]
-        k_h = k_listen[0, h]        # [T, Dh]
-        proj_h = w_h.transpose(0, 1) @ k_h.transpose(0, 1)  # [D, T]
-        cov_h = proj_h @ proj_h.transpose(0, 1)             # [D, D]
-        m_listen += cov_h
-
-    m_listen = m_listen + (float(lambda_reg) * torch.eye(d_model, device=device, dtype=dtype))
-    m_inv = torch.linalg.pinv(m_listen)
-    v = float(alpha) * (v_svm @ m_inv)
-    return v.reshape(1, -1).to(dtype=out_dtype)
 
 def calculate_steering_vector(root_dir, classifier_path, decay_span, alpha):
     """At interrupt_start, we calculate the steering vector with length alpha, 
@@ -533,6 +649,11 @@ def main() -> None:
         help="Generate/Update root-dir/*/steering_vector.json from input_timing.json and classifier.",
     )
     mode_group.add_argument(
+        "--generate-steering-vectors-optimized",
+        action="store_true",
+        help="Generate/Update root-dir/*/steering_vector.json using attention-optimized steering vectors.",
+    )
+    mode_group.add_argument(
         "--inference-with-steering",
         action="store_true",
         help="Run inference using steering vectors loaded from root-dir/*/steering_vector.json.",
@@ -590,6 +711,17 @@ def main() -> None:
         if args.classifier_path is None:
             parser.error("--generate-steering-vectors requires --classifier-path")
         calculate_steering_vector(
+            root_dir=args.root_dir,
+            classifier_path=args.classifier_path,
+            decay_span=args.decay_span,
+            alpha=args.alpha,
+        )
+        return
+
+    if args.generate_steering_vectors_optimized:
+        if args.classifier_path is None:
+            parser.error("--generate-steering-vectors-optimized requires --classifier-path")
+        compute_attention_mapped_steering_vector(
             root_dir=args.root_dir,
             classifier_path=args.classifier_path,
             decay_span=args.decay_span,
