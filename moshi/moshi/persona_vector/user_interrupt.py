@@ -6,7 +6,7 @@ import re
 import wave
 from pathlib import Path
 from typing import Any, Optional, cast
-
+from tqdm import tqdm
 import torch
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
@@ -346,7 +346,7 @@ def _compute_attention_mapped_steering_vector(
     v_stars = []
     
     print(f"[Math Engine] Computing optimal analytical solution over RoPE distance n=0 to {rope_context_len-1}...")
-    for n in range(rope_context_len):
+    for n in tqdm(range(rope_context_len)):
         first_terms = []
         second_terms = []
         
