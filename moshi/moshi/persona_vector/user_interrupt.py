@@ -180,6 +180,9 @@ def compute_attention_mapped_steering_vector(root_dir, classifier_path, decay_sp
         W_k_weights=w_k,
         alpha=float(alpha),
     ).reshape(-1)
+    # Print the cosine similarity between mapped_vector and mu_s - mu_l
+    cos_sim = F.cosine_similarity(mapped_vector, mu_s - mu_l, dim=0).item()
+    print("Cosine similarity between mapped_vector and (mu_s - mu_l):", cos_sim)
 
     input_paths = [p for p in root.glob("*/input.wav") if p.is_file()]
     input_paths.sort(key=lambda p: int(p.parent.name) if p.parent.name.isdigit() else p.parent.name)
