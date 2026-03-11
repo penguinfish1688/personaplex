@@ -369,9 +369,19 @@ def _compute_attention_mapped_steering_vector(
             
         first_term = torch.stack(first_terms).mean(dim=0)  # [d_model]
         second_term = torch.stack(second_terms).mean(dim=0)  # [d_model, d_model]
+
+        # 1. 求 M 的偽反矩陣
+        M_pinv = pseudo_inverse(second_term)
         
-        # Apply the mathematically optimal projection
-        v_stars.append(first_term @ pseudo_inverse(second_term))
+        # 2. 計算投射到 Listening 子空間的投影矩陣 (M @ M_pinv)
+        # 注意: 由於對稱性，P_listen 是一個投影矩陣
+        P_listen = second_term @ M_pinv
+        
+        # 3. 將 First Term 投影到 Null Space (安全區) 上
+        # 數學公式: v* = u - u @ P_listen
+        v_star_n = first_term - (first_term @ P_listen)
+        
+        v_stars.append(v_star_n)
         
     # Average over all RoPE distances to filter out high-frequency position noise
     v_star = torch.stack(v_stars).mean(dim=0)  # [d_model]
