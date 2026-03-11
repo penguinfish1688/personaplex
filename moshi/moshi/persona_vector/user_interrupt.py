@@ -250,34 +250,83 @@ def compute_attention_mapped_steering_vector(root_dir, classifier_path, decay_sp
 
     print(f"[user_interrupt] Done. Updated attention-mapped steering vectors for {updated} items at {root_dir}")
 
+def _average_over_rope(
+    w_q: torch.Tensor, 
+    head_dim: int, 
+    base: float = 10000.0, 
+    max_n: int = 1024
+) -> torch.Tensor:
+    """
+    Dynamically constructs the mathematical expectation of the RoPE matrix 
+    over a sequence length and applies it to W_Q.
+    
+    Args:
+        w_q: Query weights of shape [num_heads, head_dim, d_model].
+        head_dim: The dimension of each attention head (usually 128).
+        base: The base for the RoPE frequency exponential decay (default: 10000.0).
+        max_n: The context window size over which to compute the expectation.
+    
+    Returns:
+        w_q_avg_rot: The filtered Query weights of the same shape as w_q.
+    """
+    device = w_q.device
+    dtype = w_q.dtype
+    
+    # 1. Dynamically calculate RoPE frequencies (Inverse Frequencies)
+    # Calculate theta for even dimensions (0, 2, 4, ..., head_dim-2) in head_dim
+    # Formula: theta_i = 1.0 / (base ^ (2i / head_dim))
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
+    
+    # 2. Create a sequence of relative distances Delta_n (from 1 to max_n)
+    seq = torch.arange(1, max_n + 1, device=device, dtype=torch.float32)
+    
+    # 3. Compute the full rotation angle matrix [max_n, head_dim // 2]
+    # Outer product: angles[n, i] = seq[n] * inv_freq[i]
+    angles = torch.outer(seq, inv_freq)
+    
+    # 4. Take the mathematical expectation (mean) over all distances Delta_n
+    # High frequencies will average out to ~0, low frequencies will average to ~1
+    avg_cos = torch.cos(angles).mean(dim=0).to(dtype=dtype)  # [head_dim // 2]
+    avg_sin = torch.sin(angles).mean(dim=0).to(dtype=dtype)  # [head_dim // 2]
+    
+    # 5. Split W_Q into even and odd dimensions (Interleaved format)
+    w_even = w_q[:, 0::2, :]  # [H, Dh/2, D]
+    w_odd = w_q[:, 1::2, :]   # [H, Dh/2, D]
+    
+    # 6. Apply the averaged rotation matrix E[R] to the Query weights
+    w_even_rot = w_even * avg_cos.view(1, -1, 1) - w_odd * avg_sin.view(1, -1, 1)
+    w_odd_rot  = w_even * avg_sin.view(1, -1, 1) + w_odd * avg_cos.view(1, -1, 1)
+    
+    # 7. Reassemble back into the original interleaved shape
+    w_q_avg_rot = torch.empty_like(w_q)
+    w_q_avg_rot[:, 0::2, :] = w_even_rot
+    w_q_avg_rot[:, 1::2, :] = w_odd_rot
+    
+    return w_q_avg_rot
+
 
 def _compute_attention_mapped_steering_vector(
     V_svm: torch.Tensor,
     W_q_weights: torch.Tensor,
     W_k_weights: torch.Tensor,
-    alpha: float = 1.0
+    base: float = 10000.0,
+    max_context_len: int = 200,
+    alpha: float = 1.0,
 ) -> torch.Tensor:
     """
-    Computes the Attention-Mapped Persona Vector for global state steering.
-
-    What this calculates:
-    Based on the theoretical derivation: v* = (mu_s - mu_l) * W_K * W_Q^T
-    Instead of enforcing strict orthogonalization (which over-constrains the problem),
-    we take the contrastive persona vector (V_svm) from the hidden space and map it 
-    directly through the attention metric tensor (W_K * W_Q^T). This mathematically 
-    transforms the vector to maximize the attention on the target state (Speaking Mode).
+    Computes the Attention-Mapped Persona Vector for global state steering,
+    accounting for the long-range mathematical expectation of RoPE.
 
     Args:
-        V_svm: The initial, raw steering motive vector. 
-               NOTE: Expected to come from `calculate_steering_vector` 
-               (e.g., the SVM normal vector or mu_s - mu_l difference vector).
-        W_q_weights: The Query projection weights of the target attention layer.
-        W_k_weights: The Key projection weights of the target attention layer.
+        V_svm: The initial, raw steering motive vector (e.g., mu_s - mu_l).
+        W_q_weights: The Query projection weights.
+        W_k_weights: The Key projection weights.
+        base: The RoPE base parameter (default 10000.0, adjust if Llama3 uses 500k).
+        max_context_len: The expected length of conversation to average over.
         alpha: Scaling factor applied to the final mapped vector.
 
     Returns:
-        v_opt: The refined steering vector (v*), transformed to maximize attention 
-               on the target persona. Shape: [1, d_model].
+        v_opt: The refined steering vector (v*). Shape: [1, d_model].
     """
     # 1. Shape Verification & Normalization
     if W_q_weights.dim() == 2:
@@ -296,25 +345,30 @@ def _compute_attention_mapped_steering_vector(
     out_dtype = w_q.dtype
     dtype = torch.float32  # High precision for tensor accumulation
     
-    # V_svm represents our persona contrast vector (mu_s - mu_l)
     v_svm = V_svm.reshape(-1).to(device=device, dtype=dtype)
     w_q = w_q.to(device=device, dtype=dtype)
     w_k = w_k.to(device=device, dtype=dtype)
 
-    # 2. Transform the persona vector through the attention metric tensor (W_K * W_Q^T)
-    # Step A: Map into Key space -> k_vec = V_svm @ W_K^T (Shape: [H, Dh])
+    # 2. Dynamically generate E[R] and filter Query weights (Low-pass filter)
+    w_q_avg_rot = _average_over_rope(
+        w_q=w_q, 
+        head_dim=head_dim, 
+        base=base, 
+        max_n=max_context_len
+    )
+
+    # 3. Map through the filtered attention metric tensor
+    # Step A: Map V_svm into Key space -> Shape: [H, Dh]
     k_vec = torch.einsum('d, h m d -> h m', v_svm, w_k)
     
-    # Step B: Map from Key space back to residual stream via Query weights 
-    # v_star = k_vec @ W_Q (Shape: [D])
-    v_star = torch.einsum('h m, h m d -> d', k_vec, w_q)
+    # Step B: Map from Key space back to the residual stream using the FILTERED Query weights -> Shape: [D]
+    v_star = torch.einsum('h m, h m d -> d', k_vec, w_q_avg_rot)
 
-    # 3. Apply steering strength
+    # 4. Normalize and apply steering strength
     v_star_norm = F.normalize(v_star, dim=0)
     v_opt = v_star_norm * float(alpha)
 
     return v_opt.reshape(1, -1).to(dtype=out_dtype)
-
 
 
 def calculate_steering_vector(root_dir, classifier_path, decay_span, alpha):
