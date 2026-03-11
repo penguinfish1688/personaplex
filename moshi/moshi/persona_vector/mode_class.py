@@ -409,6 +409,20 @@ class HiddenModeClassifier:
         )
         print(f"[train] Listening: {n_listen}, Speaking: {n_speak}")
 
+        # Class-conditional feature means over the labeled token set.
+        pos_mask = y == 1
+        neg_mask = y == 0
+        ave_hidden_pos = (
+            X[pos_mask].mean(dim=0).detach().cpu().float()
+            if int(pos_mask.sum()) > 0
+            else torch.zeros(D, dtype=torch.float32)
+        )
+        ave_hidden_neg = (
+            X[neg_mask].mean(dim=0).detach().cpu().float()
+            if int(neg_mask.sum()) > 0
+            else torch.zeros(D, dtype=torch.float32)
+        )
+
         # Build model
         model = nn.Linear(D, 1)
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -480,6 +494,8 @@ class HiddenModeClassifier:
                 "state_dict": model.state_dict(),
                 "layer": layer,
                 "hidden_dim": D,
+                "ave_hidden_pos": ave_hidden_pos,
+                "ave_hidden_neg": ave_hidden_neg,
             },
             save_path,
         )

@@ -157,8 +157,25 @@ def compute_attention_mapped_steering_vector(root_dir, classifier_path, decay_sp
     print("W_q shape:", w_q.shape)
     print("W_k shape:", w_k.shape)
 
+    mu_s = ckpt.get("ave_hidden_pos")
+    mu_l = ckpt.get("ave_hidden_neg")
+    if mu_s is None or mu_l is None:
+        raise KeyError(
+            "Classifier checkpoint must contain 'ave_hidden_pos' and 'ave_hidden_neg'. "
+            "Please retrain or re-save the classifier with class-average hidden vectors."
+        )
+    mu_s = torch.as_tensor(mu_s, dtype=torch.float32).reshape(-1)
+    mu_l = torch.as_tensor(mu_l, dtype=torch.float32).reshape(-1)
+    if mu_s.numel() == 0 or mu_l.numel() == 0:
+        raise ValueError("'ave_hidden_pos'/'ave_hidden_neg' must be non-empty vectors")
+    if mu_s.numel() != embed_dim or mu_l.numel() != embed_dim:
+        raise ValueError(
+            f"Classifier mean vector dim mismatch: mu_s={mu_s.numel()}, mu_l={mu_l.numel()}, expected={embed_dim}"
+        )
+
     mapped_vector = _compute_attention_mapped_steering_vector(
-        V_svm=normal_vector,
+        mu_s=mu_s,
+        mu_l=mu_l,
         W_q_weights=w_q,
         W_k_weights=w_k,
         alpha=float(alpha),
@@ -250,83 +267,56 @@ def compute_attention_mapped_steering_vector(root_dir, classifier_path, decay_sp
 
     print(f"[user_interrupt] Done. Updated attention-mapped steering vectors for {updated} items at {root_dir}")
 
-def _average_over_rope(
-    w_q: torch.Tensor, 
-    head_dim: int, 
-    base: float = 10000.0, 
-    max_n: int = 1024
+
+def get_rope_matrix(
+    n: int,
+    head_dim: int,
+    base: float = 10000.0,
+    device: torch.device | str = "cpu",
 ) -> torch.Tensor:
     """
-    Dynamically constructs the mathematical expectation of the RoPE matrix 
-    over a sequence length and applies it to W_Q.
-    
-    Args:
-        w_q: Query weights of shape [num_heads, head_dim, d_model].
-        head_dim: The dimension of each attention head (usually 128).
-        base: The base for the RoPE frequency exponential decay (default: 10000.0).
-        max_n: The context window size over which to compute the expectation.
-    
-    Returns:
-        w_q_avg_rot: The filtered Query weights of the same shape as w_q.
+    Constructs the explicit dense [head_dim, head_dim] block-diagonal RoPE rotation matrix 
+    for a specific relative distance n. (Using Interleaved Format)
     """
-    device = w_q.device
-    dtype = w_q.dtype
-    
-    # 1. Dynamically calculate RoPE frequencies (Inverse Frequencies)
-    # Calculate theta for even dimensions (0, 2, 4, ..., head_dim-2) in head_dim
-    # Formula: theta_i = 1.0 / (base ^ (2i / head_dim))
     inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
+    theta = n * inv_freq  # [head_dim // 2]
     
-    # 2. Create a sequence of relative distances Delta_n (from 1 to max_n)
-    seq = torch.arange(1, max_n + 1, device=device, dtype=torch.float32)
+    cos_val = torch.cos(theta)
+    sin_val = torch.sin(theta)
     
-    # 3. Compute the full rotation angle matrix [max_n, head_dim // 2]
-    # Outer product: angles[n, i] = seq[n] * inv_freq[i]
-    angles = torch.outer(seq, inv_freq)
+    # Create an empty [head_dim, head_dim] matrix
+    R_n = torch.zeros((head_dim, head_dim), device=device, dtype=torch.float32)
     
-    # 4. Take the mathematical expectation (mean) over all distances Delta_n
-    # High frequencies will average out to ~0, low frequencies will average to ~1
-    avg_cos = torch.cos(angles).mean(dim=0).to(dtype=dtype)  # [head_dim // 2]
-    avg_sin = torch.sin(angles).mean(dim=0).to(dtype=dtype)  # [head_dim // 2]
+    # Fill the block diagonal (Interleaved format)
+    idx = torch.arange(0, head_dim, 2, device=device)
+    R_n[idx, idx] = cos_val
+    R_n[idx, idx + 1] = -sin_val
+    R_n[idx + 1, idx] = sin_val
+    R_n[idx + 1, idx + 1] = cos_val
     
-    # 5. Split W_Q into even and odd dimensions (Interleaved format)
-    w_even = w_q[:, 0::2, :]  # [H, Dh/2, D]
-    w_odd = w_q[:, 1::2, :]   # [H, Dh/2, D]
-    
-    # 6. Apply the averaged rotation matrix E[R] to the Query weights
-    w_even_rot = w_even * avg_cos.view(1, -1, 1) - w_odd * avg_sin.view(1, -1, 1)
-    w_odd_rot  = w_even * avg_sin.view(1, -1, 1) + w_odd * avg_cos.view(1, -1, 1)
-    
-    # 7. Reassemble back into the original interleaved shape
-    w_q_avg_rot = torch.empty_like(w_q)
-    w_q_avg_rot[:, 0::2, :] = w_even_rot
-    w_q_avg_rot[:, 1::2, :] = w_odd_rot
-    
-    return w_q_avg_rot
+    return R_n
+
+
+def pseudo_inverse(M: torch.Tensor, rcond: float = 1e-5) -> torch.Tensor:
+    """
+    Computes the Moore-Penrose pseudo-inverse of a matrix.
+    Handles rank-deficient high-dimensional matrices safely via SVD.
+    """
+    return torch.linalg.pinv(M, rcond=rcond)
 
 
 def _compute_attention_mapped_steering_vector(
-    V_svm: torch.Tensor,
+    mu_s: torch.Tensor,
+    mu_l: torch.Tensor,
     W_q_weights: torch.Tensor,
     W_k_weights: torch.Tensor,
-    base: float = 10000.0,
-    max_context_len: int = 200,
+    rope_base: float = 10000.0,
+    rope_context_len: int = 200,
     alpha: float = 1.0,
 ) -> torch.Tensor:
     """
-    Computes the Attention-Mapped Persona Vector for global state steering,
-    accounting for the long-range mathematical expectation of RoPE.
-
-    Args:
-        V_svm: The initial, raw steering motive vector (e.g., mu_s - mu_l).
-        W_q_weights: The Query projection weights.
-        W_k_weights: The Key projection weights.
-        base: The RoPE base parameter (default 10000.0, adjust if Llama3 uses 500k).
-        max_context_len: The expected length of conversation to average over.
-        alpha: Scaling factor applied to the final mapped vector.
-
-    Returns:
-        v_opt: The refined steering vector (v*). Shape: [1, d_model].
+    Computes the theoretically optimal steering vector using Rank-H mapping and pseudo-inverse,
+    averaged over RoPE context length to eliminate distance-induced high-frequency noise.
     """
     # 1. Shape Verification & Normalization
     if W_q_weights.dim() == 2:
@@ -345,29 +335,49 @@ def _compute_attention_mapped_steering_vector(
     out_dtype = w_q.dtype
     dtype = torch.float32  # High precision for tensor accumulation
     
-    v_svm = V_svm.reshape(-1).to(device=device, dtype=dtype)
+    mu_s = mu_s.reshape(-1).to(device=device, dtype=dtype)
+    mu_l = mu_l.reshape(-1).to(device=device, dtype=dtype)
     w_q = w_q.to(device=device, dtype=dtype)
     w_k = w_k.to(device=device, dtype=dtype)
 
-    # 2. Dynamically generate E[R] and filter Query weights (Low-pass filter)
-    w_q_avg_rot = _average_over_rope(
-        w_q=w_q, 
-        head_dim=head_dim, 
-        base=base, 
-        max_n=max_context_len
-    )
-
-    # 3. Map through the filtered attention metric tensor
-    # Step A: Map V_svm into Key space -> Shape: [H, Dh]
-    k_vec = torch.einsum('d, h m d -> h m', v_svm, w_k)
+    v_stars = []
     
-    # Step B: Map from Key space back to the residual stream using the FILTERED Query weights -> Shape: [D]
-    v_star = torch.einsum('h m, h m d -> d', k_vec, w_q_avg_rot)
-
-    # 4. Normalize and apply steering strength
+    print(f"[Math Engine] Computing optimal analytical solution over RoPE distance n=0 to {rope_context_len-1}...")
+    for n in range(rope_context_len):
+        first_terms = []
+        second_terms = []
+        
+        # We loop through heads to preserve Rank-H structure (avoiding Rank-1 Woodbury collapse)
+        for i in range(num_heads):
+            w_q_i = w_q[i]  # [head_dim, d_model]
+            w_k_i = w_k[i]  # [head_dim, d_model]
+            r_n = get_rope_matrix(n, head_dim, rope_base, device=device)
+            
+            # --- First Term: Maximizing interference on Speaking Mode ---
+            mu_s_w_k_i = torch.einsum('d, m d -> m', mu_s, w_k_i)
+            r_n_w_q_i = torch.einsum('n m, m d -> n d', r_n, w_q_i)
+            first_terms.append(mu_s_w_k_i @ r_n_w_q_i)
+            
+            # --- Second Term: Constraining (minimizing impact) on Listening Mode ---
+            w_q_i_r_n = torch.einsum('n d, n m -> m d', w_q_i, r_n)
+            w_k_i_mu_l = torch.einsum('m d, d -> m', w_k_i, mu_l)
+            # Outer product to build the covariance matrix
+            second_terms.append((w_k_i_mu_l @ w_q_i_r_n).unsqueeze(1) @ (w_k_i_mu_l @ w_q_i_r_n).unsqueeze(0))
+            
+        first_term = torch.stack(first_terms).mean(dim=0)  # [d_model]
+        second_term = torch.stack(second_terms).mean(dim=0)  # [d_model, d_model]
+        
+        # Apply the mathematically optimal projection
+        v_stars.append(first_term @ pseudo_inverse(second_term))
+        
+    # Average over all RoPE distances to filter out high-frequency position noise
+    v_star = torch.stack(v_stars).mean(dim=0)  # [d_model]
+    
+    # Normalize and scale by steering strength (alpha)
     v_star_norm = F.normalize(v_star, dim=0)
     v_opt = v_star_norm * float(alpha)
 
+    print("[Math Engine] Optimal vector computed successfully.")
     return v_opt.reshape(1, -1).to(dtype=out_dtype)
 
 
