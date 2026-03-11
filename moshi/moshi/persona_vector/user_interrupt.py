@@ -300,14 +300,6 @@ def get_rope_matrix(
     return R_n
 
 
-def pseudo_inverse(M: torch.Tensor, rcond: float = 1e-5) -> torch.Tensor:
-    """
-    Computes the Moore-Penrose pseudo-inverse of a matrix.
-    Handles rank-deficient high-dimensional matrices safely via SVD.
-    """
-    return torch.linalg.pinv(M, rcond=rcond)
-
-
 def _compute_attention_mapped_steering_vector(
     mu_s: torch.Tensor,
     mu_l: torch.Tensor,
@@ -318,8 +310,9 @@ def _compute_attention_mapped_steering_vector(
     alpha: float = 1.0,
 ) -> torch.Tensor:
     """
-    Computes the theoretically optimal steering vector using Rank-H mapping and pseudo-inverse,
-    averaged over RoPE context length to eliminate distance-induced high-frequency noise.
+    Computes the theoretically optimal static steering vector using Rank-H mapping and 
+    Tikhonov Regularization (Ridge Regression) over the expected RoPE context length.
+    This guarantees global optimality across all token distances without rank-explosion.
     """
     # 1. Shape Verification & Normalization
     if W_q_weights.dim() == 2:
@@ -343,54 +336,57 @@ def _compute_attention_mapped_steering_vector(
     w_q = w_q.to(device=device, dtype=dtype)
     w_k = w_k.to(device=device, dtype=dtype)
 
-    v_stars = []
+    all_first_terms = []
+    all_second_terms = []
     
-    print(f"[Math Engine] Computing optimal analytical solution over RoPE distance n=0 to {rope_context_len-1}...")
+    print(f"[Math Engine] Computing total covariance over RoPE distance n=0 to {rope_context_len-1}...")
+    
+    # 1. 收集所有距離的約束條件 (不在此做局部投影)
     for n in tqdm(range(rope_context_len)):
-        first_terms = []
-        second_terms = []
+        n_first_terms = []
+        n_second_terms = []
         
-        # We loop through heads to preserve Rank-H structure (avoiding Rank-1 Woodbury collapse)
+        # We loop through heads to preserve Rank-H structure
         for i in range(num_heads):
             w_q_i = w_q[i]  # [head_dim, d_model]
             w_k_i = w_k[i]  # [head_dim, d_model]
             r_n = get_rope_matrix(n, head_dim, rope_base, device=device)
             
-            # --- First Term: Maximizing interference on Speaking Mode ---
+            # --- First Term: Speaking Mode Direction (u) ---
             mu_s_w_k_i = torch.einsum('d, m d -> m', mu_s, w_k_i)
             r_n_w_q_i = torch.einsum('n m, m d -> n d', r_n, w_q_i)
-            first_terms.append(mu_s_w_k_i @ r_n_w_q_i)
+            n_first_terms.append(mu_s_w_k_i @ r_n_w_q_i)
             
-            # --- Second Term: Constraining (minimizing impact) on Listening Mode ---
+            # --- Second Term: Listening Mode Covariance (M) ---
             w_q_i_r_n = torch.einsum('n d, n m -> m d', w_q_i, r_n)
             w_k_i_mu_l = torch.einsum('m d, d -> m', w_k_i, mu_l)
             # Outer product to build the covariance matrix
-            second_terms.append((w_k_i_mu_l @ w_q_i_r_n).unsqueeze(1) @ (w_k_i_mu_l @ w_q_i_r_n).unsqueeze(0))
+            z_i = w_k_i_mu_l @ w_q_i_r_n
+            n_second_terms.append(z_i.unsqueeze(1) @ z_i.unsqueeze(0))
             
-        first_term = torch.stack(first_terms).mean(dim=0)  # [d_model]
-        second_term = torch.stack(second_terms).mean(dim=0)  # [d_model, d_model]
+        all_first_terms.append(torch.stack(n_first_terms).mean(dim=0))
+        all_second_terms.append(torch.stack(n_second_terms).mean(dim=0))
 
-        # 1. 求 M 的偽反矩陣
-        M_pinv = pseudo_inverse(second_term)
-        
-        # 2. 計算投射到 Listening 子空間的投影矩陣 (M @ M_pinv)
-        # 注意: 由於對稱性，P_listen 是一個投影矩陣
-        P_listen = second_term @ M_pinv
-        
-        # 3. 將 First Term 投影到 Null Space (安全區) 上
-        # 數學公式: v* = u - u @ P_listen
-        v_star_n = first_term - (first_term @ P_listen)
-        
-        v_stars.append(v_star_n)
-        
-    # Average over all RoPE distances to filter out high-frequency position noise
-    v_star = torch.stack(v_stars).mean(dim=0)  # [d_model]
+    # 2. 統整全局期望值 (Expected Target & Expected Covariance)
+    u_total = torch.stack(all_first_terms).mean(dim=0)  # [d_model]
+    M_total = torch.stack(all_second_terms).mean(dim=0) # [d_model, d_model]
+
+    print("[Math Engine] Solving via Tikhonov Regularized Inverse (Soft Projection)...")
     
-    # Normalize and scale by steering strength (alpha)
+    # 3. Tikhonov 正規化 (Ridge Regression)
+    # 動態計算阻尼係數 lambda，根據 M_total 的平均特徵值來設定
+    # 0.05 是一個穩健的經驗值，代表允許 5% 的柔性妥協來換取數值穩定與最佳壓制力
+    lambda_reg = 0.05 * (M_total.trace() / d_model)  
+    I = torch.eye(d_model, device=device, dtype=dtype)
+    
+    # 數學公式: v* = u_total @ (M_total + lambda * I)^-1
+    v_star = u_total @ torch.linalg.inv(M_total + lambda_reg * I)
+    
+    # 4. 正規化與強度控制 (Alpha scaling)
     v_star_norm = F.normalize(v_star, dim=0)
     v_opt = v_star_norm * float(alpha)
 
-    print("[Math Engine] Optimal vector computed successfully.")
+    print("[Math Engine] Optimal global static vector computed successfully.")
     return v_opt.reshape(1, -1).to(dtype=out_dtype)
 
 
