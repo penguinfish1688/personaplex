@@ -154,6 +154,9 @@ def compute_attention_mapped_steering_vector(root_dir, classifier_path, decay_sp
     w_q = w[:embed_dim, :].contiguous()
     w_k = w[embed_dim : 2 * embed_dim, :].contiguous()
 
+    print("W_q shape:", w_q.shape)
+    print("W_k shape:", w_k.shape)
+
     mapped_vector = _compute_attention_mapped_steering_vector(
         V_svm=normal_vector,
         W_q_weights=w_q,
