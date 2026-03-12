@@ -408,9 +408,205 @@ def compute_attention_mapped_steering_vector(
             alpha=alpha,
         )
 
-import torch
-import torch.nn.functional as F
-from tqdm import tqdm
+
+def compute_attention_mapped_steering_vector_average(
+    root_dir: str,
+    classifier_dir: str,
+    target_layer: int,
+    decay_span: int,
+    alpha: float,
+) -> None:
+    """Compute the average of attention-mapped steering vectors across ALL available layers
+    (each layer uses its own W_q/W_k from the Moshi model and class-mean vectors from its
+    own classifier checkpoint), then save that single averaged vector (with decay schedule)
+    under the key for ``target_layer`` in each root_dir/*/steering_vector.json.
+    """
+    token_rate_hz = 12.5
+    root = Path(root_dir)
+
+    if decay_span < 0:
+        raise ValueError(f"decay_span must be >= 0, got {decay_span}")
+    if not _is_valid_main_layer(target_layer):
+        raise ValueError(
+            f"target_layer {target_layer} must be in [{MAIN_LAYER_MIN}..{MAIN_LAYER_MAX}]"
+        )
+
+    discovered = _discover_classifier_paths(classifier_dir)
+    all_layers = sorted(discovered.keys())
+    print(
+        f"[user_interrupt] Computing averaged optimized vector across "
+        f"{len(all_layers)} layers: {all_layers}"
+    )
+
+    # Load Moshi model once; reuse for all layers.
+    moshi_weight = hf_hub_download(loaders.DEFAULT_REPO, loaders.MOSHI_NAME)
+    lm = loaders.get_moshi_lm(moshi_weight, device="cpu", cpu_offload=False)
+    lm.eval()
+    num_model_layers = len(lm.transformer.layers)
+
+    layer_vectors: list[torch.Tensor] = []
+    layer_mu_diffs: list[tuple[int, torch.Tensor]] = []  # (layer, mu_s - mu_l)
+
+    for layer in all_layers:
+        classifier_path = discovered[layer]
+        ckpt = torch.load(classifier_path, map_location="cpu", weights_only=False)
+        if not isinstance(ckpt, dict):
+            raise TypeError(
+                f"Expected checkpoint dict at {classifier_path}, got {type(ckpt).__name__}"
+            )
+
+        layer_idx = layer if layer >= 0 else num_model_layers + layer
+        if layer_idx < 0 or layer_idx >= num_model_layers:
+            print(f"[user_interrupt] Warning: skipping layer {layer} (out of model range)")
+            continue
+
+        # Extract W_q/W_k from Moshi at this layer.
+        attn_layer = lm.transformer.layers[layer_idx]
+        attn = cast(Any, attn_layer.self_attn)
+        w = attn.in_proj_weight.detach().cpu().float()
+        embed_dim = int(attn.embed_dim)
+        weights_per_step = int(getattr(attn, "weights_per_step", 0))
+
+        if weights_per_step > 0 and w.dim() == 2 and w.shape[0] == weights_per_step * 3 * embed_dim:
+            w = w.view(weights_per_step, 3 * embed_dim, embed_dim)[0]
+
+        if w.dim() != 2 or w.shape[0] != 3 * embed_dim or w.shape[1] != embed_dim:
+            raise RuntimeError(
+                f"Unexpected in_proj_weight shape at layer {layer}: {tuple(w.shape)}"
+            )
+
+        w_q = w[:embed_dim, :].contiguous()
+        w_k = w[embed_dim : 2 * embed_dim, :].contiguous()
+
+        # Load class-mean vectors with alias fallbacks.
+        mu_s = ckpt.get("ave_hidden_pos")
+        mu_l = ckpt.get("ave_hidden_neg")
+        if mu_s is None:
+            mu_s = ckpt.get("avg_hidden_pos")
+        if mu_l is None:
+            mu_l = ckpt.get("avg_hidden_neg")
+        if mu_s is None:
+            mu_s = ckpt.get("mean_hidden_pos")
+        if mu_l is None:
+            mu_l = ckpt.get("mean_hidden_neg")
+        if mu_s is None or mu_l is None:
+            ckpt_keys = sorted(str(k) for k in ckpt.keys())
+            raise KeyError(
+                f"Layer {layer} classifier missing class-average vectors. "
+                f"Found keys: {ckpt_keys}. Retrain with updated mode_class."
+            )
+        mu_s = torch.as_tensor(mu_s, dtype=torch.float32).reshape(-1)
+        mu_l = torch.as_tensor(mu_l, dtype=torch.float32).reshape(-1)
+        layer_mu_diffs.append((layer, mu_s - mu_l))
+
+        print(f"[user_interrupt] Computing mapped vector for layer {layer}...")
+        # Use alpha=1.0; normalize and scale after averaging across layers.
+        mapped = _compute_attention_mapped_steering_vector(
+            mu_s=mu_s,
+            mu_l=mu_l,
+            W_q_weights=w_q,
+            W_k_weights=w_k,
+            alpha=1.0,
+        ).reshape(-1)
+        layer_vectors.append(mapped)
+
+    if not layer_vectors:
+        raise RuntimeError("No layer vectors computed; cannot average.")
+
+    # Average the per-layer (unit-norm) vectors, renormalize, then apply alpha.
+    avg_vector = torch.stack(layer_vectors).mean(dim=0)
+    avg_vector = F.normalize(avg_vector, dim=0) * float(alpha)
+
+    print("[user_interrupt] Cosine similarity between avg_vector and each layer's (mu_s - mu_l):")
+    for layer_idx, mu_diff in layer_mu_diffs:
+        cos_sim = F.cosine_similarity(avg_vector.unsqueeze(0), mu_diff.unsqueeze(0)).item()
+        print(f"  layer {layer_idx:3d}: {cos_sim:.6f}")
+
+    layer_key = f"layer_{_internal_layer_to_json_layer(target_layer)}"
+    print(
+        f"[user_interrupt] Averaged {len(layer_vectors)} layer vectors; "
+        f"writing under key '{layer_key}'"
+    )
+
+    # Write decay schedule to each entry directory.
+    input_paths = [p for p in root.glob("*/input.wav") if p.is_file()]
+    input_paths.sort(
+        key=lambda p: int(p.parent.name) if p.parent.name.isdigit() else p.parent.name
+    )
+    if not input_paths:
+        raise FileNotFoundError(f"No files matched pattern {root_dir}/*/input.wav")
+
+    def _wav_duration_seconds(wav_path: Path) -> float:
+        try:
+            with wave.open(str(wav_path), "rb") as wf:
+                nframes = wf.getnframes()
+                framerate = wf.getframerate()
+            if framerate <= 0:
+                raise ValueError(f"Invalid sample rate in WAV: {wav_path}")
+            return float(nframes) / float(framerate)
+        except wave.Error:
+            import soundfile as sf
+            info = sf.info(str(wav_path))
+            if info.samplerate <= 0:
+                raise ValueError(f"Invalid sample rate in WAV: {wav_path}")
+            return float(info.frames) / float(info.samplerate)
+
+    updated = 0
+    for input_wav in input_paths:
+        entry_dir = input_wav.parent
+        timing_path = entry_dir / "input_timing.json"
+        if not timing_path.exists():
+            raise FileNotFoundError(f"Missing timing file: {timing_path}")
+
+        with timing_path.open("r", encoding="utf-8") as f:
+            timing_payload = json.load(f)
+        if not isinstance(timing_payload, dict):
+            raise ValueError(f"Expected dict in {timing_path}, got {type(timing_payload)}")
+        if "interrupt_start" not in timing_payload:
+            raise KeyError(f"Missing 'interrupt_start' in {timing_path}")
+
+        interrupt_start = float(timing_payload["interrupt_start"])
+        duration_s = _wav_duration_seconds(input_wav)
+        total_tokens = int(math.ceil(duration_s * token_rate_hz))
+        if total_tokens <= 0:
+            raise ValueError(
+                f"Computed non-positive token count for {input_wav}: duration={duration_s:.6f}s"
+            )
+
+        start_idx = max(0, min(int(interrupt_start * token_rate_hz), total_tokens - 1))
+
+        layer_payload: dict[str, Optional[list[float]]] = {
+            str(i): None for i in range(total_tokens)
+        }
+        layer_payload[str(start_idx)] = avg_vector.tolist()
+
+        for k in range(1, int(decay_span) + 1):
+            token_idx = start_idx + k
+            if token_idx >= total_tokens:
+                break
+            decay_factor = 1.0 - (float(k) / float(decay_span)) if decay_span > 0 else 0.0
+            if decay_factor <= 0.0:
+                layer_payload[str(token_idx)] = None
+                continue
+            layer_payload[str(token_idx)] = (avg_vector * float(decay_factor)).tolist()
+
+        steering_path = entry_dir / "steering_vector.json"
+        existing = _load_existing_steering_payload(steering_path)
+        existing[layer_key] = layer_payload
+        _atomic_write_json(steering_path, existing)
+
+        non_null = sum(1 for v in layer_payload.values() if v is not None)
+        print(
+            f"[user_interrupt] {entry_dir.name}: wrote averaged vector under {layer_key} "
+            f"(tokens={total_tokens}, start_idx={start_idx}, non_null={non_null})"
+        )
+        updated += 1
+
+    print(
+        f"[user_interrupt] Done. Wrote averaged optimized steering vectors for "
+        f"{updated} items at {root_dir}"
+    )
+
 
 def get_rope_matrix(
     n: int,
@@ -969,6 +1165,15 @@ def main() -> None:
         help="Generate/Update root-dir/*/steering_vector.json using attention-optimized steering vectors.",
     )
     mode_group.add_argument(
+        "--generate-steering-vectors-optimized-average",
+        action="store_true",
+        help=(
+            "Compute the average of attention-mapped vectors across ALL available layers in "
+            "--classifier-dir, then save the averaged vector under the --layer key in "
+            "root-dir/*/steering_vector.json. --layer must be a single integer."
+        ),
+    )
+    mode_group.add_argument(
         "--inference-with-steering",
         action="store_true",
         help="Run inference using steering vectors loaded from root-dir/*/steering_vector.json.",
@@ -1070,6 +1275,23 @@ def main() -> None:
             root_dir=args.root_dir,
             classifier_dir=args.classifier_dir,
             layers=[int(x) for x in args.layer],
+            decay_span=args.decay_span,
+            alpha=args.alpha,
+        )
+        return
+
+    if args.generate_steering_vectors_optimized_average:
+        if args.classifier_dir is None:
+            parser.error("--generate-steering-vectors-optimized-average requires --classifier-dir")
+        if len(args.layer) != 1:
+            parser.error(
+                "--generate-steering-vectors-optimized-average requires exactly one --layer value "
+                "specifying where to save the averaged vector"
+            )
+        compute_attention_mapped_steering_vector_average(
+            root_dir=args.root_dir,
+            classifier_dir=args.classifier_dir,
+            target_layer=int(args.layer[0]),
             decay_span=args.decay_span,
             alpha=args.alpha,
         )
