@@ -660,33 +660,27 @@ class StreamingTransformerLayer(StreamingModule[_LayerState]):
             if x.device.type != 'cuda':
                 stack.enter_context(no_compile())
 
-            steer_view = None
+            # When steer_for_attn_only is set, inject before SA then subtract before FFN.
+            # Net effect: attention sees steered input; its output propagates normally; FFN is unaffected.
+            steer_view: torch.Tensor | None = None
             if steer_for_attn_only is not None:
-                if steer_for_attn_only.dim() != 1:
-                    steer_for_attn_only = steer_for_attn_only.reshape(-1)
-                if int(steer_for_attn_only.numel()) != int(x.shape[-1]):
+                vec = steer_for_attn_only.reshape(-1)
+                if int(vec.numel()) != int(x.shape[-1]):
                     raise ValueError(
-                        f"steer_for_attn_only dim mismatch: got {int(steer_for_attn_only.numel())}, expected {int(x.shape[-1])}"
+                        f"steer_for_attn_only dim mismatch: got {int(vec.numel())}, expected {int(x.shape[-1])}"
                     )
-                steer_view_shape = (1,) * (x.dim() - 1) + (x.shape[-1],)
-                steer_view = steer_for_attn_only.to(device=x.device, dtype=x.dtype).view(steer_view_shape)
-                # Inject right before self-attention.
+                steer_view = vec.to(device=x.device, dtype=x.dtype).view((1,) * (x.dim() - 1) + (x.shape[-1],))
                 x = x + steer_view
 
+            sa_result = self._sa_block(x, return_attention_weights=return_attention_weights)
             if return_attention_weights:
-                sa_out = self._sa_block(x, return_attention_weights=True)
-                if not isinstance(sa_out, tuple):
-                    raise RuntimeError("Expected (x, attn_weights) tuple from _sa_block")
-                x, attn_weights = sa_out
+                assert isinstance(sa_result, tuple), "Expected (x, attn_weights) tuple from _sa_block"
+                x, attn_weights = sa_result
             else:
-                sa_out = self._sa_block(x)
-                if isinstance(sa_out, tuple):
-                    x = sa_out[0]
-                else:
-                    x = sa_out
+                assert isinstance(sa_result, torch.Tensor), "Expected Tensor from _sa_block"
+                x = sa_result
 
             if steer_view is not None:
-                # Remove the injected steering before FFN so only attention path is affected.
                 x = x - steer_view
 
             x = self._ff_block(x)
@@ -849,24 +843,25 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
         attention_weights = [] if return_attention_weights else None
         
         for layer_idx, layer in enumerate(self.layers):
+            # Resolve which steering vector (if any) applies to this layer.
             layer_steer: torch.Tensor | None = None
             if do_single_steer and layer_idx == steering_layer:
-                assert steering_vector is not None
                 layer_steer = steering_vector
-            if do_multi_steer:
+            elif do_multi_steer:
                 assert steering_vectors_by_layer is not None
-                multi_layer_steer = steering_vectors_by_layer.get(layer_idx)
-                if multi_layer_steer is not None:
-                    layer_steer = multi_layer_steer
+                layer_steer = steering_vectors_by_layer.get(layer_idx)
 
+            # Full-residual mode: add steering directly to the stream before the layer.
+            # Attn-only mode: delegate injection/subtraction to the layer itself.
             if layer_steer is not None and not steer_attn_only:
                 x = x + layer_steer.view(steering_view_shape)
 
+            layer_steer_arg = layer_steer if steer_attn_only else None
             if return_attention_weights:
                 x, layer_attn = layer(
                     x,
                     return_attention_weights=True,
-                    steer_for_attn_only=layer_steer if steer_attn_only else None,
+                    steer_for_attn_only=layer_steer_arg,
                     *args,
                     **kwargs,
                 )
@@ -875,7 +870,7 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
             else:
                 x = layer(
                     x,
-                    steer_for_attn_only=layer_steer if steer_attn_only else None,
+                    steer_for_attn_only=layer_steer_arg,
                     *args,
                     **kwargs,
                 )
