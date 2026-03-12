@@ -340,7 +340,7 @@ def _compute_attention_mapped_steering_vector(
     w_k = w_k.to(device=device, dtype=dtype)
 
     # The contrastive target vector in the residual stream
-    v_svm = mu_s - mu_l
+    v_svm = mu_s - 0.2 * mu_l
     
     all_grads = []
     
