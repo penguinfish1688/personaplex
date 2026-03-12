@@ -877,7 +877,8 @@ def inference_with_steering(
         root_dir,
         inject_layers,
     offset=0,
-        save_hidden=False
+        save_hidden=False,
+        steer_attn_only: bool = False,
     ) -> None:
     """
     In the root_dir/*/steering_vector.json, we have the steering vectors calculated from calculate_steering_vector() for each input.wav file.
@@ -998,7 +999,8 @@ def inference_with_steering(
 
     print(
         f"[user_interrupt] Processing {len(input_paths)} files from {root_dir} "
-        f"with steering layers {requested_layers} and offset {offset}"
+        f"with steering layers {requested_layers}, offset {offset}, "
+        f"steer_attn_only={steer_attn_only}"
     )
 
     for path in input_paths:
@@ -1067,6 +1069,7 @@ def inference_with_steering(
                 save_hidden_payload=bool(save_hidden),
                 output_hiddens=[output_hidden] if save_hidden else None,
                 steering_vectors_by_layer=steering_vectors_by_layer,
+                steer_attn_only=bool(steer_attn_only),
             )
 
     if save_hidden:
@@ -1239,6 +1242,14 @@ def main() -> None:
         help="Shift steering injection target from token i to i+offset (can be negative).",
     )
     parser.add_argument(
+        "--steer-attn-only",
+        action="store_true",
+        help=(
+            "If set with steering inference, inject steering right before self-attention and "
+            "subtract it before FFN so only attention path is affected."
+        ),
+    )
+    parser.add_argument(
         "--save-hidden",
         action="store_true",
         help="If set, save hidden payload to root-dir/*/output_hidden.pt (works for both inference modes).",
@@ -1305,6 +1316,7 @@ def main() -> None:
             inject_layers=[int(x) for x in args.inject_layer],
             offset=args.offset,
             save_hidden=args.save_hidden,
+            steer_attn_only=bool(args.steer_attn_only),
         )
         return
 

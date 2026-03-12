@@ -757,6 +757,7 @@ def run_batch_inference(
     steering_vectors: Optional[list[Optional[torch.Tensor]]] = None,
     steering_layer: Optional[int] = None,
     steering_vectors_by_layer: Optional[dict[int, list[Optional[torch.Tensor]]]] = None,
+    steer_attn_only: bool = False,
     payload_target_layer: Optional[int] = None,
 ) -> Optional[List[List[HiddenLayerOutputs]]]:
     """Run batch offline inference using multiple input WAVs and text prompts.
@@ -979,6 +980,7 @@ def run_batch_inference(
                         steering_vector=step_steering_vector,
                         steering_layer=steering_layer,
                         steering_vectors_by_layer=step_steering_vectors_by_layer,
+                        steer_attn_only=steer_attn_only,
                     )
                     tokens, hidden_layers = result  # type: ignore
                     assert isinstance(hidden_layers, HiddenLayerOutputs), "Hidden layers were requested but not captured."
@@ -988,6 +990,7 @@ def run_batch_inference(
                         steering_vector=step_steering_vector,
                         steering_layer=steering_layer,
                         steering_vectors_by_layer=step_steering_vectors_by_layer,
+                        steer_attn_only=steer_attn_only,
                     )
                     hidden_layers = None
                 

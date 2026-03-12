@@ -650,14 +650,45 @@ class StreamingTransformerLayer(StreamingModule[_LayerState]):
         update = self.self_attn(x, x, x)
         return x_orig + self.layer_scale_1(update)
 
-    def forward(self, x: torch.Tensor, return_attention_weights: bool = False):
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_attention_weights: bool = False,
+        steer_for_attn_only: torch.Tensor | None = None,
+    ):
         with ExitStack() as stack:
             if x.device.type != 'cuda':
                 stack.enter_context(no_compile())
+
+            steer_view = None
+            if steer_for_attn_only is not None:
+                if steer_for_attn_only.dim() != 1:
+                    steer_for_attn_only = steer_for_attn_only.reshape(-1)
+                if int(steer_for_attn_only.numel()) != int(x.shape[-1]):
+                    raise ValueError(
+                        f"steer_for_attn_only dim mismatch: got {int(steer_for_attn_only.numel())}, expected {int(x.shape[-1])}"
+                    )
+                steer_view_shape = (1,) * (x.dim() - 1) + (x.shape[-1],)
+                steer_view = steer_for_attn_only.to(device=x.device, dtype=x.dtype).view(steer_view_shape)
+                # Inject right before self-attention.
+                x = x + steer_view
+
             if return_attention_weights:
-                x, attn_weights = self._sa_block(x, return_attention_weights=True)
+                sa_out = self._sa_block(x, return_attention_weights=True)
+                if not isinstance(sa_out, tuple):
+                    raise RuntimeError("Expected (x, attn_weights) tuple from _sa_block")
+                x, attn_weights = sa_out
             else:
-                x = self._sa_block(x)
+                sa_out = self._sa_block(x)
+                if isinstance(sa_out, tuple):
+                    x = sa_out[0]
+                else:
+                    x = sa_out
+
+            if steer_view is not None:
+                # Remove the injected steering before FFN so only attention path is affected.
+                x = x - steer_view
+
             x = self._ff_block(x)
             state = self._streaming_state
             if state:
@@ -754,6 +785,7 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
         steering_vector: torch.Tensor | None = None,
         steering_layer: int | None = None,
         steering_vectors_by_layer: dict[int, torch.Tensor] | None = None,
+        steer_attn_only: bool = False,
         *args,
         **kwargs,
     ):
@@ -817,20 +849,36 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
         attention_weights = [] if return_attention_weights else None
         
         for layer_idx, layer in enumerate(self.layers):
+            layer_steer: torch.Tensor | None = None
             if do_single_steer and layer_idx == steering_layer:
                 assert steering_vector is not None
-                x = x + steering_vector.view(steering_view_shape)
+                layer_steer = steering_vector
             if do_multi_steer:
                 assert steering_vectors_by_layer is not None
-                layer_steer = steering_vectors_by_layer.get(layer_idx)
-                if layer_steer is not None:
-                    x = x + layer_steer.view(steering_view_shape)
+                multi_layer_steer = steering_vectors_by_layer.get(layer_idx)
+                if multi_layer_steer is not None:
+                    layer_steer = multi_layer_steer
+
+            if layer_steer is not None and not steer_attn_only:
+                x = x + layer_steer.view(steering_view_shape)
+
             if return_attention_weights:
-                x, layer_attn = layer(x, return_attention_weights=True, *args, **kwargs)
+                x, layer_attn = layer(
+                    x,
+                    return_attention_weights=True,
+                    steer_for_attn_only=layer_steer if steer_attn_only else None,
+                    *args,
+                    **kwargs,
+                )
                 assert attention_weights is not None
                 attention_weights.append(layer_attn.clone() if isinstance(layer_attn, torch.Tensor) else layer_attn)
             else:
-                x = layer(x, *args, **kwargs)
+                x = layer(
+                    x,
+                    steer_for_attn_only=layer_steer if steer_attn_only else None,
+                    *args,
+                    **kwargs,
+                )
             if return_hidden_layers:
                 assert hidden_layers is not None
                 hidden_layers.append(x.clone())

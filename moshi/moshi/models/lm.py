@@ -467,6 +467,7 @@ class LMModel(StreamingContainer):
         steering_vector: torch.Tensor | None = None,
         steering_layer: int | None = None,
         steering_vectors_by_layer: dict[int, torch.Tensor] | None = None,
+        steer_attn_only: bool = False,
     ):
         return self.forward_embeddings(
             self.embed_codes(sequence),
@@ -475,6 +476,7 @@ class LMModel(StreamingContainer):
             steering_vector=steering_vector,
             steering_layer=steering_layer,
             steering_vectors_by_layer=steering_vectors_by_layer,
+            steer_attn_only=steer_attn_only,
         )
     
     def forward_embeddings(
@@ -485,6 +487,7 @@ class LMModel(StreamingContainer):
         steering_vector: torch.Tensor | None = None,
         steering_layer: int | None = None,
         steering_vectors_by_layer: dict[int, torch.Tensor] | None = None,
+        steer_attn_only: bool = False,
     ) -> ForwardCodesOutput:
         # print("EMBED:", input[0, 0, :10].float().cpu().tolist()) # DEBUG
         if return_hidden_layers and return_attention_weights:
@@ -495,6 +498,7 @@ class LMModel(StreamingContainer):
                 steering_vector=steering_vector,
                 steering_layer=steering_layer,
                 steering_vectors_by_layer=steering_vectors_by_layer,
+                steer_attn_only=steer_attn_only,
             )
         elif return_hidden_layers:
             transformer_out, hidden_layers = self.transformer(
@@ -503,6 +507,7 @@ class LMModel(StreamingContainer):
                 steering_vector=steering_vector,
                 steering_layer=steering_layer,
                 steering_vectors_by_layer=steering_vectors_by_layer,
+                steer_attn_only=steer_attn_only,
             )
             attention_weights = None
         elif return_attention_weights:
@@ -512,6 +517,7 @@ class LMModel(StreamingContainer):
                 steering_vector=steering_vector,
                 steering_layer=steering_layer,
                 steering_vectors_by_layer=steering_vectors_by_layer,
+                steer_attn_only=steer_attn_only,
             )
             hidden_layers = None
         else:
@@ -520,6 +526,7 @@ class LMModel(StreamingContainer):
                 steering_vector=steering_vector,
                 steering_layer=steering_layer,
                 steering_vectors_by_layer=steering_vectors_by_layer,
+                steer_attn_only=steer_attn_only,
             )
             hidden_layers = None
             attention_weights = None
@@ -929,7 +936,8 @@ class LMGen(StreamingModule[_LMGenState]):
                return_embeddings: bool=False, return_hidden_layers: bool=False, return_attention_weights: bool=False,
                check_silence_token: bool=False, steering_vector: torch.Tensor | None = None,
                steering_layer: int | None = None,
-               steering_vectors_by_layer: dict[int, torch.Tensor] | None = None) \
+             steering_vectors_by_layer: dict[int, torch.Tensor] | None = None,
+             steer_attn_only: bool = False) \
         -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]] | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]] | tuple[torch.Tensor, HiddenLayerOutputs] | tuple[torch.Tensor, HiddenLayerOutputs, bool]:
         """Run a single step of the language model.
         
@@ -998,6 +1006,7 @@ class LMGen(StreamingModule[_LMGenState]):
                 steering_vector=steering_vector,
                 steering_layer=steering_layer,
                 steering_vectors_by_layer=steering_vectors_by_layer,
+                steer_attn_only=steer_attn_only,
             )
             transformer_out = forward_out.transformer_out
             text_logits = forward_out.text_logits
@@ -1010,6 +1019,7 @@ class LMGen(StreamingModule[_LMGenState]):
                     steering_vector=steering_vector,
                     steering_layer=steering_layer,
                     steering_vectors_by_layer=steering_vectors_by_layer,
+                    steer_attn_only=steer_attn_only,
                 )
                 transformer_out = forward_out.transformer_out
                 text_logits = forward_out.text_logits
@@ -1017,6 +1027,7 @@ class LMGen(StreamingModule[_LMGenState]):
                 forward_out = lm_model.forward_codes(
                     input_,
                     steering_vectors_by_layer=steering_vectors_by_layer,
+                    steer_attn_only=steer_attn_only,
                 )
                 transformer_out = forward_out.transformer_out
                 text_logits = forward_out.text_logits
