@@ -756,6 +756,7 @@ def run_batch_inference(
     output_hiddens: Optional[List[str]] = None,
     steering_vectors: Optional[list[Optional[torch.Tensor]]] = None,
     steering_layer: Optional[int] = None,
+    steering_vectors_by_layer: Optional[dict[int, list[Optional[torch.Tensor]]]] = None,
     payload_target_layer: Optional[int] = None,
 ) -> Optional[List[List[HiddenLayerOutputs]]]:
     """Run batch offline inference using multiple input WAVs and text prompts.
@@ -786,7 +787,11 @@ def run_batch_inference(
         log("warning", "Empty input lists provided")
         return [] if return_hidden_layers else None
 
-    if steering_vectors is not None and steering_layer is None:
+    has_single_steer = steering_vectors is not None
+    has_multi_steer = steering_vectors_by_layer is not None and len(steering_vectors_by_layer) > 0
+    if has_single_steer and has_multi_steer:
+        raise ValueError("Provide either steering_vectors/steering_layer or steering_vectors_by_layer, not both")
+    if has_single_steer and steering_layer is None:
         raise ValueError("steering_vectors provided but steering_layer is None")
     
     log("info", f"Starting batch inference with {len(input_wavs)} instances")
@@ -856,6 +861,9 @@ def run_batch_inference(
         target_layer_idx = int(payload_target_layer)
     elif steering_layer is not None:
         target_layer_idx = int(steering_layer)
+    elif has_multi_steer:
+        assert steering_vectors_by_layer is not None
+        target_layer_idx = int(sorted(steering_vectors_by_layer.keys())[0])
     else:
         target_layer_idx = len(lm.transformer.layers) - 1
     if target_layer_idx < 0 or target_layer_idx >= len(lm.transformer.layers):
@@ -890,7 +898,7 @@ def run_batch_inference(
         total_target_samples = user_audio.shape[-1]
 
         # Token-rate sanity check for steering vectors.
-        if steering_vectors is not None:
+        if has_single_steer:
             expected_tokens = int(round((total_target_samples / float(sample_rate)) * float(mimi.frame_rate)))
             actual_tokens = len(steering_vectors)
             if abs(actual_tokens - expected_tokens) > 2:
@@ -907,6 +915,24 @@ def run_batch_inference(
                     raise AssertionError(
                         f"steering_vectors[{idx}] dim mismatch: got {int(sv.numel())}, expected {hidden_dim}"
                     )
+        elif has_multi_steer:
+            assert steering_vectors_by_layer is not None
+            expected_tokens = int(round((total_target_samples / float(sample_rate)) * float(mimi.frame_rate)))
+            hidden_dim = int(lm.dim)
+            for layer_idx, layer_vectors in steering_vectors_by_layer.items():
+                actual_tokens = len(layer_vectors)
+                if abs(actual_tokens - expected_tokens) > 2:
+                    raise AssertionError(
+                        f"steering_vectors_by_layer[{layer_idx}] length mismatch: len={actual_tokens}, expected~{expected_tokens} "
+                        f"(audio_seconds={total_target_samples / float(sample_rate):.3f}, frame_rate={float(mimi.frame_rate):.3f})"
+                    )
+                for idx, sv in enumerate(layer_vectors):
+                    if sv is None:
+                        continue
+                    if int(sv.numel()) != hidden_dim:
+                        raise AssertionError(
+                            f"steering_vectors_by_layer[{layer_idx}][{idx}] dim mismatch: got {int(sv.numel())}, expected {hidden_dim}"
+                        )
         
         hidden_layers_list: List[HiddenLayerOutputs] = []
         text_hidden_layers_per_token: list[torch.Tensor] = []
@@ -924,12 +950,25 @@ def run_batch_inference(
             for c in range(steps):
                 step_in = user_encoded[:, :, c : c + 1]
                 step_steering_vector: Optional[torch.Tensor] = None
-                if steering_vectors is not None:
+                step_steering_vectors_by_layer: Optional[dict[int, torch.Tensor]] = None
+                if has_single_steer:
                     if steer_idx >= len(steering_vectors):
                         raise AssertionError(
                             f"Steering index out of range at step {steer_idx} with len={len(steering_vectors)}"
                         )
                     step_steering_vector = steering_vectors[steer_idx]
+                elif has_multi_steer:
+                    assert steering_vectors_by_layer is not None
+                    step_steering_vectors_by_layer = {}
+                    for layer_idx, layer_vectors in steering_vectors_by_layer.items():
+                        if steer_idx >= len(layer_vectors):
+                            raise AssertionError(
+                                f"Steering index out of range at step {steer_idx} with len={len(layer_vectors)} for layer {layer_idx}"
+                            )
+                        layer_step_vec = layer_vectors[steer_idx]
+                        if layer_step_vec is not None:
+                            step_steering_vectors_by_layer[int(layer_idx)] = layer_step_vec
+                if has_single_steer or has_multi_steer:
                     steer_idx += 1
                 
                 if capture_hidden:
@@ -939,6 +978,7 @@ def run_batch_inference(
                         return_attention_weights=save_hidden_payload,
                         steering_vector=step_steering_vector,
                         steering_layer=steering_layer,
+                        steering_vectors_by_layer=step_steering_vectors_by_layer,
                     )
                     tokens, hidden_layers = result  # type: ignore
                     assert isinstance(hidden_layers, HiddenLayerOutputs), "Hidden layers were requested but not captured."
@@ -947,6 +987,7 @@ def run_batch_inference(
                         step_in,
                         steering_vector=step_steering_vector,
                         steering_layer=steering_layer,
+                        steering_vectors_by_layer=step_steering_vectors_by_layer,
                     )
                     hidden_layers = None
                 
@@ -976,7 +1017,7 @@ def run_batch_inference(
                     text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
                     generated_text_tokens.append(text_token_map[text_token])
 
-        if steering_vectors is not None:
+        if has_single_steer:
             # `lm_iterate_audio(..., pad=True)` can introduce a small boundary mismatch,
             # so we allow a tiny slack instead of requiring exact equality.
             unused = len(steering_vectors) - steer_idx
@@ -985,6 +1026,15 @@ def run_batch_inference(
                     f"Steering token consumption mismatch: used={steer_idx}, provided={len(steering_vectors)}, "
                     f"unused={unused}"
                 )
+        elif has_multi_steer:
+            assert steering_vectors_by_layer is not None
+            for layer_idx, layer_vectors in steering_vectors_by_layer.items():
+                unused = len(layer_vectors) - steer_idx
+                if abs(unused) > 2:
+                    raise AssertionError(
+                        f"Steering token consumption mismatch for layer {layer_idx}: used={steer_idx}, provided={len(layer_vectors)}, "
+                        f"unused={unused}"
+                    )
 
         if len(generated_frames) == 0:
             log("error", f"No audio frames were generated for instance {i+1}. Check input file: {input_wav}")

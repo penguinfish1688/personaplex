@@ -16,6 +16,48 @@ from moshi.models import loaders
 from moshi.persona_vector.mode_class import extract_normal_vector
 
 
+def _discover_classifier_paths(classifier_dir: str) -> dict[int, str]:
+    base = Path(classifier_dir)
+    if not base.is_dir():
+        raise FileNotFoundError(f"Classifier directory not found: {classifier_dir}")
+
+    discovered: dict[int, str] = {}
+    for p in base.glob("hidden_mode_classifier_layer_*.pt"):
+        m = re.search(r"hidden_mode_classifier_layer_(-?\d+)\.pt$", p.name)
+        if m is None:
+            continue
+        discovered[int(m.group(1))] = str(p)
+    if not discovered:
+        raise FileNotFoundError(
+            f"No classifier checkpoints found in {classifier_dir}. Expected files like hidden_mode_classifier_layer_<layer>.pt"
+        )
+    return discovered
+
+
+def _resolve_requested_layers(
+    requested_layers: list[int],
+    available_layers: list[int],
+) -> list[int]:
+    if not available_layers:
+        raise ValueError("No available layers to resolve")
+    if -1 in requested_layers:
+        return sorted(set(int(x) for x in available_layers))
+    resolved = [int(x) for x in requested_layers]
+    missing = [x for x in resolved if x not in set(available_layers)]
+    if missing:
+        raise FileNotFoundError(
+            f"Requested layers not found: {missing}. Available layers: {sorted(set(available_layers))}"
+        )
+    # Preserve user ordering but drop duplicates.
+    unique: list[int] = []
+    seen: set[int] = set()
+    for x in resolved:
+        if x not in seen:
+            unique.append(x)
+            seen.add(x)
+    return unique
+
+
 def inference(
     root_dir: str,
     save_hidden: bool = False,
@@ -90,7 +132,7 @@ def inference(
     else:
         print(f"[user_interrupt] Done. Wrote {len(output_wavs)} output.wav files.")
 
-def compute_attention_mapped_steering_vector(root_dir, classifier_path, decay_span, alpha):
+def _compute_attention_mapped_steering_vector_single_layer(root_dir, classifier_path, decay_span, alpha):
     """Just like calculate_steering_vector()
     but instead of just using the normal vector from the SVM classifier
     use _compute_attention_mapped_steering_vector() to optimize of the 
@@ -270,6 +312,24 @@ def compute_attention_mapped_steering_vector(root_dir, classifier_path, decay_sp
 
     print(f"[user_interrupt] Done. Updated attention-mapped steering vectors for {updated} items at {root_dir}")
 
+
+def compute_attention_mapped_steering_vector(
+    root_dir: str,
+    classifier_dir: str,
+    layers: list[int],
+    decay_span: int,
+    alpha: float,
+) -> None:
+    discovered = _discover_classifier_paths(classifier_dir)
+    resolved_layers = _resolve_requested_layers(layers, list(discovered.keys()))
+    for layer in resolved_layers:
+        _compute_attention_mapped_steering_vector_single_layer(
+            root_dir=root_dir,
+            classifier_path=discovered[layer],
+            decay_span=decay_span,
+            alpha=alpha,
+        )
+
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -340,7 +400,7 @@ def _compute_attention_mapped_steering_vector(
     w_k = w_k.to(device=device, dtype=dtype)
 
     # The contrastive target vector in the residual stream
-    v_svm = mu_s - 0.2 * mu_l
+    v_svm = mu_s - mu_l
     
     all_grads = []
     
@@ -381,7 +441,7 @@ def _compute_attention_mapped_steering_vector(
     return v_opt.reshape(1, -1).to(dtype=out_dtype)
 
 
-def calculate_steering_vector(root_dir, classifier_path, decay_span, alpha):
+def _calculate_steering_vector_single_layer(root_dir, classifier_path, decay_span, alpha):
     """At interrupt_start, we calculate the steering vector with length alpha, 
     and linearly decay to 0 over decay_span tokens.
 
@@ -527,9 +587,27 @@ def calculate_steering_vector(root_dir, classifier_path, decay_span, alpha):
 
     print(f"[user_interrupt] Done. Updated steering vectors for {updated} items at {root_dir}")
 
+
+def calculate_steering_vector(
+    root_dir: str,
+    classifier_dir: str,
+    layers: list[int],
+    decay_span: int,
+    alpha: float,
+) -> None:
+    discovered = _discover_classifier_paths(classifier_dir)
+    resolved_layers = _resolve_requested_layers(layers, list(discovered.keys()))
+    for layer in resolved_layers:
+        _calculate_steering_vector_single_layer(
+            root_dir=root_dir,
+            classifier_path=discovered[layer],
+            decay_span=decay_span,
+            alpha=alpha,
+        )
+
 def inference_with_steering(
-        root_dir, 
-        inject_layer,
+        root_dir,
+        inject_layers,
     offset=0,
         save_hidden=False
     ) -> None:
@@ -564,61 +642,85 @@ def inference_with_steering(
         "Never agree with incorrect information just to be polite."
     )
 
-    def _extract_layer_vector(raw: dict, layer: int, offset: int = 0) -> list[Optional[torch.Tensor]]:
-        candidate_keys = [
-            f"layer_{layer}",
-            f"layer{layer}",
-            str(layer),
-            layer,
-        ]
-        layer_payload = None
-        for key in candidate_keys:
-            if key in raw:
-                layer_payload = raw[key]
-                break
-        if layer_payload is None:
-            available = ", ".join([str(k) for k in raw.keys()])
-            raise KeyError(
-                f"Layer {layer} not found in steering file. Available keys: {available}"
-            )
-        if not isinstance(layer_payload, dict):
-            raise ValueError(
-                f"Expected dict for layer payload at layer {layer}, got {type(layer_payload)}"
-            )
+    requested_layers = [int(x) for x in inject_layers]
 
-        # Input JSON uses 0-based token indices. Shift to i+offset at inference time.
-        token_entries: dict[int, Optional[torch.Tensor]] = {}
-        max_idx = 0
-        for token_key, token_vec in layer_payload.items():
+    def _extract_layer_vectors(
+        raw: dict,
+        layers: list[int],
+        offset: int = 0,
+    ) -> dict[int, list[Optional[torch.Tensor]]]:
+        if not isinstance(raw, dict):
+            raise ValueError(f"Expected dict steering payload, got {type(raw)}")
+
+        available_map: dict[int, object] = {}
+        for k, v in raw.items():
+            if isinstance(k, str):
+                m = re.fullmatch(r"layer_(-?\d+)", k)
+                if m is not None:
+                    available_map[int(m.group(1))] = v
+                    continue
             try:
-                token_idx = int(token_key)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"Token index must be an integer-like key, got '{token_key}'") from exc
-            if token_idx < 0:
-                raise ValueError(f"Token indices must be >= 0, got {token_idx}")
-            shifted_idx = token_idx + int(offset)
-            if shifted_idx < 0:
-                # Negative target index cannot be injected; clip by dropping.
+                available_map[int(k)] = v
+            except (TypeError, ValueError):
                 continue
-            if token_vec is None:
-                token_entries[shifted_idx] = None
-            else:
-                token_entries[shifted_idx] = torch.as_tensor(token_vec, dtype=torch.float32).reshape(-1)
-            max_idx = max(max_idx, shifted_idx)
 
-        if len(token_entries) == 0:
-            raise ValueError(
-                f"Layer payload has no usable steering vectors after applying offset={offset}"
+        if -1 in layers:
+            resolved = sorted(available_map.keys())
+        else:
+            resolved = [int(x) for x in layers]
+
+        if not resolved:
+            raise KeyError("No layer information found in steering_vector.json")
+
+        missing = [x for x in resolved if x not in available_map]
+        if missing:
+            raise KeyError(
+                f"Requested layer(s) {missing} missing in steering_vector.json. "
+                f"Available layers: {sorted(available_map.keys())}"
             )
 
-        vectors: list[Optional[torch.Tensor]] = [None] * (max_idx + 1)
-        for token_idx, token_vec in token_entries.items():
-            vectors[token_idx] = token_vec
-        return vectors
+        out: dict[int, list[Optional[torch.Tensor]]] = {}
+        for layer in resolved:
+            layer_payload = available_map[layer]
+            if not isinstance(layer_payload, dict):
+                raise ValueError(
+                    f"Expected dict for layer payload at layer {layer}, got {type(layer_payload)}"
+                )
+
+            token_entries: dict[int, Optional[torch.Tensor]] = {}
+            max_idx = 0
+            for token_key, token_vec in layer_payload.items():
+                try:
+                    token_idx = int(token_key)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"Token index must be an integer-like key, got '{token_key}'"
+                    ) from exc
+                if token_idx < 0:
+                    raise ValueError(f"Token indices must be >= 0, got {token_idx}")
+                shifted_idx = token_idx + int(offset)
+                if shifted_idx < 0:
+                    continue
+                if token_vec is None:
+                    token_entries[shifted_idx] = None
+                else:
+                    token_entries[shifted_idx] = torch.as_tensor(token_vec, dtype=torch.float32).reshape(-1)
+                max_idx = max(max_idx, shifted_idx)
+
+            if len(token_entries) == 0:
+                raise ValueError(
+                    f"Layer {layer} payload has no usable steering vectors after applying offset={offset}"
+                )
+
+            vectors: list[Optional[torch.Tensor]] = [None] * (max_idx + 1)
+            for token_idx, token_vec in token_entries.items():
+                vectors[token_idx] = token_vec
+            out[int(layer)] = vectors
+        return out
 
     print(
         f"[user_interrupt] Processing {len(input_paths)} files from {root_dir} "
-        f"with steering at layer {inject_layer} and offset {offset}"
+        f"with steering layers {requested_layers} and offset {offset}"
     )
 
     for path in input_paths:
@@ -637,9 +739,9 @@ def inference_with_steering(
         if not isinstance(steering_payload, dict):
             raise ValueError(f"Expected dict in {steering_json}, got {type(steering_payload)}")
 
-        steering_vectors = _extract_layer_vector(
+        steering_vectors_by_layer = _extract_layer_vectors(
             steering_payload,
-            int(inject_layer),
+            requested_layers,
             int(offset),
         )
 
@@ -654,14 +756,14 @@ def inference_with_steering(
             info = sf.info(input_wav)
             duration_s = float(info.frames) / float(info.samplerate)
         min_tokens = int(math.ceil(duration_s * 12.5))
-        if len(steering_vectors) < min_tokens:
-            steering_vectors.extend([None] * (min_tokens - len(steering_vectors)))
-
-        non_null = sum(1 for v in steering_vectors if v is not None)
-        print(
-            f"[user_interrupt] {entry_dir.name}: loaded steering vectors len={len(steering_vectors)}, "
-            f"min_tokens={min_tokens}, non_null={non_null}"
-        )
+        for layer, vectors in steering_vectors_by_layer.items():
+            if len(vectors) < min_tokens:
+                vectors.extend([None] * (min_tokens - len(vectors)))
+            non_null = sum(1 for v in vectors if v is not None)
+            print(
+                f"[user_interrupt] {entry_dir.name}: layer={layer} loaded steering vectors len={len(vectors)}, "
+                f"min_tokens={min_tokens}, non_null={non_null}"
+            )
 
         with torch.no_grad():
             run_batch_inference(
@@ -686,8 +788,7 @@ def inference_with_steering(
                 return_hidden_layers=False,
                 save_hidden_payload=bool(save_hidden),
                 output_hiddens=[output_hidden] if save_hidden else None,
-                steering_vectors=steering_vectors,
-                steering_layer=int(inject_layer),
+                steering_vectors_by_layer=steering_vectors_by_layer,
             )
 
     if save_hidden:
@@ -727,10 +828,24 @@ def main() -> None:
     )
 
     parser.add_argument(
-        "--classifier-path",
+        "--classifier-dir",
         type=str,
         default=None,
-        help="Path to mode classifier checkpoint (.pt). Required for --generate-steering-vectors.",
+        help=(
+            "Directory containing classifier checkpoints named "
+            "hidden_mode_classifier_layer_<layer>.pt. "
+            "Required for steering-vector generation modes."
+        ),
+    )
+    parser.add_argument(
+        "--layer",
+        type=int,
+        nargs="+",
+        default=[-1],
+        help=(
+            "Target layer indices. Use multiple values for multi-layer operation. "
+            "Use -1 to select all available layers."
+        ),
     )
     parser.add_argument(
         "--decay-span",
@@ -747,8 +862,12 @@ def main() -> None:
     parser.add_argument(
         "--inject-layer",
         type=int,
+        nargs="+",
         default=None,
-        help="Layer index to inject steering vectors during --inference-with-steering.",
+        help=(
+            "Layer indices to inject steering vectors during --inference-with-steering. "
+            "Use multiple values for multi-layer injection; use -1 for all layers found in steering_vector.json."
+        ),
     )
     parser.add_argument(
         "--offset",
@@ -775,22 +894,24 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.generate_steering_vectors:
-        if args.classifier_path is None:
-            parser.error("--generate-steering-vectors requires --classifier-path")
+        if args.classifier_dir is None:
+            parser.error("--generate-steering-vectors requires --classifier-dir")
         calculate_steering_vector(
             root_dir=args.root_dir,
-            classifier_path=args.classifier_path,
+            classifier_dir=args.classifier_dir,
+            layers=[int(x) for x in args.layer],
             decay_span=args.decay_span,
             alpha=args.alpha,
         )
         return
 
     if args.generate_steering_vectors_optimized:
-        if args.classifier_path is None:
-            parser.error("--generate-steering-vectors-optimized requires --classifier-path")
+        if args.classifier_dir is None:
+            parser.error("--generate-steering-vectors-optimized requires --classifier-dir")
         compute_attention_mapped_steering_vector(
             root_dir=args.root_dir,
-            classifier_path=args.classifier_path,
+            classifier_dir=args.classifier_dir,
+            layers=[int(x) for x in args.layer],
             decay_span=args.decay_span,
             alpha=args.alpha,
         )
@@ -801,7 +922,7 @@ def main() -> None:
             parser.error("--inference-with-steering requires --inject-layer")
         inference_with_steering(
             root_dir=args.root_dir,
-            inject_layer=args.inject_layer,
+            inject_layers=[int(x) for x in args.inject_layer],
             offset=args.offset,
             save_hidden=args.save_hidden,
         )

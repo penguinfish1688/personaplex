@@ -753,14 +753,19 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
         return_attention_weights: bool = False,
         steering_vector: torch.Tensor | None = None,
         steering_layer: int | None = None,
+        steering_vectors_by_layer: dict[int, torch.Tensor] | None = None,
         *args,
         **kwargs,
     ):
         B, T, C = x.shape
 
-        do_steer = steering_vector is not None
+        do_single_steer = steering_vector is not None
+        do_multi_steer = steering_vectors_by_layer is not None and len(steering_vectors_by_layer) > 0
 
-        if do_steer:
+        if do_single_steer and do_multi_steer:
+            raise ValueError("Provide either steering_vector/steering_layer or steering_vectors_by_layer, not both")
+
+        if do_single_steer:
             if steering_layer is None:
                 raise ValueError("steering_vector provided but steering_layer is None")
             if steering_layer < 0 or steering_layer >= len(self.layers):
@@ -775,9 +780,24 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
                     f"Steering vector dimension mismatch: got {int(steering_vector.numel())}, expected {C}"
                 )
             steering_vector = steering_vector.to(device=x.device, dtype=x.dtype)
-            steering_view_shape = (1,) * (x.dim() - 1) + (C,)
-        else:
-            steering_view_shape = None
+        elif do_multi_steer:
+            assert steering_vectors_by_layer is not None
+            prepared_vectors: dict[int, torch.Tensor] = {}
+            for layer_idx, vec in steering_vectors_by_layer.items():
+                if layer_idx < 0 or layer_idx >= len(self.layers):
+                    raise ValueError(
+                        f"steering layer out of range: {layer_idx}. Expected [0, {len(self.layers) - 1}]"
+                    )
+                if vec.dim() != 1:
+                    vec = vec.reshape(-1)
+                if int(vec.numel()) != C:
+                    raise ValueError(
+                        f"Steering vector dimension mismatch at layer {layer_idx}: got {int(vec.numel())}, expected {C}"
+                    )
+                prepared_vectors[int(layer_idx)] = vec.to(device=x.device, dtype=x.dtype)
+            steering_vectors_by_layer = prepared_vectors
+
+        steering_view_shape = (1,) * (x.dim() - 1) + (C,)
 
         state = self._streaming_state
         if state is None:
@@ -797,15 +817,22 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
         attention_weights = [] if return_attention_weights else None
         
         for layer_idx, layer in enumerate(self.layers):
-            if do_steer and layer_idx == steering_layer:
-                assert steering_view_shape is not None
+            if do_single_steer and layer_idx == steering_layer:
+                assert steering_vector is not None
                 x = x + steering_vector.view(steering_view_shape)
+            if do_multi_steer:
+                assert steering_vectors_by_layer is not None
+                layer_steer = steering_vectors_by_layer.get(layer_idx)
+                if layer_steer is not None:
+                    x = x + layer_steer.view(steering_view_shape)
             if return_attention_weights:
                 x, layer_attn = layer(x, return_attention_weights=True, *args, **kwargs)
+                assert attention_weights is not None
                 attention_weights.append(layer_attn.clone() if isinstance(layer_attn, torch.Tensor) else layer_attn)
             else:
                 x = layer(x, *args, **kwargs)
             if return_hidden_layers:
+                assert hidden_layers is not None
                 hidden_layers.append(x.clone())
 
         if state is not None:
