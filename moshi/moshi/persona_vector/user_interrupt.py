@@ -555,6 +555,7 @@ def _calculate_steering_vector_single_layer(root_dir, classifier_path, decay_spa
     normal_vector = torch.as_tensor(
         extract_normal_vector(classifier_path), dtype=torch.float32
     ).reshape(-1)
+    print(f"[Debug] normal vector have norm {torch.norm(normal_vector):.4f} and shape {normal_vector.shape}")
     if normal_vector.numel() == 0:
         raise ValueError(f"Extracted empty normal vector from classifier: {classifier_path}")
 
