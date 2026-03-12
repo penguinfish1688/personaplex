@@ -26,7 +26,7 @@ JSON_LAYER_MAX = MAIN_LAYER_MAX + 1
 def _load_existing_steering_payload(steering_path: Path) -> dict:
     """Load an existing steering JSON payload.
 
-    If the file is malformed JSON, move it to a backup path and start fresh.
+    If the file is malformed JSON, delete it and start fresh.
     """
     if not steering_path.exists():
         return {}
@@ -35,11 +35,13 @@ def _load_existing_steering_payload(steering_path: Path) -> dict:
         with steering_path.open("r", encoding="utf-8") as f:
             existing = json.load(f)
     except json.JSONDecodeError as exc:
-        backup_path = steering_path.with_name(f"{steering_path.stem}.corrupt.json")
-        steering_path.replace(backup_path)
+        try:
+            steering_path.unlink()
+        except FileNotFoundError:
+            pass
         print(
             f"[user_interrupt] Warning: malformed JSON at {steering_path}. "
-            f"Backed up to {backup_path} and recreating file. Error: {exc}"
+            f"Deleted file and recreating it. Error: {exc}"
         )
         return {}
 
