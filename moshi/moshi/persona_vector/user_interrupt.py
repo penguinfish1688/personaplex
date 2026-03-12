@@ -201,10 +201,23 @@ def _compute_attention_mapped_steering_vector_single_layer(root_dir, classifier_
 
     mu_s = ckpt.get("ave_hidden_pos")
     mu_l = ckpt.get("ave_hidden_neg")
+    # Backward/variant key compatibility.
+    if mu_s is None:
+        mu_s = ckpt.get("avg_hidden_pos")
+    if mu_l is None:
+        mu_l = ckpt.get("avg_hidden_neg")
+    if mu_s is None:
+        mu_s = ckpt.get("mean_hidden_pos")
+    if mu_l is None:
+        mu_l = ckpt.get("mean_hidden_neg")
     if mu_s is None or mu_l is None:
+        ckpt_keys = sorted([str(k) for k in ckpt.keys()])
         raise KeyError(
-            "Classifier checkpoint must contain 'ave_hidden_pos' and 'ave_hidden_neg'. "
-            "Please retrain or re-save the classifier with class-average hidden vectors."
+            f"Classifier checkpoint missing class-average vectors: {classifier_path}. "
+            "Expected one of ('ave_hidden_pos'/'ave_hidden_neg', "
+            "'avg_hidden_pos'/'avg_hidden_neg', 'mean_hidden_pos'/'mean_hidden_neg'). "
+            f"Found keys: {ckpt_keys}. "
+            "Please retrain/re-save this layer checkpoint with the updated mode_class trainer."
         )
     mu_s = torch.as_tensor(mu_s, dtype=torch.float32).reshape(-1)
     mu_l = torch.as_tensor(mu_l, dtype=torch.float32).reshape(-1)
