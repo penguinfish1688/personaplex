@@ -854,6 +854,72 @@ def inference_with_steering(
         print(f"[user_interrupt] Done. Wrote output.wav/output.json for {len(input_paths)} items.")
 
 
+def scale_steering_vectors(root_dir: str, scale: float) -> None:
+    """Normalize then scale steering vectors under root_dir/*/steering_vector.json.
+
+    For each steering JSON file:
+    - find the maximum L2 norm across all non-None vectors,
+    - divide every non-None vector by that max norm (so max norm becomes 1),
+    - multiply by ``scale``.
+
+    None entries remain None.
+    """
+    root = Path(root_dir)
+    steering_paths = [p for p in root.glob("*/steering_vector.json") if p.is_file()]
+    steering_paths.sort(key=lambda p: int(p.parent.name) if p.parent.name.isdigit() else p.parent.name)
+    if not steering_paths:
+        raise FileNotFoundError(f"No files matched pattern {root_dir}/*/steering_vector.json")
+
+    updated = 0
+    factor = float(scale)
+    for steering_path in steering_paths:
+        with steering_path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            raise ValueError(f"Expected dict in {steering_path}, got {type(payload)}")
+
+        # Pass 1: compute max L2 norm among all non-None vectors in this file.
+        max_norm = 0.0
+        for layer_key, layer_payload in payload.items():
+            if not isinstance(layer_payload, dict):
+                raise ValueError(
+                    f"Expected dict for layer payload at key '{layer_key}' in {steering_path}, got {type(layer_payload)}"
+                )
+            for token_key, token_vec in layer_payload.items():
+                if token_vec is None:
+                    continue
+                if not isinstance(token_vec, list):
+                    raise ValueError(
+                        f"Expected list or None for token '{token_key}' under '{layer_key}' in {steering_path}, got {type(token_vec)}"
+                    )
+                norm = math.sqrt(sum(float(x) * float(x) for x in token_vec))
+                if norm > max_norm:
+                    max_norm = norm
+
+        # Pass 2: normalize by max_norm and then multiply by scale.
+        denom = max_norm if max_norm > 0.0 else 1.0
+
+        for layer_key, layer_payload in payload.items():
+            for token_key, token_vec in layer_payload.items():
+                if token_vec is None:
+                    continue
+                layer_payload[token_key] = [(float(x) / denom) * factor for x in token_vec]
+
+        with steering_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+
+        print(
+            f"[user_interrupt] {steering_path.parent.name}: normalized by max_norm={max_norm:.6g} "
+            f"then scaled by {factor}"
+        )
+        updated += 1
+
+    print(
+        f"[user_interrupt] Done. Normalized+scaled steering vectors in {updated} files at {root_dir}; "
+        f"target max norm per file = {factor}"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser("user_interrupt_inference")
     parser.add_argument(
@@ -882,6 +948,11 @@ def main() -> None:
         "--inference-with-steering",
         action="store_true",
         help="Run inference using steering vectors loaded from root-dir/*/steering_vector.json.",
+    )
+    mode_group.add_argument(
+        "--scale-steering-vectors",
+        action="store_true",
+        help="Scale all vectors in root-dir/*/steering_vector.json by --scale (None stays None).",
     )
 
     parser.add_argument(
@@ -915,6 +986,12 @@ def main() -> None:
         type=float,
         default=0.05,
         help="Steering strength multiplier for steering vector generation.",
+    )
+    parser.add_argument(
+        "--scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for --scale-steering-vectors (1.0 keeps values unchanged).",
     )
     parser.add_argument(
         "--inject-layer",
@@ -982,6 +1059,13 @@ def main() -> None:
             inject_layers=[int(x) for x in args.inject_layer],
             offset=args.offset,
             save_hidden=args.save_hidden,
+        )
+        return
+
+    if args.scale_steering_vectors:
+        scale_steering_vectors(
+            root_dir=args.root_dir,
+            scale=float(args.scale),
         )
         return
 
