@@ -16,6 +16,30 @@ from moshi.models import loaders
 from moshi.persona_vector.mode_class import extract_normal_vector
 
 
+MAIN_LAYER_MIN = 0
+MAIN_LAYER_MAX = 31
+JSON_LAYER_MIN = MAIN_LAYER_MIN + 1
+JSON_LAYER_MAX = MAIN_LAYER_MAX + 1
+
+
+def _is_valid_main_layer(layer: int) -> bool:
+    return MAIN_LAYER_MIN <= int(layer) <= MAIN_LAYER_MAX
+
+
+def _internal_layer_to_json_layer(layer: int) -> int:
+    return int(layer) + 1
+
+
+def _json_layer_to_internal_layer(layer: int) -> Optional[int]:
+    # Preferred schema: JSON uses 1-based layer numbers (1..32).
+    if JSON_LAYER_MIN <= int(layer) <= JSON_LAYER_MAX:
+        return int(layer) - 1
+    # Backward compatibility for older 0-based JSON (0..31).
+    if _is_valid_main_layer(int(layer)):
+        return int(layer)
+    return None
+
+
 def _discover_classifier_paths(classifier_dir: str) -> dict[int, str]:
     base = Path(classifier_dir)
     if not base.is_dir():
@@ -26,10 +50,14 @@ def _discover_classifier_paths(classifier_dir: str) -> dict[int, str]:
         m = re.search(r"hidden_mode_classifier_layer_(-?\d+)\.pt$", p.name)
         if m is None:
             continue
-        discovered[int(m.group(1))] = str(p)
+        layer = int(m.group(1))
+        if not _is_valid_main_layer(layer):
+            continue
+        discovered[layer] = str(p)
     if not discovered:
         raise FileNotFoundError(
-            f"No classifier checkpoints found in {classifier_dir}. Expected files like hidden_mode_classifier_layer_<layer>.pt"
+            f"No classifier checkpoints found in {classifier_dir} for valid layers [{MAIN_LAYER_MIN}..{MAIN_LAYER_MAX}]. "
+            "Expected files like hidden_mode_classifier_layer_<layer>.pt"
         )
     return discovered
 
@@ -40,13 +68,19 @@ def _resolve_requested_layers(
 ) -> list[int]:
     if not available_layers:
         raise ValueError("No available layers to resolve")
+    available_filtered = sorted(set(int(x) for x in available_layers if _is_valid_main_layer(int(x))))
     if -1 in requested_layers:
-        return sorted(set(int(x) for x in available_layers))
+        return available_filtered
     resolved = [int(x) for x in requested_layers]
-    missing = [x for x in resolved if x not in set(available_layers)]
+    invalid = [x for x in resolved if not _is_valid_main_layer(x)]
+    if invalid:
+        raise ValueError(
+            f"Invalid layer(s) requested: {invalid}. Supported range is [{MAIN_LAYER_MIN}..{MAIN_LAYER_MAX}] or -1 for all."
+        )
+    missing = [x for x in resolved if x not in set(available_filtered)]
     if missing:
         raise FileNotFoundError(
-            f"Requested layers not found: {missing}. Available layers: {sorted(set(available_layers))}"
+            f"Requested layers not found: {missing}. Available layers: {available_filtered}"
         )
     # Preserve user ordering but drop duplicates.
     unique: list[int] = []
@@ -167,7 +201,7 @@ def _compute_attention_mapped_steering_vector_single_layer(root_dir, classifier_
             )
         layer = int(m.group(1))
     layer = int(layer)
-    layer_key = f"layer_{layer}"
+    layer_key = f"layer_{_internal_layer_to_json_layer(layer)}"
 
     moshi_weight = hf_hub_download(loaders.DEFAULT_REPO, loaders.MOSHI_NAME)
     lm = loaders.get_moshi_lm(moshi_weight, device="cpu", cpu_offload=False)
@@ -508,7 +542,7 @@ def _calculate_steering_vector_single_layer(root_dir, classifier_path, decay_spa
                 f"Classifier checkpoint {classifier_path} missing 'layer' field and filename does not contain layer index"
             )
         layer = int(m.group(1))
-    layer_key = f"layer_{int(layer)}"
+    layer_key = f"layer_{_internal_layer_to_json_layer(int(layer))}"
 
     input_paths = [p for p in root.glob("*/input.wav") if p.is_file()]
     input_paths.sort(key=lambda p: int(p.parent.name) if p.parent.name.isdigit() else p.parent.name)
@@ -670,17 +704,27 @@ def inference_with_steering(
             if isinstance(k, str):
                 m = re.fullmatch(r"layer_(-?\d+)", k)
                 if m is not None:
-                    available_map[int(m.group(1))] = v
+                    layer = _json_layer_to_internal_layer(int(m.group(1)))
+                    if layer is not None:
+                        available_map[layer] = v
                     continue
             try:
-                available_map[int(k)] = v
+                layer = _json_layer_to_internal_layer(int(k))
+                if layer is not None:
+                    available_map[layer] = v
             except (TypeError, ValueError):
                 continue
 
         if -1 in layers:
             resolved = sorted(available_map.keys())
         else:
-            resolved = [int(x) for x in layers]
+            resolved = [int(x) for x in layers if _is_valid_main_layer(int(x))]
+
+        invalid_requested = [int(x) for x in layers if int(x) != -1 and not _is_valid_main_layer(int(x))]
+        if invalid_requested:
+            raise ValueError(
+                f"Invalid requested layer(s): {sorted(set(invalid_requested))}. Supported range is [{MAIN_LAYER_MIN}..{MAIN_LAYER_MAX}] or -1."
+            )
 
         if not resolved:
             raise KeyError("No layer information found in steering_vector.json")
