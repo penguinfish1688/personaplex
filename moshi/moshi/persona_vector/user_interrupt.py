@@ -3,6 +3,7 @@ import json
 import math
 import os
 import re
+import tempfile
 import wave
 from pathlib import Path
 from typing import Any, Optional, cast
@@ -20,6 +21,41 @@ MAIN_LAYER_MIN = 0
 MAIN_LAYER_MAX = 31
 JSON_LAYER_MIN = MAIN_LAYER_MIN + 1
 JSON_LAYER_MAX = MAIN_LAYER_MAX + 1
+
+
+def _load_existing_steering_payload(steering_path: Path) -> dict:
+    """Load an existing steering JSON payload.
+
+    If the file is malformed JSON, move it to a backup path and start fresh.
+    """
+    if not steering_path.exists():
+        return {}
+
+    try:
+        with steering_path.open("r", encoding="utf-8") as f:
+            existing = json.load(f)
+    except json.JSONDecodeError as exc:
+        backup_path = steering_path.with_name(f"{steering_path.stem}.corrupt.json")
+        steering_path.replace(backup_path)
+        print(
+            f"[user_interrupt] Warning: malformed JSON at {steering_path}. "
+            f"Backed up to {backup_path} and recreating file. Error: {exc}"
+        )
+        return {}
+
+    if not isinstance(existing, dict):
+        raise ValueError(f"Expected dict in {steering_path}, got {type(existing)}")
+    return existing
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    """Atomically write JSON to reduce risk of partial/truncated files."""
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=str(path.parent), delete=False) as tf:
+        json.dump(payload, tf, indent=2, ensure_ascii=False)
+        tf.flush()
+        os.fsync(tf.fileno())
+        tmp_name = tf.name
+    os.replace(tmp_name, path)
 
 
 def _is_valid_main_layer(layer: int) -> bool:
@@ -338,17 +374,10 @@ def _compute_attention_mapped_steering_vector_single_layer(root_dir, classifier_
             layer_payload[str(token_idx)] = vec
 
         steering_path = entry_dir / "steering_vector.json"
-        if steering_path.exists():
-            with steering_path.open("r", encoding="utf-8") as f:
-                existing = json.load(f)
-            if not isinstance(existing, dict):
-                raise ValueError(f"Expected dict in {steering_path}, got {type(existing)}")
-        else:
-            existing = {}
+        existing = _load_existing_steering_payload(steering_path)
 
         existing[layer_key] = layer_payload
-        with steering_path.open("w", encoding="utf-8") as f:
-            json.dump(existing, f, indent=2, ensure_ascii=False)
+        _atomic_write_json(steering_path, existing)
 
         non_null = sum(1 for v in layer_payload.values() if v is not None)
         print(
@@ -612,18 +641,11 @@ def _calculate_steering_vector_single_layer(root_dir, classifier_path, decay_spa
             layer_payload[str(token_idx)] = vec
 
         steering_path = entry_dir / "steering_vector.json"
-        if steering_path.exists():
-            with steering_path.open("r", encoding="utf-8") as f:
-                existing = json.load(f)
-            if not isinstance(existing, dict):
-                raise ValueError(f"Expected dict in {steering_path}, got {type(existing)}")
-        else:
-            existing = {}
+        existing = _load_existing_steering_payload(steering_path)
 
         # Merge/update only the target layer while preserving other layers.
         existing[layer_key] = layer_payload
-        with steering_path.open("w", encoding="utf-8") as f:
-            json.dump(existing, f, indent=2, ensure_ascii=False)
+        _atomic_write_json(steering_path, existing)
 
         non_null = sum(1 for v in layer_payload.values() if v is not None)
         print(
@@ -905,8 +927,7 @@ def scale_steering_vectors(root_dir: str, scale: float) -> None:
                     continue
                 layer_payload[token_key] = [(float(x) / denom) * factor for x in token_vec]
 
-        with steering_path.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
+        _atomic_write_json(steering_path, payload)
 
         print(
             f"[user_interrupt] {steering_path.parent.name}: normalized by max_norm={max_norm:.6g} "
