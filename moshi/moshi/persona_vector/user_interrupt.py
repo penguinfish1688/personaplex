@@ -23,6 +23,9 @@ JSON_LAYER_MIN = MAIN_LAYER_MIN + 1
 JSON_LAYER_MAX = MAIN_LAYER_MAX + 1
 
 
+_MODE_CLASS_HIDDEN_CACHE: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
 def _load_existing_steering_payload(steering_path: Path) -> dict:
     """Load an existing steering JSON payload.
 
@@ -130,6 +133,141 @@ def _resolve_requested_layers(
     return unique
 
 
+def _extract_hidden_layer_from_payload(payload: dict[str, Any], layer: int) -> torch.Tensor:
+    """Extract hidden states for a specific layer as [T, D]."""
+    if "text_hidden_layers" in payload:
+        hidden = payload["text_hidden_layers"]
+        if not isinstance(hidden, torch.Tensor):
+            hidden = torch.as_tensor(hidden)
+        num_layers = int(hidden.shape[1])
+        actual_layer = int(layer) if int(layer) >= 0 else num_layers + int(layer)
+        if actual_layer < 0 or actual_layer >= num_layers:
+            raise ValueError(
+                f"Layer {layer} out of range for payload with {num_layers} layers"
+            )
+        return hidden[:, actual_layer, :].float()
+
+    if "hidden_states" in payload:
+        if int(layer) != -1:
+            raise ValueError(
+                "Payload has only 'hidden_states'; this supports layer=-1 only. "
+                f"Requested layer={layer}."
+            )
+        hidden = payload["hidden_states"]
+        if not isinstance(hidden, torch.Tensor):
+            hidden = torch.as_tensor(hidden)
+        return hidden.float()
+
+    raise KeyError("Payload has neither 'text_hidden_layers' nor 'hidden_states'")
+
+
+def _build_mode_labels(
+    num_tokens: int,
+    listening_ranges: list[list[int]],
+    speaking_ranges: list[list[int]],
+) -> torch.Tensor:
+    """Build per-token labels: listening=0, speaking=1."""
+    labels = torch.zeros(num_tokens, dtype=torch.float32)
+    for start, end in listening_ranges:
+        if start < 0 or end >= num_tokens:
+            raise ValueError(
+                f"Listening range [{start}, {end}] out of bounds for {num_tokens} tokens"
+            )
+        labels[start : end + 1] = 0.0
+    for start, end in speaking_ranges:
+        if start < 0 or end >= num_tokens:
+            raise ValueError(
+                f"Speaking range [{start}, {end}] out of bounds for {num_tokens} tokens"
+            )
+        labels[start : end + 1] = 1.0
+    return labels
+
+
+def _load_mode_class_hidden_sets(
+    classifier_dir: str,
+    layer: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Load H_s/H_l token sets from mode-class dataset under classifier_dir.
+
+    Expects entries like classifier_dir/*/input.json and corresponding
+    complete/incomplete *_hidden.pt files with mode ranges in input.json.
+    Returns:
+      H_s: [N_s, D] speaking hidden states
+      H_l: [N_l, D] listening hidden states
+    """
+    cache_key = (str(Path(classifier_dir).resolve()), int(layer))
+    cached = _MODE_CLASS_HIDDEN_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    base = Path(classifier_dir)
+    entries = sorted(
+        [p for p in base.glob("*/input.json") if p.is_file()],
+        key=lambda p: int(p.parent.name) if p.parent.name.isdigit() else p.parent.name,
+    )
+    if not entries:
+        raise FileNotFoundError(
+            f"No mode-class dataset entries found in {classifier_dir}. "
+            "Expected */input.json with *_hidden.pt files."
+        )
+
+    speaking_chunks: list[torch.Tensor] = []
+    listening_chunks: list[torch.Tensor] = []
+
+    for entry_json in entries:
+        entry_dir = entry_json.parent
+        with entry_json.open("r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if not isinstance(meta, dict):
+            raise ValueError(f"Expected dict in {entry_json}, got {type(meta)}")
+
+        sample_specs = [
+            ("complete_sentence_hidden.pt", "complete_modes"),
+            ("incomplete_sentence_hidden.pt", "incomplete_modes"),
+        ]
+        for hidden_name, mode_key in sample_specs:
+            hidden_path = entry_dir / hidden_name
+            if not hidden_path.exists():
+                raise FileNotFoundError(
+                    f"Missing hidden payload: {hidden_path}. "
+                    "Run mode_class --gen-dataset-hidden first."
+                )
+            if mode_key not in meta:
+                raise KeyError(f"Missing '{mode_key}' in {entry_json}")
+
+            payload = torch.load(hidden_path, map_location="cpu", weights_only=False)
+            if not isinstance(payload, dict):
+                raise TypeError(
+                    f"Expected dict payload in {hidden_path}, got {type(payload).__name__}"
+                )
+            hidden = _extract_hidden_layer_from_payload(payload, int(layer))
+            num_tokens = int(hidden.shape[0])
+            mode_payload = meta[mode_key]
+            if not isinstance(mode_payload, dict):
+                raise ValueError(f"Expected dict for '{mode_key}' in {entry_json}")
+            listening_ranges = mode_payload.get("listening", [])
+            speaking_ranges = mode_payload.get("speaking", [])
+            labels = _build_mode_labels(num_tokens, listening_ranges, speaking_ranges)
+
+            speaking_mask = labels == 1
+            listening_mask = labels == 0
+            if int(speaking_mask.sum()) > 0:
+                speaking_chunks.append(hidden[speaking_mask])
+            if int(listening_mask.sum()) > 0:
+                listening_chunks.append(hidden[listening_mask])
+
+    if not speaking_chunks or not listening_chunks:
+        raise RuntimeError(
+            f"Insufficient labeled tokens in {classifier_dir} for layer {layer}. "
+            f"speaking_chunks={len(speaking_chunks)}, listening_chunks={len(listening_chunks)}"
+        )
+
+    H_s = torch.cat(speaking_chunks, dim=0)
+    H_l = torch.cat(listening_chunks, dim=0)
+    _MODE_CLASS_HIDDEN_CACHE[cache_key] = (H_s, H_l)
+    return H_s, H_l
+
+
 def inference(
     root_dir: str,
     save_hidden: bool = False,
@@ -204,41 +342,23 @@ def inference(
     else:
         print(f"[user_interrupt] Done. Wrote {len(output_wavs)} output.wav files.")
 
-def _compute_attention_mapped_steering_vector_single_layer(root_dir, classifier_path, decay_span, alpha):
-    """Just like calculate_steering_vector()
-    but instead of just using the normal vector from the SVM classifier
-    use _compute_attention_mapped_steering_vector() to optimize of the 
-    steering vector by mapping it. Then save the mapped vector and decay logic
-    as calculate_steering_vector() does, so that it can be injected during inference.
+def _compute_attention_mapped_steering_vector_single_layer(root_dir, classifier_dir, layer, decay_span, alpha):
+    """Generate one optimized steering vector for a target layer.
+
+    Uses mode-class dataset hidden states (H_s/H_l) loaded from ``classifier_dir``
+    and layer-specific Moshi attention weights (W_q/W_k), then writes the
+    per-token decay schedule into ``root_dir/*/steering_vector.json``.
     """
     token_rate_hz = 12.5
     root = Path(root_dir)
-    classifier_path = str(classifier_path)
+    classifier_dir = str(classifier_dir)
+    layer = int(layer)
 
     if decay_span < 0:
         raise ValueError(f"decay_span must be >= 0, got {decay_span}")
 
-    normal_vector = torch.as_tensor(
-        extract_normal_vector(classifier_path), dtype=torch.float32
-    ).reshape(-1)
-    if normal_vector.numel() == 0:
-        raise ValueError(f"Extracted empty normal vector from classifier: {classifier_path}")
-
-    ckpt = torch.load(classifier_path, map_location="cpu", weights_only=False)
-    if not isinstance(ckpt, dict):
-        raise TypeError(
-            f"Expected checkpoint dict at {classifier_path}, got {type(ckpt).__name__}"
-        )
-
-    layer = ckpt.get("layer")
-    if layer is None:
-        m = re.search(r"layer_(-?\d+)", Path(classifier_path).stem)
-        if m is None:
-            raise KeyError(
-                f"Classifier checkpoint {classifier_path} missing 'layer' field and filename does not contain layer index"
-            )
-        layer = int(m.group(1))
-    layer = int(layer)
+    if not _is_valid_main_layer(layer):
+        raise ValueError(f"Invalid layer {layer}; expected [{MAIN_LAYER_MIN}..{MAIN_LAYER_MAX}]")
     layer_key = f"layer_{_internal_layer_to_json_layer(layer)}"
 
     moshi_weight = hf_hub_download(loaders.DEFAULT_REPO, loaders.MOSHI_NAME)
@@ -271,45 +391,23 @@ def _compute_attention_mapped_steering_vector_single_layer(root_dir, classifier_
     print("W_q shape:", w_q.shape)
     print("W_k shape:", w_k.shape)
 
-    mu_s = ckpt.get("ave_hidden_pos")
-    mu_l = ckpt.get("ave_hidden_neg")
-    # Backward/variant key compatibility.
-    if mu_s is None:
-        mu_s = ckpt.get("avg_hidden_pos")
-    if mu_l is None:
-        mu_l = ckpt.get("avg_hidden_neg")
-    if mu_s is None:
-        mu_s = ckpt.get("mean_hidden_pos")
-    if mu_l is None:
-        mu_l = ckpt.get("mean_hidden_neg")
-    if mu_s is None or mu_l is None:
-        ckpt_keys = sorted([str(k) for k in ckpt.keys()])
-        raise KeyError(
-            f"Classifier checkpoint missing class-average vectors: {classifier_path}. "
-            "Expected one of ('ave_hidden_pos'/'ave_hidden_neg', "
-            "'avg_hidden_pos'/'avg_hidden_neg', 'mean_hidden_pos'/'mean_hidden_neg'). "
-            f"Found keys: {ckpt_keys}. "
-            "Please retrain/re-save this layer checkpoint with the updated mode_class trainer."
-        )
-    mu_s = torch.as_tensor(mu_s, dtype=torch.float32).reshape(-1)
-    mu_l = torch.as_tensor(mu_l, dtype=torch.float32).reshape(-1)
-    if mu_s.numel() == 0 or mu_l.numel() == 0:
-        raise ValueError("'ave_hidden_pos'/'ave_hidden_neg' must be non-empty vectors")
-    if mu_s.numel() != embed_dim or mu_l.numel() != embed_dim:
+    H_s, H_l = _load_mode_class_hidden_sets(classifier_dir, layer)
+    if int(H_s.shape[-1]) != embed_dim or int(H_l.shape[-1]) != embed_dim:
         raise ValueError(
-            f"Classifier mean vector dim mismatch: mu_s={mu_s.numel()}, mu_l={mu_l.numel()}, expected={embed_dim}"
+            f"Hidden dim mismatch for layer {layer}: H_s={int(H_s.shape[-1])}, "
+            f"H_l={int(H_l.shape[-1])}, expected={embed_dim}"
         )
 
     mapped_vector = _compute_attention_mapped_steering_vector(
-        mu_s=mu_s,
-        mu_l=mu_l,
+        H_s=H_s,
+        H_l=H_l,
         W_q_weights=w_q,
         W_k_weights=w_k,
         alpha=float(alpha),
     ).reshape(-1)
-    # Print the cosine similarity between mapped_vector and mu_s - mu_l
-    cos_sim = F.cosine_similarity(mapped_vector, mu_s - mu_l, dim=0).item()
-    print("Cosine similarity between mapped_vector and (mu_s - mu_l):", cos_sim)
+    mu_diff = H_s.mean(dim=0) - H_l.mean(dim=0)
+    cos_sim = F.cosine_similarity(mapped_vector, mu_diff, dim=0).item()
+    print("Cosine similarity between mapped_vector and mean(H_s) - mean(H_l):", cos_sim)
 
     input_paths = [p for p in root.glob("*/input.wav") if p.is_file()]
     input_paths.sort(key=lambda p: int(p.parent.name) if p.parent.name.isdigit() else p.parent.name)
@@ -403,7 +501,8 @@ def compute_attention_mapped_steering_vector(
     for layer in resolved_layers:
         _compute_attention_mapped_steering_vector_single_layer(
             root_dir=root_dir,
-            classifier_path=discovered[layer],
+            classifier_dir=classifier_dir,
+            layer=layer,
             decay_span=decay_span,
             alpha=alpha,
         )
@@ -417,9 +516,10 @@ def compute_attention_mapped_steering_vector_average(
     alpha: float,
 ) -> None:
     """Compute the average of attention-mapped steering vectors across ALL available layers
-    (each layer uses its own W_q/W_k from the Moshi model and class-mean vectors from its
-    own classifier checkpoint), then save that single averaged vector (with decay schedule)
-    under the key for ``target_layer`` in each root_dir/*/steering_vector.json.
+    (each layer uses its own W_q/W_k from the Moshi model and H_s/H_l loaded from the
+    mode-class dataset under ``classifier_dir``), then save that single averaged vector
+    (with decay schedule) under the key for ``target_layer`` in each
+    root_dir/*/steering_vector.json.
     """
     token_rate_hz = 12.5
     root = Path(root_dir)
@@ -445,16 +545,9 @@ def compute_attention_mapped_steering_vector_average(
     num_model_layers = len(lm.transformer.layers)
 
     layer_vectors: list[torch.Tensor] = []
-    layer_mu_diffs: list[tuple[int, torch.Tensor]] = []  # (layer, mu_s - mu_l)
+    layer_mean_diffs: list[tuple[int, torch.Tensor]] = []  # (layer, mean(H_s) - mean(H_l))
 
     for layer in all_layers:
-        classifier_path = discovered[layer]
-        ckpt = torch.load(classifier_path, map_location="cpu", weights_only=False)
-        if not isinstance(ckpt, dict):
-            raise TypeError(
-                f"Expected checkpoint dict at {classifier_path}, got {type(ckpt).__name__}"
-            )
-
         layer_idx = layer if layer >= 0 else num_model_layers + layer
         if layer_idx < 0 or layer_idx >= num_model_layers:
             print(f"[user_interrupt] Warning: skipping layer {layer} (out of model range)")
@@ -478,32 +571,19 @@ def compute_attention_mapped_steering_vector_average(
         w_q = w[:embed_dim, :].contiguous()
         w_k = w[embed_dim : 2 * embed_dim, :].contiguous()
 
-        # Load class-mean vectors with alias fallbacks.
-        mu_s = ckpt.get("ave_hidden_pos")
-        mu_l = ckpt.get("ave_hidden_neg")
-        if mu_s is None:
-            mu_s = ckpt.get("avg_hidden_pos")
-        if mu_l is None:
-            mu_l = ckpt.get("avg_hidden_neg")
-        if mu_s is None:
-            mu_s = ckpt.get("mean_hidden_pos")
-        if mu_l is None:
-            mu_l = ckpt.get("mean_hidden_neg")
-        if mu_s is None or mu_l is None:
-            ckpt_keys = sorted(str(k) for k in ckpt.keys())
-            raise KeyError(
-                f"Layer {layer} classifier missing class-average vectors. "
-                f"Found keys: {ckpt_keys}. Retrain with updated mode_class."
+        H_s, H_l = _load_mode_class_hidden_sets(classifier_dir, layer)
+        if int(H_s.shape[-1]) != embed_dim or int(H_l.shape[-1]) != embed_dim:
+            raise ValueError(
+                f"Hidden dim mismatch at layer {layer}: H_s={int(H_s.shape[-1])}, "
+                f"H_l={int(H_l.shape[-1])}, expected={embed_dim}"
             )
-        mu_s = torch.as_tensor(mu_s, dtype=torch.float32).reshape(-1)
-        mu_l = torch.as_tensor(mu_l, dtype=torch.float32).reshape(-1)
-        layer_mu_diffs.append((layer, mu_s - mu_l))
+        layer_mean_diffs.append((layer, H_s.mean(dim=0) - H_l.mean(dim=0)))
 
         print(f"[user_interrupt] Computing mapped vector for layer {layer}...")
         # Use alpha=1.0; normalize and scale after averaging across layers.
         mapped = _compute_attention_mapped_steering_vector(
-            mu_s=mu_s,
-            mu_l=mu_l,
+            H_s=H_s,
+            H_l=H_l,
             W_q_weights=w_q,
             W_k_weights=w_k,
             alpha=1.0,
@@ -517,9 +597,9 @@ def compute_attention_mapped_steering_vector_average(
     avg_vector = torch.stack(layer_vectors).mean(dim=0)
     avg_vector = F.normalize(avg_vector, dim=0) * float(alpha)
 
-    print("[user_interrupt] Cosine similarity between avg_vector and each layer's (mu_s - mu_l):")
-    for layer_idx, mu_diff in layer_mu_diffs:
-        cos_sim = F.cosine_similarity(avg_vector.unsqueeze(0), mu_diff.unsqueeze(0)).item()
+    print("[user_interrupt] Cosine similarity between avg_vector and each layer's mean(H_s)-mean(H_l):")
+    for layer_idx, mean_diff in layer_mean_diffs:
+        cos_sim = F.cosine_similarity(avg_vector.unsqueeze(0), mean_diff.unsqueeze(0)).item()
         print(f"  layer {layer_idx:3d}: {cos_sim:.6f}")
 
     layer_key = f"layer_{_internal_layer_to_json_layer(target_layer)}"
@@ -636,83 +716,112 @@ def get_rope_matrix(
     
     return R_n
 
-
 def _compute_attention_mapped_steering_vector(
-    mu_s: torch.Tensor,
-    mu_l: torch.Tensor,
-    W_q_weights: torch.Tensor,
-    W_k_weights: torch.Tensor,
+    H_s: torch.Tensor,        # [N_s, d_model] - Speaking mode hidden states
+    H_l: torch.Tensor,        # [N_l, d_model] - Listening mode hidden states
+    W_q_weights: torch.Tensor, # [num_heads, head_dim, d_model] or [d_model, d_model]
+    W_k_weights: torch.Tensor, # [num_heads, head_dim, d_model] or [d_model, d_model]
     rope_base: float = 10000.0,
     rope_context_len: int = 200,
     alpha: float = 1.0,
 ) -> torch.Tensor:
     """
-    Strategy 3: Unconstrained Bi-directional Gradient Superposition.
-    Directly computes the gradient vector that maximizes attention to the Speaking mode 
-    while minimizing attention to the Listening mode, averaged over RoPE distances.
+    Persona Vector Theory v4: Subspace Intersection & Component Normalization.
+    
+    1. Maps H_s and H_l to Attention Gradient Space (D_s, D_l)[cite: 52, 53].
+    2. Performs PCA to find the 2D subspace of each mode[cite: 54].
+    3. Identifies the shared 'neutral direction' (n) via subspace alignment[cite: 55, 56].
+    4. Normalizes gradients such that their projection on 'n' is exactly 1.
+    5. Subtracts normalized gradients to annihilate the neutral component.
     """
-    # 1. Shape Verification & Normalization
+    device = W_q_weights.device
+    dtype = torch.float32 # 確保幾何運算的精度
+    
+    # --- 1. 權重與維度處理 ---
     if W_q_weights.dim() == 2:
         d_model = W_q_weights.shape[0]
-        # Moshi/Llama default heuristics: head_dim is usually 128
         head_dim = 128 
         num_heads = d_model // head_dim
-        w_q = W_q_weights.reshape(num_heads, head_dim, d_model)
-        w_k = W_k_weights.reshape(num_heads, head_dim, d_model)
+        w_q = W_q_weights.reshape(num_heads, head_dim, d_model).to(dtype=dtype)
+        w_k = W_k_weights.reshape(num_heads, head_dim, d_model).to(dtype=dtype)
     else:
         num_heads, head_dim, d_model = W_q_weights.shape
-        w_q = W_q_weights
-        w_k = W_k_weights
+        w_q = W_q_weights.to(dtype=dtype)
+        w_k = W_k_weights.to(dtype=dtype)
 
-    device = w_q.device
-    out_dtype = w_q.dtype
-    dtype = torch.float32  # High precision for tensor accumulation
+    H_s = H_s.to(dtype=dtype)
+    H_l = H_l.to(dtype=dtype)
+
+    # --- 2. 映射至梯度空間 (D_s, D_l) [cite: 51-53] ---
+    def get_attention_gradients(H_states):
+        D = []
+        # 預計算 RoPE 矩陣的平均，以優化效能 (average_over_rope) 
+        combined_rope_map = torch.zeros(num_heads, d_model, d_model, device=device, dtype=dtype)
+        for n in range(rope_context_len):
+            r_n = get_rope_matrix(n, head_dim, rope_base, device=device).to(dtype=dtype)
+            for i in range(num_heads):
+                # 這裡計算 W_q^T @ R_n @ W_k 
+                combined_rope_map[i] += torch.matmul(w_q[i].T, torch.matmul(r_n, w_k[i]))
+        combined_rope_map /= rope_context_len
+
+        for h in H_states:
+            # h shape: [d_model]
+            # grad = \sum (h @ W_k^T @ R_n^T @ W_q)
+            # 這裡簡化為矩陣線性變換
+            grad = torch.zeros(d_model, device=device, dtype=dtype)
+            for i in range(num_heads):
+                grad += torch.matmul(combined_rope_map[i], h)
+            D.append(grad)
+        return torch.stack(D) # [N, d_model]
+
+    print("[Math Engine] Mapping activations to gradient space...")
+    D_s = get_attention_gradients(H_s) # [N_s, d_model]
+    D_l = get_attention_gradients(H_l) # [N_l, d_model]
+
+    # --- 3. PCA 子空間提取 [cite: 54] ---
+    # 使用 lowrank PCA 提取前兩個主成分 (PC1, PC2)
+    _, _, V_s = torch.pca_lowrank(D_s, q=2) # V_s: [d_model, 2]
+    _, _, V_l = torch.pca_lowrank(D_l, q=2) # V_l: [d_model, 2]
+
+    # --- 4. 尋找對齊的中性軸 (n) [cite: 55-56] ---
+    # 計算兩組 PC 之間的 Cosine Similarity 矩陣
+    # cos_sim[i, j] 表示 V_s 的第 i 個 PC 與 V_l 的第 j 個 PC 的相似度
+    cos_sim = torch.matmul(V_s.T, V_l) 
+    abs_cos = torch.abs(cos_sim)
+    idx_s, idx_l = torch.where(abs_cos == torch.max(abs_cos))
+    idx_s, idx_l = idx_s[0], idx_l[0]
+
+    n_dir_s = V_s[:, idx_s]
+    n_dir_l = V_l[:, idx_l]
     
-    mu_s = mu_s.reshape(-1).to(device=device, dtype=dtype)
-    mu_l = mu_l.reshape(-1).to(device=device, dtype=dtype)
-    w_q = w_q.to(device=device, dtype=dtype)
-    w_k = w_k.to(device=device, dtype=dtype)
+    # 確保符號一致並融合 (n = n_dir_l + n_dir_r) [cite: 56]
+    if cos_sim[idx_s, idx_l] < 0:
+        n_dir_l = -n_dir_l
+    n = F.normalize(n_dir_s + n_dir_l, dim=0)
 
-    # The contrastive target vector in the residual stream
-    v_svm = mu_s - mu_l
-    
-    all_grads = []
-    
-    print(f"[Math Engine] Computing Strategy 3 Gradient Superposition over RoPE n=0 to {rope_context_len-1}...")
-    
-    for n in tqdm(range(rope_context_len)):
-        grad_n = torch.zeros(d_model, device=device, dtype=dtype)
-        
-        # Calculate the gradient contribution for each Attention Head
-        for i in range(num_heads):
-            w_q_i = w_q[i]  # [head_dim, d_model]
-            w_k_i = w_k[i]  # [head_dim, d_model]
-            r_n = get_rope_matrix(n, head_dim, rope_base, device=device) # [head_dim, head_dim]
-            
-            # --- The elegant linear math ---
-            # 1. Map target vector into Key space: W_K @ v_svm
-            key_proj = torch.matmul(w_k_i, v_svm)  # shape: [head_dim]
-            
-            # 2. Apply RoPE rotation: R_n @ key_proj
-            rotated_key = torch.matmul(r_n, key_proj) # shape: [head_dim]
-            
-            # 3. Pull gradient back to Residual Stream via Query weights: W_Q^T @ rotated_key
-            # Note: PyTorch w_q_i is [head_dim, d_model], so w_q_i.T acts as the mapping back to d_model
-            grad_head_i = torch.matmul(w_q_i.T, rotated_key) # shape: [d_model]
-            
-            grad_n += grad_head_i
-            
-        all_grads.append(grad_n)
+    # --- 5. 分量歸一化與相減 (Normalization Annihilation) [cite: 57-61] ---
+    grad_s_avg = D_s.mean(dim=0) # [d_model]
+    grad_l_avg = D_l.mean(dim=0) # [d_model]
 
-    # Average the gradient over all RoPE distances to create a robust static vector
-    v_star = torch.stack(all_grads).mean(dim=0)  # [d_model]
+    # 定義公式：v_norm = v / (v \cdot n) 使得其在 n 方向投影為 1 
+    def normalize_on_n(v, n_vec):
+        projection_len = torch.dot(v, n_vec)
+        return v / projection_len
 
-    # Normalize and scale by steering strength (alpha)
-    v_star_norm = F.normalize(v_star, dim=0)
-    v_opt = v_star_norm * float(alpha)
+    grad_s_norm = normalize_on_n(grad_s_avg, n)
+    grad_l_norm = normalize_on_n(grad_l_avg, n)
 
-    print("[Math Engine] Strategy 3 optimal vector computed successfully.")
-    return v_opt.reshape(1, -1).to(dtype=out_dtype)
+    # 最終對消：v* = normalize(grad_s_norm - grad_l_norm) 
+    v_star = grad_s_norm - grad_l_norm
+    v_opt = F.normalize(v_star, dim=0) * float(alpha)
+
+    mu_s = H_s.mean(dim=0)
+    mu_l = H_l.mean(dim=0)
+    cos_vopt_mu = F.cosine_similarity(v_opt, mu_s - mu_l, dim=0).item()
+    print(f"[Math Engine] cos(v_opt, mu_s-mu_l): {cos_vopt_mu:.6f}")
+
+    print(f"[Math Engine] Neutral axis alignment: {torch.max(abs_cos).item():.4f}")
+    return v_opt.reshape(1, -1).to(dtype=W_q_weights.dtype)
 
 
 def _calculate_steering_vector_single_layer(root_dir, classifier_path, decay_span, alpha):
