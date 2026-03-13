@@ -818,8 +818,15 @@ def _compute_attention_mapped_steering_vector(
 
     mu_s = H_s.mean(dim=0)
     mu_l = H_l.mean(dim=0)
-    cos_vopt_mu = F.cosine_similarity(v_opt, mu_s - mu_l, dim=0).item()
-    print(f"[Math Engine] cos(v_opt, mu_s-mu_l): {cos_vopt_mu:.6f}")
+    mu_diff = mu_s - mu_l
+    cos_vopt_mu = F.cosine_similarity(v_opt, mu_diff, dim=0).item()
+    if cos_vopt_mu > 0.0:
+        v_opt = -v_opt
+        cos_vopt_mu = F.cosine_similarity(v_opt, mu_diff, dim=0).item()
+        print("[Math Engine] cos(v_opt, mu_s-mu_l) was positive; flipped v_opt sign.")
+
+    print(f"[Math Engine] final v_opt: {v_opt}")
+    print(f"[Math Engine] final cos(v_opt, mu_s-mu_l): {cos_vopt_mu:.6f}")
 
     print(f"[Math Engine] Neutral axis alignment: {torch.max(abs_cos).item():.4f}")
     return v_opt.reshape(1, -1).to(device=original_device, dtype=W_q_weights.dtype)
