@@ -734,7 +734,8 @@ def _compute_attention_mapped_steering_vector(
     4. Normalizes gradients such that their projection on 'n' is exactly 1.
     5. Subtracts normalized gradients to annihilate the neutral component.
     """
-    device = W_q_weights.device
+    original_device = W_q_weights.device
+    compute_device = torch.device("cuda") if torch.cuda.is_available() else original_device
     dtype = torch.float32 # 確保幾何運算的精度
     
     # --- 1. 權重與維度處理 ---
@@ -742,23 +743,23 @@ def _compute_attention_mapped_steering_vector(
         d_model = W_q_weights.shape[0]
         head_dim = 128 
         num_heads = d_model // head_dim
-        w_q = W_q_weights.reshape(num_heads, head_dim, d_model).to(dtype=dtype)
-        w_k = W_k_weights.reshape(num_heads, head_dim, d_model).to(dtype=dtype)
+        w_q = W_q_weights.reshape(num_heads, head_dim, d_model).to(device=compute_device, dtype=dtype)
+        w_k = W_k_weights.reshape(num_heads, head_dim, d_model).to(device=compute_device, dtype=dtype)
     else:
         num_heads, head_dim, d_model = W_q_weights.shape
-        w_q = W_q_weights.to(dtype=dtype)
-        w_k = W_k_weights.to(dtype=dtype)
+        w_q = W_q_weights.to(device=compute_device, dtype=dtype)
+        w_k = W_k_weights.to(device=compute_device, dtype=dtype)
 
-    H_s = H_s.to(dtype=dtype)
-    H_l = H_l.to(dtype=dtype)
+    H_s = H_s.to(device=compute_device, dtype=dtype)
+    H_l = H_l.to(device=compute_device, dtype=dtype)
 
     # --- 2. 映射至梯度空間 (D_s, D_l) [cite: 51-53] ---
     def get_attention_gradients(H_states):
         D = []
         # 預計算 RoPE 矩陣的平均，以優化效能 (average_over_rope) 
-        combined_rope_map = torch.zeros(num_heads, d_model, d_model, device=device, dtype=dtype)
-        for n in range(rope_context_len):
-            r_n = get_rope_matrix(n, head_dim, rope_base, device=device).to(dtype=dtype)
+        combined_rope_map = torch.zeros(num_heads, d_model, d_model, device=compute_device, dtype=dtype)
+        for n in tqdm(range(rope_context_len)):
+            r_n = get_rope_matrix(n, head_dim, rope_base, device=compute_device).to(dtype=dtype)
             for i in range(num_heads):
                 # 這裡計算 W_q^T @ R_n @ W_k 
                 combined_rope_map[i] += torch.matmul(w_q[i].T, torch.matmul(r_n, w_k[i]))
@@ -768,7 +769,7 @@ def _compute_attention_mapped_steering_vector(
             # h shape: [d_model]
             # grad = \sum (h @ W_k^T @ R_n^T @ W_q)
             # 這裡簡化為矩陣線性變換
-            grad = torch.zeros(d_model, device=device, dtype=dtype)
+            grad = torch.zeros(d_model, device=compute_device, dtype=dtype)
             for i in range(num_heads):
                 grad += torch.matmul(combined_rope_map[i], h)
             D.append(grad)
@@ -821,7 +822,7 @@ def _compute_attention_mapped_steering_vector(
     print(f"[Math Engine] cos(v_opt, mu_s-mu_l): {cos_vopt_mu:.6f}")
 
     print(f"[Math Engine] Neutral axis alignment: {torch.max(abs_cos).item():.4f}")
-    return v_opt.reshape(1, -1).to(dtype=W_q_weights.dtype)
+    return v_opt.reshape(1, -1).to(device=original_device, dtype=W_q_weights.dtype)
 
 
 def _calculate_steering_vector_single_layer(root_dir, classifier_path, decay_span, alpha):
