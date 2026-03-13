@@ -6,11 +6,10 @@ import re
 import tempfile
 import wave
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, Optional
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
-from huggingface_hub import hf_hub_download
 
 from moshi.offline import run_batch_inference, _get_voice_prompt_dir
 from moshi.models import loaders
@@ -346,8 +345,7 @@ def _compute_attention_mapped_steering_vector_single_layer(root_dir, classifier_
     """Generate one optimized steering vector for a target layer.
 
     Uses mode-class dataset hidden states (H_s/H_l) loaded from ``classifier_dir``
-    and layer-specific Moshi attention weights (W_q/W_k), then writes the
-    per-token decay schedule into ``root_dir/*/steering_vector.json``.
+    and writes the per-token decay schedule into ``root_dir/*/steering_vector.json``.
     """
     token_rate_hz = 12.5
     root = Path(root_dir)
@@ -361,48 +359,16 @@ def _compute_attention_mapped_steering_vector_single_layer(root_dir, classifier_
         raise ValueError(f"Invalid layer {layer}; expected [{MAIN_LAYER_MIN}..{MAIN_LAYER_MAX}]")
     layer_key = f"layer_{_internal_layer_to_json_layer(layer)}"
 
-    moshi_weight = hf_hub_download(loaders.DEFAULT_REPO, loaders.MOSHI_NAME)
-    lm = loaders.get_moshi_lm(moshi_weight, device="cpu", cpu_offload=False)
-    lm.eval()
-
-    num_layers = len(lm.transformer.layers)
-    layer_idx = layer if layer >= 0 else num_layers + layer
-    if layer_idx < 0 or layer_idx >= num_layers:
-        raise ValueError(
-            f"Layer index {layer} (resolved to {layer_idx}) out of range for model with {num_layers} layers"
-        )
-
-    target_layer = lm.transformer.layers[layer_idx]
-    attn = cast(Any, target_layer.self_attn)
-    w = attn.in_proj_weight.detach().cpu().float()
-    embed_dim = int(attn.embed_dim)
-    weights_per_step = int(getattr(attn, "weights_per_step", 0))
-
-    if weights_per_step > 0 and w.dim() == 2 and w.shape[0] == weights_per_step * 3 * embed_dim:
-        # Use step 0 for offline steering-vector generation.
-        w = w.view(weights_per_step, 3 * embed_dim, embed_dim)[0]
-
-    if w.dim() != 2 or w.shape[0] != 3 * embed_dim or w.shape[1] != embed_dim:
-        raise RuntimeError(f"Unexpected in_proj_weight shape for packed QKV: {tuple(w.shape)}")
-
-    w_q = w[:embed_dim, :].contiguous()
-    w_k = w[embed_dim : 2 * embed_dim, :].contiguous()
-
-    print("W_q shape:", w_q.shape)
-    print("W_k shape:", w_k.shape)
-
     H_s, H_l = _load_mode_class_hidden_sets(classifier_dir, layer)
-    if int(H_s.shape[-1]) != embed_dim or int(H_l.shape[-1]) != embed_dim:
+    if int(H_s.shape[-1]) != int(H_l.shape[-1]):
         raise ValueError(
             f"Hidden dim mismatch for layer {layer}: H_s={int(H_s.shape[-1])}, "
-            f"H_l={int(H_l.shape[-1])}, expected={embed_dim}"
+            f"H_l={int(H_l.shape[-1])}"
         )
 
     mapped_vector = _compute_attention_mapped_steering_vector(
         H_s=H_s,
         H_l=H_l,
-        W_q_weights=w_q,
-        W_k_weights=w_k,
         alpha=float(alpha),
     ).reshape(-1)
     mu_diff = H_s.mean(dim=0) - H_l.mean(dim=0)
@@ -516,10 +482,9 @@ def compute_attention_mapped_steering_vector_average(
     alpha: float,
 ) -> None:
     """Compute the average of attention-mapped steering vectors across ALL available layers
-    (each layer uses its own W_q/W_k from the Moshi model and H_s/H_l loaded from the
-    mode-class dataset under ``classifier_dir``), then save that single averaged vector
-    (with decay schedule) under the key for ``target_layer`` in each
-    root_dir/*/steering_vector.json.
+    (using H_s/H_l loaded from the mode-class dataset under ``classifier_dir``),
+    then save that single averaged vector (with decay schedule) under the key
+    for ``target_layer`` in each root_dir/*/steering_vector.json.
     """
     token_rate_hz = 12.5
     root = Path(root_dir)
@@ -538,44 +503,15 @@ def compute_attention_mapped_steering_vector_average(
         f"{len(all_layers)} layers: {all_layers}"
     )
 
-    # Load Moshi model once; reuse for all layers.
-    moshi_weight = hf_hub_download(loaders.DEFAULT_REPO, loaders.MOSHI_NAME)
-    lm = loaders.get_moshi_lm(moshi_weight, device="cpu", cpu_offload=False)
-    lm.eval()
-    num_model_layers = len(lm.transformer.layers)
-
     layer_vectors: list[torch.Tensor] = []
     layer_mean_diffs: list[tuple[int, torch.Tensor]] = []  # (layer, mean(H_s) - mean(H_l))
 
     for layer in all_layers:
-        layer_idx = layer if layer >= 0 else num_model_layers + layer
-        if layer_idx < 0 or layer_idx >= num_model_layers:
-            print(f"[user_interrupt] Warning: skipping layer {layer} (out of model range)")
-            continue
-
-        # Extract W_q/W_k from Moshi at this layer.
-        attn_layer = lm.transformer.layers[layer_idx]
-        attn = cast(Any, attn_layer.self_attn)
-        w = attn.in_proj_weight.detach().cpu().float()
-        embed_dim = int(attn.embed_dim)
-        weights_per_step = int(getattr(attn, "weights_per_step", 0))
-
-        if weights_per_step > 0 and w.dim() == 2 and w.shape[0] == weights_per_step * 3 * embed_dim:
-            w = w.view(weights_per_step, 3 * embed_dim, embed_dim)[0]
-
-        if w.dim() != 2 or w.shape[0] != 3 * embed_dim or w.shape[1] != embed_dim:
-            raise RuntimeError(
-                f"Unexpected in_proj_weight shape at layer {layer}: {tuple(w.shape)}"
-            )
-
-        w_q = w[:embed_dim, :].contiguous()
-        w_k = w[embed_dim : 2 * embed_dim, :].contiguous()
-
         H_s, H_l = _load_mode_class_hidden_sets(classifier_dir, layer)
-        if int(H_s.shape[-1]) != embed_dim or int(H_l.shape[-1]) != embed_dim:
+        if int(H_s.shape[-1]) != int(H_l.shape[-1]):
             raise ValueError(
                 f"Hidden dim mismatch at layer {layer}: H_s={int(H_s.shape[-1])}, "
-                f"H_l={int(H_l.shape[-1])}, expected={embed_dim}"
+                f"H_l={int(H_l.shape[-1])}"
             )
         layer_mean_diffs.append((layer, H_s.mean(dim=0) - H_l.mean(dim=0)))
 
@@ -584,8 +520,6 @@ def compute_attention_mapped_steering_vector_average(
         mapped = _compute_attention_mapped_steering_vector(
             H_s=H_s,
             H_l=H_l,
-            W_q_weights=w_q,
-            W_k_weights=w_k,
             alpha=1.0,
         ).reshape(-1)
         layer_vectors.append(mapped)
@@ -716,77 +650,36 @@ def get_rope_matrix(
     
     return R_n
 
+
 def _compute_attention_mapped_steering_vector(
     H_s: torch.Tensor,        # [N_s, d_model] - Speaking mode hidden states
     H_l: torch.Tensor,        # [N_l, d_model] - Listening mode hidden states
-    W_q_weights: torch.Tensor, # [num_heads, head_dim, d_model] or [d_model, d_model]
-    W_k_weights: torch.Tensor, # [num_heads, head_dim, d_model] or [d_model, d_model]
-    rope_base: float = 10000.0,
-    rope_context_len: int = 200,
     alpha: float = 1.0,
 ) -> torch.Tensor:
     """
-    Persona Vector Theory v4: Subspace Intersection & Component Normalization.
+    Persona Vector Theory v5: Activation-Space Subspace Intersection & Normalization Annihilation.
     
-    1. Maps H_s and H_l to Attention Gradient Space (D_s, D_l)[cite: 52, 53].
-    2. Performs PCA to find the 2D subspace of each mode[cite: 54].
-    3. Identifies the shared 'neutral direction' (n) via subspace alignment[cite: 55, 56].
-    4. Normalizes gradients such that their projection on 'n' is exactly 1.
-    5. Subtracts normalized gradients to annihilate the neutral component.
+    1. Directly applies PCA on Hidden States (H_s, H_l) to find 2D subspaces.
+    2. Identifies the shared 'neutral direction' (n) via subspace alignment in Activation Space.
+    3. Calculates mu_s = E(H_s) and mu_l = E(H_l).
+    4. Normalizes mu_s and mu_l such that their projection on 'n' is equal.
+    5. V* = mu_s* - mu_l* (Annihilates the common neutral background).
+    6. Ensures the final vector has negative cosine similarity with the naive mu_s - mu_l.
     """
-    original_device = W_q_weights.device
+    original_device = H_s.device
     compute_device = torch.device("cuda") if torch.cuda.is_available() else original_device
     dtype = torch.float32 # 確保幾何運算的精度
     
-    # --- 1. 權重與維度處理 ---
-    if W_q_weights.dim() == 2:
-        d_model = W_q_weights.shape[0]
-        head_dim = 128 
-        num_heads = d_model // head_dim
-        w_q = W_q_weights.reshape(num_heads, head_dim, d_model).to(device=compute_device, dtype=dtype)
-        w_k = W_k_weights.reshape(num_heads, head_dim, d_model).to(device=compute_device, dtype=dtype)
-    else:
-        num_heads, head_dim, d_model = W_q_weights.shape
-        w_q = W_q_weights.to(device=compute_device, dtype=dtype)
-        w_k = W_k_weights.to(device=compute_device, dtype=dtype)
-
     H_s = H_s.to(device=compute_device, dtype=dtype)
     H_l = H_l.to(device=compute_device, dtype=dtype)
 
-    # --- 2. 映射至梯度空間 (D_s, D_l) [cite: 51-53] ---
-    def get_attention_gradients(H_states):
-        D = []
-        # 預計算 RoPE 矩陣的平均，以優化效能 (average_over_rope) 
-        combined_rope_map = torch.zeros(num_heads, d_model, d_model, device=compute_device, dtype=dtype)
-        for n in tqdm(range(rope_context_len)):
-            r_n = get_rope_matrix(n, head_dim, rope_base, device=compute_device).to(dtype=dtype)
-            for i in range(num_heads):
-                # 這裡計算 W_q^T @ R_n @ W_k 
-                combined_rope_map[i] += torch.matmul(w_q[i].T, torch.matmul(r_n, w_k[i]))
-        combined_rope_map /= rope_context_len
-
-        for h in H_states:
-            # h shape: [d_model]
-            # grad = \sum (h @ W_k^T @ R_n^T @ W_q)
-            # 這裡簡化為矩陣線性變換
-            grad = torch.zeros(d_model, device=compute_device, dtype=dtype)
-            for i in range(num_heads):
-                grad += torch.matmul(combined_rope_map[i], h)
-            D.append(grad)
-        return torch.stack(D) # [N, d_model]
-
-    print("[Math Engine] Mapping activations to gradient space...")
-    D_s = get_attention_gradients(H_s) # [N_s, d_model]
-    D_l = get_attention_gradients(H_l) # [N_l, d_model]
-
-    # --- 3. PCA 子空間提取 [cite: 54] ---
+    # --- 1. PCA 子空間提取 (直接在 Activation Space 進行) ---
     # 使用 lowrank PCA 提取前兩個主成分 (PC1, PC2)
-    _, _, V_s = torch.pca_lowrank(D_s, q=2) # V_s: [d_model, 2]
-    _, _, V_l = torch.pca_lowrank(D_l, q=2) # V_l: [d_model, 2]
+    _, _, V_s = torch.pca_lowrank(H_s, q=2) # V_s: [d_model, 2]
+    _, _, V_l = torch.pca_lowrank(H_l, q=2) # V_l: [d_model, 2]
 
-    # --- 4. 尋找對齊的中性軸 (n) [cite: 55-56] ---
+    # --- 2. 尋找對齊的中性軸 (n) ---
     # 計算兩組 PC 之間的 Cosine Similarity 矩陣
-    # cos_sim[i, j] 表示 V_s 的第 i 個 PC 與 V_l 的第 j 個 PC 的相似度
     cos_sim = torch.matmul(V_s.T, V_l) 
     abs_cos = torch.abs(cos_sim)
     idx_s, idx_l = torch.where(abs_cos == torch.max(abs_cos))
@@ -795,42 +688,41 @@ def _compute_attention_mapped_steering_vector(
     n_dir_s = V_s[:, idx_s]
     n_dir_l = V_l[:, idx_l]
     
-    # 確保符號一致並融合 (n = n_dir_l + n_dir_r) [cite: 56]
+    # 確保符號一致並融合 (n = n_dir_l + n_dir_s)
     if cos_sim[idx_s, idx_l] < 0:
         n_dir_l = -n_dir_l
     n = F.normalize(n_dir_s + n_dir_l, dim=0)
 
-    # --- 5. 分量歸一化與相減 (Normalization Annihilation) [cite: 57-61] ---
-    grad_s_avg = D_s.mean(dim=0) # [d_model]
-    grad_l_avg = D_l.mean(dim=0) # [d_model]
+    # --- 3. 平均隱藏狀態計算 ---
+    mu_s = H_s.mean(dim=0) # [d_model]
+    mu_l = H_l.mean(dim=0) # [d_model]
 
+    # --- 4. 分量歸一化與相減 (Normalization Annihilation) ---
     # 定義公式：v_norm = v / (v \cdot n) 使得其在 n 方向投影為 1 
     def normalize_on_n(v, n_vec):
         projection_len = torch.dot(v, n_vec)
         return v / projection_len
 
-    grad_s_norm = normalize_on_n(grad_s_avg, n)
-    grad_l_norm = normalize_on_n(grad_l_avg, n)
+    mu_s_star = normalize_on_n(mu_s, n)
+    mu_l_star = normalize_on_n(mu_l, n)
 
-    # 最終對消：v* = normalize(grad_s_norm - grad_l_norm) 
-    v_star = grad_s_norm - grad_l_norm
+    # 最終對消：v* = normalize(mu_s* - mu_l*) 
+    v_star = mu_s_star - mu_l_star
     v_opt = F.normalize(v_star, dim=0) * float(alpha)
 
-    mu_s = H_s.mean(dim=0)
-    mu_l = H_l.mean(dim=0)
+    # --- 5. 強制確保與 mu_s - mu_l 呈負相關 ---
     mu_diff = mu_s - mu_l
     cos_vopt_mu = F.cosine_similarity(v_opt, mu_diff, dim=0).item()
+    
     if cos_vopt_mu > 0.0:
-        v_opt = -v_opt
+        v_opt = -v_opt  # 翻轉向量方向
         cos_vopt_mu = F.cosine_similarity(v_opt, mu_diff, dim=0).item()
         print("[Math Engine] cos(v_opt, mu_s-mu_l) was positive; flipped v_opt sign.")
 
-    print(f"[Math Engine] final v_opt: {v_opt}")
+    print(f"[Math Engine] Neutral axis alignment (Activation Space): {torch.max(abs_cos).item():.4f}")
     print(f"[Math Engine] final cos(v_opt, mu_s-mu_l): {cos_vopt_mu:.6f}")
 
-    print(f"[Math Engine] Neutral axis alignment: {torch.max(abs_cos).item():.4f}")
-    return v_opt.reshape(1, -1).to(device=original_device, dtype=W_q_weights.dtype)
-
+    return v_opt.reshape(1, -1).to(device=original_device, dtype=torch.float32)
 
 def _calculate_steering_vector_single_layer(root_dir, classifier_path, decay_span, alpha):
     """At interrupt_start, we calculate the steering vector with length alpha, 
