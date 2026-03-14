@@ -1260,7 +1260,7 @@ def plot_residual_routing(
 
     # Strictly same-step routing: n-th hidden is compared to n-th input/output vectors.
     # Convert each vector to a probability distribution with softmax, then compute
-    # token-wise JSD and normalize by ln(2) to map into [0, 1].
+    # token-wise raw JSD (natural-log base).
     eps = 1e-12
 
     def _jsd_per_token(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -1270,7 +1270,7 @@ def plot_residual_routing(
         kl_a_m = F.kl_div(pa.log(), m, reduction="none").sum(dim=1)
         kl_b_m = F.kl_div(pb.log(), m, reduction="none").sum(dim=1)
         jsd = 0.5 * (kl_a_m + kl_b_m)
-        return jsd / float(np.log(2.0))
+        return jsd
 
     input_jsd = _jsd_per_token(h_l, full_input).detach().cpu().numpy()
     output_jsd = _jsd_per_token(h_l, full_output).detach().cpu().numpy()
@@ -1317,7 +1317,7 @@ def plot_residual_routing(
         linewidth=1.2,
         label="Output JSD: JSD(h_L[n] || full_output[n])",
     )
-    ax_top.set_ylabel("JSD (normalized)")
+    ax_top.set_ylabel("JSD")
     ax_top.set_title(
         f"Residual Routing at Step n via JSD (layer={layer}, tokens={T})"
     )
@@ -1332,15 +1332,15 @@ def plot_residual_routing(
             y_mid = float(y_all.mean())
             y_lo, y_hi = y_mid - 0.05, y_mid + 0.05
         pad = max(0.01, 0.12 * (y_hi - y_lo))
-        y_min = max(0.0, y_lo - pad)
-        y_max = min(1.0, y_hi + pad)
+        y_min = y_lo - pad
+        y_max = y_hi + pad
         if y_max - y_min < 0.04:
             y_mid = 0.5 * (y_min + y_max)
-            y_min = max(0.0, y_mid - 0.02)
-            y_max = min(1.0, y_mid + 0.02)
+            y_min = y_mid - 0.02
+            y_max = y_mid + 0.02
         ax_top.set_ylim(y_min, y_max)
     else:
-        ax_top.set_ylim(0.0, 1.0)
+        ax_top.set_ylim(0.0, 0.5)
     ax_top.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
     ax_top.legend(loc="upper right", fontsize=8)
 
