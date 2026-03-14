@@ -1015,11 +1015,11 @@ def plot_output_hidden_alignment(
     *,
     layer: int = -1,
 ) -> None:
-    """Plot token-step alignments and synchronized user/model waveforms.
+    """Plot token-step projections and synchronized user/model waveforms.
 
     Top subplot (token-rate):
-      - Listen alignment: cosine(hidden[L, n], user_audio_embedding[n+1])
-      - Speak alignment: cosine(hidden[L, n], model_output_state[n+1])
+      - Line 1: projection length of user_audio_embedding[n] onto hidden[L, n-1]
+      - Line 2: projection length of model_output_state[n] onto hidden[L, n-1]
 
     Bottom subplot (sample-rate):
       - input.wav and output.wav amplitudes over time.
@@ -1055,24 +1055,28 @@ def plot_output_hidden_alignment(
             f"model={tuple(model_state.shape)}"
         )
 
-    n_steps = min(hidden_l.shape[0], user_emb.shape[0] - 1, model_state.shape[0] - 1)
-    if n_steps <= 0:
+    # Build pairs at token n projected onto hidden at token (n-1).
+    n_pairs = min(hidden_l.shape[0] - 1, user_emb.shape[0] - 1, model_state.shape[0] - 1)
+    if n_pairs <= 0:
         raise ValueError(
-            "Not enough token steps for n->n+1 alignment. "
+            "Not enough token steps for n on (n-1) projection. "
             f"hidden={hidden_l.shape[0]}, user={user_emb.shape[0]}, model={model_state.shape[0]}"
         )
 
-    h_n = hidden_l[:n_steps]
-    u_n1 = user_emb[1 : 1 + n_steps]
-    s_n1 = model_state[1 : 1 + n_steps]
+    h_prev = hidden_l[:n_pairs]
+    u_curr = user_emb[1 : 1 + n_pairs]
+    s_curr = model_state[1 : 1 + n_pairs]
 
-    listen_align = torch.nn.functional.cosine_similarity(h_n, u_n1, dim=1)
-    speak_align = torch.nn.functional.cosine_similarity(h_n, s_n1, dim=1)
+    # Projection length ||proj_h(x)|| = |x · h_hat| where h_hat = h / ||h||.
+    h_unit = h_prev / h_prev.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12)
+    user_proj_len = (u_curr * h_unit).sum(dim=1).abs()
+    model_proj_len = (s_curr * h_unit).sum(dim=1).abs()
 
-    token_times_sec = torch.arange(n_steps, dtype=torch.float32) / frame_rate_hz
+    # Use token n timestamps on x-axis (starts at n=1).
+    token_times_sec = torch.arange(1, n_pairs + 1, dtype=torch.float32) / frame_rate_hz
     token_times_np = token_times_sec.numpy()
-    listen_np = listen_align.detach().cpu().numpy()
-    speak_np = speak_align.detach().cpu().numpy()
+    listen_np = user_proj_len.detach().cpu().numpy()
+    speak_np = model_proj_len.detach().cpu().numpy()
 
     hidden_p = Path(hidden_path)
     input_wav = Path(str(payload.get("input_wav", hidden_p.with_name("input.wav"))))
@@ -1083,7 +1087,7 @@ def plot_output_hidden_alignment(
     in_times = np.arange(in_wav.shape[0], dtype=np.float32) / float(in_sr)
     out_times = np.arange(out_wav.shape[0], dtype=np.float32) / float(out_sr)
 
-    top_end = float(n_steps) / frame_rate_hz
+    top_end = float(n_pairs + 1) / frame_rate_hz
     max_t = max(
         top_end,
         float(in_wav.shape[0]) / float(in_sr),
@@ -1105,20 +1109,19 @@ def plot_output_hidden_alignment(
         listen_np,
         color="#1f77b4",
         linewidth=1.6,
-        label="Listen Alignment: cos(hidden[n], user_emb[n+1])",
+        label="User Projection Length: |proj_{hidden[n-1]}(user[n])|",
     )
     ax_top.plot(
         token_times_np,
         speak_np,
         color="#d62728",
         linewidth=1.6,
-        label="Speak Alignment: cos(hidden[n], model_state[n+1])",
+        label="Model Projection Length: |proj_{hidden[n-1]}(model[n])|",
     )
-    ax_top.axhline(0.0, color="#666666", linewidth=0.8, linestyle="--", alpha=0.7)
-    ax_top.set_ylim(-1.05, 1.05)
-    ax_top.set_ylabel("Cosine similarity")
+    ax_top.set_ylim(bottom=0.0)
+    ax_top.set_ylabel("Projection length")
     ax_top.set_title(
-        f"Token Alignment vs Audio Timeline (layer={layer}, steps={n_steps})"
+        f"Projection Lengths vs Audio Timeline (layer={layer}, pairs={n_pairs})"
     )
     ax_top.grid(True, axis="y", linestyle=":", linewidth=0.7, alpha=0.65)
     ax_top.legend(loc="lower right", fontsize=8)
