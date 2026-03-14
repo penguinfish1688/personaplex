@@ -1202,7 +1202,8 @@ def plot_logit_lens_step_n(
     """Plot step-n premature-decode CE losses and aligned waveforms.
 
     Top subplot:
-    - User Multi-modal CE: (CE_audio_user + CE_text_user) / 2
+            - User Multi-modal CE (shifted): logits from step n vs user targets at step n+1
+                i.e. (CE_audio_user_shift + CE_text_user_shift) / 2
     - Model Multi-modal CE: (CE_audio_model + CE_text_model) / 2
 
     Bottom subplot:
@@ -1234,6 +1235,8 @@ def plot_logit_lens_step_n(
         raise ValueError(f"Expected output_token_ids [T, K_out], got {tuple(output_token_ids.shape)}")
 
     T, num_layers, d_hidden = hidden.shape
+    if T < 2:
+        raise ValueError("Need at least 2 token steps to compute user n+1 shifted CE.")
     if input_token_ids.shape[0] != T or output_token_ids.shape[0] != T:
         raise ValueError(
             "Token-length mismatch across hidden/token-id tensors: "
@@ -1279,25 +1282,27 @@ def plot_logit_lens_step_n(
             logits0 = lm.forward_depformer(0, dep_in, x)  # [T, 1, 1, card]
         logits0 = logits0[:, 0, 0, :].float()  # [T, card]
 
+        # User-focus CE is shifted by +1 target step: compare logits(n) with user_target(n+1).
         user_audio_ce = F.cross_entropy(
-            logits0,
-            user_audio_target.to(device=device, dtype=torch.long),
+            logits0[:-1],
+            user_audio_target[1:].to(device=device, dtype=torch.long),
             reduction="none",
         )
+        # Model-focus CE remains step-aligned with n on the same valid plotted range [0..T-2].
         model_audio_ce = F.cross_entropy(
-            logits0,
-            model_audio_target.to(device=device, dtype=torch.long),
+            logits0[:-1],
+            model_audio_target[:-1].to(device=device, dtype=torch.long),
             reduction="none",
         )
 
         user_text_ce = F.cross_entropy(
-            text_logits,
-            user_text_target.to(device=device, dtype=torch.long),
+            text_logits[:-1],
+            user_text_target[1:].to(device=device, dtype=torch.long),
             reduction="none",
         )
         model_text_ce = F.cross_entropy(
-            text_logits,
-            model_text_target.to(device=device, dtype=torch.long),
+            text_logits[:-1],
+            model_text_target[:-1].to(device=device, dtype=torch.long),
             reduction="none",
         )
 
@@ -1309,9 +1314,9 @@ def plot_logit_lens_step_n(
 
     times = payload.get("times", None)
     if isinstance(times, torch.Tensor) and times.ndim == 1 and times.shape[0] == T:
-        x_sec = times.detach().cpu().float().numpy()
+        x_sec = times.detach().cpu().float().numpy()[:-1]
     else:
-        x_sec = (np.arange(T, dtype=np.float32) / float(frame_rate_hz)).astype(np.float32)
+        x_sec = (np.arange(T - 1, dtype=np.float32) / float(frame_rate_hz)).astype(np.float32)
 
     hidden_p = Path(hidden_path)
     input_wav = Path(str(payload.get("input_wav", hidden_p.with_name("input.wav"))))
@@ -1351,7 +1356,7 @@ def plot_logit_lens_step_n(
     )
     ax_top.set_ylabel("Cross-Entropy Loss")
     ax_top.set_title(
-        f"Logit Lens Multi-modal CE at Step n (layer={layer}, tokens={T})"
+        f"Logit Lens Multi-modal CE (User shifted to n+1) (layer={layer}, tokens={T})"
     )
     y_all = torch.cat([ce_user_s, ce_model_s], dim=0).numpy()
     y_all = y_all[np.isfinite(y_all)]
