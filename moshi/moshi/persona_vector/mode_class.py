@@ -1015,14 +1015,17 @@ def plot_output_hidden_alignment(
     *,
     layer: int = -1,
 ) -> None:
-    """Plot token-step projections and synchronized user/model waveforms.
+    """Plot attention heatmap (top) and aligned user/model waveforms (bottom).
 
-    Top subplot (token-rate):
-      - Line 1: projection length of user_audio_embedding[n] onto hidden[L, n-1]
-      - Line 2: projection length of model_output_state[n] onto hidden[L, n-1]
+    Top subplot:
+      - 2D attention heatmap for selected layer from ``text_attention_weights``.
+      - X-axis: key token position/time.
+      - Y-axis: query token position.
 
-    Bottom subplot (sample-rate):
-      - input.wav and output.wav amplitudes over time.
+    Bottom subplot:
+      - input.wav (user) and output.wav (model) amplitudes over time.
+
+    The figure uses shared x-axis time in seconds so key-axis and audio are aligned.
     """
     import matplotlib.pyplot as plt
     import numpy as np
@@ -1030,53 +1033,56 @@ def plot_output_hidden_alignment(
     payload = _load_hidden_payload(hidden_path)
     frame_rate_hz = float(payload.get("frame_rate", 12.5))
 
-    hidden_l = _extract_layer(payload, layer)  # [T, D]
-    user_emb = payload.get("user_audio_embeddings", None)
-    if user_emb is None:
+    attn_steps = payload.get("text_attention_weights", None)
+    if not isinstance(attn_steps, list) or len(attn_steps) == 0:
         raise KeyError(
-            "Payload is missing 'user_audio_embeddings'. "
-            "Re-run inference with updated hidden payload saving."
+            "Payload is missing non-empty 'text_attention_weights'. "
+            "Re-run inference with attention capture enabled."
         )
-    user_emb = user_emb.float()
 
-    model_state = payload.get("text_pre_unembed_states", None)
-    if model_state is None:
-        model_state = payload.get("hidden_states", None)
-    if model_state is None:
-        raise KeyError(
-            "Payload is missing both 'text_pre_unembed_states' and 'hidden_states'."
-        )
-    model_state = model_state.float()
-
-    if hidden_l.ndim != 2 or user_emb.ndim != 2 or model_state.ndim != 2:
+    first_attn = next((a for a in attn_steps if isinstance(a, torch.Tensor)), None)
+    if first_attn is None:
+        raise ValueError("All attention entries are None; cannot build heatmap.")
+    if first_attn.ndim != 3:
         raise ValueError(
-            "Expected [T, D] tensors for hidden/user/model states, got "
-            f"hidden={tuple(hidden_l.shape)}, user={tuple(user_emb.shape)}, "
-            f"model={tuple(model_state.shape)}"
+            "Expected per-step attention shape [L, H, K], "
+            f"got {tuple(first_attn.shape)}"
         )
 
-    # Build pairs at token n projected onto hidden at token (n-1).
-    n_pairs = min(hidden_l.shape[0] - 1, user_emb.shape[0] - 1, model_state.shape[0] - 1)
-    if n_pairs <= 0:
+    num_layers = first_attn.shape[0]
+    actual_layer = layer if layer >= 0 else num_layers + layer
+    if actual_layer < 0 or actual_layer >= num_layers:
         raise ValueError(
-            "Not enough token steps for n on (n-1) projection. "
-            f"hidden={hidden_l.shape[0]}, user={user_emb.shape[0]}, model={model_state.shape[0]}"
+            f"Layer {layer} out of range for attention with {num_layers} layers."
         )
 
-    h_prev = hidden_l[:n_pairs]
-    u_curr = user_emb[1 : 1 + n_pairs]
-    s_curr = model_state[1 : 1 + n_pairs]
+    # Build a dense generated-token attention matrix [T, T].
+    # We keep only the most recent generated-key window so the heatmap has a
+    # causal lower-triangular layout in generated-token coordinates.
+    T = len(attn_steps)
+    attn_matrix = np.full((T, T), np.nan, dtype=np.float32)
+    for t, entry in enumerate(attn_steps):
+        if entry is None:
+            continue
+        if not isinstance(entry, torch.Tensor) or entry.ndim != 3:
+            raise ValueError(
+                f"Unexpected attention entry at step {t}: {type(entry).__name__}, "
+                f"shape={tuple(entry.shape) if hasattr(entry, 'shape') else 'N/A'}"
+            )
+        if entry.shape[0] != num_layers:
+            raise ValueError(
+                f"Layer count mismatch at step {t}: got {entry.shape[0]}, expected {num_layers}"
+            )
+        # Mean over heads -> [K_t]
+        vec = entry[actual_layer].float().mean(dim=0).detach().cpu().numpy()
+        if vec.ndim != 1:
+            raise ValueError(f"Expected [K_t] after head-mean at step {t}, got {vec.shape}")
 
-    # Projection length ||proj_h(x)|| = |x · h_hat| where h_hat = h / ||h||.
-    h_unit = h_prev / h_prev.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12)
-    user_proj_len = (u_curr * h_unit).sum(dim=1).abs()
-    model_proj_len = (s_curr * h_unit).sum(dim=1).abs()
-
-    # Use token n timestamps on x-axis (starts at n=1).
-    token_times_sec = torch.arange(1, n_pairs + 1, dtype=torch.float32) / frame_rate_hz
-    token_times_np = token_times_sec.numpy()
-    listen_np = user_proj_len.detach().cpu().numpy()
-    speak_np = model_proj_len.detach().cpu().numpy()
+        # Place most recent keys into [0..t] span (causal generated-token view).
+        use_len = min(vec.shape[0], t + 1)
+        if use_len <= 0:
+            continue
+        attn_matrix[t, t - use_len + 1 : t + 1] = vec[-use_len:]
 
     hidden_p = Path(hidden_path)
     input_wav = Path(str(payload.get("input_wav", hidden_p.with_name("input.wav"))))
@@ -1087,9 +1093,9 @@ def plot_output_hidden_alignment(
     in_times = np.arange(in_wav.shape[0], dtype=np.float32) / float(in_sr)
     out_times = np.arange(out_wav.shape[0], dtype=np.float32) / float(out_sr)
 
-    top_end = float(n_pairs + 1) / frame_rate_hz
+    token_end = float(T) / frame_rate_hz
     max_t = max(
-        top_end,
+        token_end,
         float(in_wav.shape[0]) / float(in_sr),
         float(out_wav.shape[0]) / float(out_sr),
     )
@@ -1101,35 +1107,31 @@ def plot_output_hidden_alignment(
         figsize=(fig_w, 6.5),
         dpi=180,
         sharex=True,
-        gridspec_kw={"height_ratios": [2.2, 1.0]},
+        gridspec_kw={"height_ratios": [2.4, 1.0]},
     )
 
-    ax_top.plot(
-        token_times_np,
-        listen_np,
-        color="#1f77b4",
-        linewidth=1.6,
-        label="User Projection Length: |proj_{hidden[n-1]}(user[n])|",
+    # Map key-axis [0..T] to seconds for direct alignment with waveform axis.
+    img = ax_top.imshow(
+        attn_matrix,
+        cmap="Blues",
+        aspect="auto",
+        interpolation="nearest",
+        origin="lower",
+        extent=[0.0, token_end, -0.5, T - 0.5],
+        vmin=0.0,
     )
-    ax_top.plot(
-        token_times_np,
-        speak_np,
-        color="#d62728",
-        linewidth=1.6,
-        label="Model Projection Length: |proj_{hidden[n-1]}(model[n])|",
-    )
-    ax_top.set_ylim(bottom=0.0)
-    ax_top.set_ylabel("Projection length")
+    cbar = fig.colorbar(img, ax=ax_top, fraction=0.03, pad=0.02)
+    cbar.set_label("Attention weight")
+    ax_top.set_ylabel("Query token position")
     ax_top.set_title(
-        f"Projection Lengths vs Audio Timeline (layer={layer}, pairs={n_pairs})"
+        f"Attention Heatmap + Audio Timeline (layer={layer}, steps={T})"
     )
-    ax_top.grid(True, axis="y", linestyle=":", linewidth=0.7, alpha=0.65)
-    ax_top.legend(loc="lower right", fontsize=8)
+    ax_top.grid(False)
 
     ax_bot.plot(in_times, in_wav, color="#2ca02c", linewidth=0.7, alpha=0.9, label="input.wav (user)")
     ax_bot.plot(out_times, out_wav, color="#9467bd", linewidth=0.7, alpha=0.85, label="output.wav (model)")
     ax_bot.set_ylabel("Amplitude")
-    ax_bot.set_xlabel("Time (seconds)")
+    ax_bot.set_xlabel("Time (seconds)  [aligned with key-axis above]")
     ax_bot.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
     ax_bot.legend(loc="upper right", fontsize=8)
     ax_bot.set_xlim(0.0, max_t)
@@ -1147,7 +1149,7 @@ def plot_output_hidden_alignment_dataset(
     *,
     layer: int = -1,
 ) -> None:
-    """Recursively find all ``output_hidden.pt`` files and plot alignments."""
+    """Recursively find all ``output_hidden.pt`` files and plot attention+audio."""
     root = Path(root_dir)
     if not root.is_dir():
         raise FileNotFoundError(f"Root directory not found: {root}")
@@ -1156,18 +1158,18 @@ def plot_output_hidden_alignment_dataset(
     if not hidden_files:
         raise FileNotFoundError(f"No output_hidden.pt files found under {root}")
 
-    print(f"[plot-align] Found {len(hidden_files)} output_hidden.pt files under {root}")
+    print(f"[plot-attn] Found {len(hidden_files)} output_hidden.pt files under {root}")
     ok = 0
     for hp in hidden_files:
-        out_png = hp.with_name(f"output_hidden_alignment_layer_{layer}.png")
+        out_png = hp.with_name(f"output_hidden_attention_layer_{layer}.png")
         print(f"\n--- {hp} ---")
         try:
             plot_output_hidden_alignment(str(hp), str(out_png), layer=layer)
             ok += 1
         except Exception as exc:
-            print(f"  [SKIP] alignment plot failed: {exc}")
+            print(f"  [SKIP] attention plot failed: {exc}")
 
-    print(f"\n[plot-align] Done. Generated {ok}/{len(hidden_files)} plots.")
+    print(f"\n[plot-attn] Done. Generated {ok}/{len(hidden_files)} plots.")
 
 
 # ---------------------------------------------------------------------------
@@ -1228,7 +1230,7 @@ def main() -> None:
         "--plot-output-hidden-alignment-dataset",
         type=str,
         metavar="ROOT_DIR",
-        help="Recursively plot output_hidden alignment for all output_hidden.pt under ROOT_DIR.",
+        help="Recursively plot output_hidden attention heatmap + audio waveform for all output_hidden.pt under ROOT_DIR.",
     )
 
     # Shared inference options (used by --gen-*)
