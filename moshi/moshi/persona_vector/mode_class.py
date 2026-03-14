@@ -1120,7 +1120,10 @@ def plot_output_hidden_alignment(
         origin="lower",
         extent=[0.0, token_end, -0.5, T - 0.5],
     )
-    cbar = fig.colorbar(img, ax=ax_top, fraction=0.03, pad=0.02)
+    # Keep identical subplot box widths: place colorbar in an inset axis so it
+    # does not shrink the top subplot relative to the waveform subplot.
+    cax = ax_top.inset_axes([1.01, 0.0, 0.018, 1.0])
+    cbar = fig.colorbar(img, cax=cax)
     cbar.set_label("Attention logit")
     ax_top.set_ylabel("Query token position")
     ax_top.set_title(
