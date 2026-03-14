@@ -657,48 +657,57 @@ def _compute_attention_mapped_steering_vector(
     alpha: float = 1.0,
 ) -> torch.Tensor:
     """
-    Persona Vector Theory v5: Activation-Space Subspace Intersection & Normalization Annihilation.
-    
-    1. Directly applies PCA on Hidden States (H_s, H_l) to find 2D subspaces.
-    2. Identifies the shared 'neutral direction' (n) via subspace alignment in Activation Space.
-    3. Calculates mu_s = E(H_s) and mu_l = E(H_l).
-    4. Normalizes mu_s and mu_l such that their projection on 'n' is equal.
-    5. V* = mu_s* - mu_l* (Annihilates the common neutral background).
-    6. Ensures the final vector has negative cosine similarity with the naive mu_s - mu_l.
+    Persona Vector Theory v5 (SVD Enhanced) with PCA Component Alignment Diagnostics.
     """
     original_device = H_s.device
     compute_device = torch.device("cuda") if torch.cuda.is_available() else original_device
-    dtype = torch.float32 # 確保幾何運算的精度
+    dtype = torch.float32 
     
     H_s = H_s.to(device=compute_device, dtype=dtype)
     H_l = H_l.to(device=compute_device, dtype=dtype)
 
-    # --- 1. PCA 子空間提取 (直接在 Activation Space 進行) ---
-    # 使用 lowrank PCA 提取前兩個主成分 (PC1, PC2)
-    _, _, V_s = torch.pca_lowrank(H_s, q=2) # V_s: [d_model, 2]
-    _, _, V_l = torch.pca_lowrank(H_l, q=2) # V_l: [d_model, 2]
+    # --- 1. 擴張的 PCA 子空間提取 ---
+    q_dim = 5 
+    _, _, V_s = torch.pca_lowrank(H_s, q=q_dim) # V_s: [d_model, q_dim]
+    _, _, V_l = torch.pca_lowrank(H_l, q=q_dim) # V_l: [d_model, q_dim]
 
-    # --- 2. 尋找對齊的中性軸 (n) ---
-    # 計算兩組 PC 之間的 Cosine Similarity 矩陣
-    cos_sim = torch.matmul(V_s.T, V_l) 
-    abs_cos = torch.abs(cos_sim)
-    idx_s, idx_l = torch.where(abs_cos == torch.max(abs_cos))
-    idx_s, idx_l = idx_s[0], idx_l[0]
+    # --- 2. 使用 SVD 尋找真實的子空間交集 ---
+    M = torch.matmul(V_s.T, V_l) # [q_dim, q_dim]
+    U, S, Vh = torch.linalg.svd(M)
+    max_alignment = S[0].item()
 
-    n_dir_s = V_s[:, idx_s]
-    n_dir_l = V_l[:, idx_l]
+    n_dir_s = torch.matmul(V_s, U[:, 0])      
+    n_dir_l = torch.matmul(V_l, Vh[0, :])     
     
-    # 確保符號一致並融合 (n = n_dir_l + n_dir_s)
-    if cos_sim[idx_s, idx_l] < 0:
+    if torch.dot(n_dir_s, n_dir_l) < 0:
         n_dir_l = -n_dir_l
     n = F.normalize(n_dir_s + n_dir_l, dim=0)
 
+    # =====================================================================
+    # 🔍 診斷區塊：檢查 Neutral Axis (n) 與原始 PCA 主成分的相似度
+    # =====================================================================
+    # 因為 V_s, V_l 每行是單位向量，n 也是單位向量，所以內積即為 Cosine 相似度
+    cos_sim_Vs = torch.matmul(V_s.T, n) # shape: [q_dim]
+    cos_sim_Vl = torch.matmul(V_l.T, n) # shape: [q_dim]
+    
+    # 找出絕對值最大（最平行）的那根 PC 的 index
+    idx_s = torch.argmax(torch.abs(cos_sim_Vs)).item()
+    idx_l = torch.argmax(torch.abs(cos_sim_Vl)).item()
+    
+    # 取得實際的 Cosine 值（帶正負號）
+    best_cos_s = cos_sim_Vs[idx_s].item()
+    best_cos_l = cos_sim_Vl[idx_l].item()
+    
+    print(f"[Math Engine] True Neutral axis alignment (SVD, q={q_dim}): {max_alignment:.4f}")
+    print(f"[Math Engine] n aligns most with V_s PC{idx_s} (cos: {best_cos_s:.4f})")
+    print(f"[Math Engine] n aligns most with V_l PC{idx_l} (cos: {best_cos_l:.4f})")
+    # =====================================================================
+
     # --- 3. 平均隱藏狀態計算 ---
-    mu_s = H_s.mean(dim=0) # [d_model]
-    mu_l = H_l.mean(dim=0) # [d_model]
+    mu_s = H_s.mean(dim=0) 
+    mu_l = H_l.mean(dim=0) 
 
     # --- 4. 分量歸一化與相減 (Normalization Annihilation) ---
-    # 定義公式：v_norm = v / (v \cdot n) 使得其在 n 方向投影為 1 
     def normalize_on_n(v, n_vec):
         projection_len = torch.dot(v, n_vec)
         return v / projection_len
@@ -706,23 +715,22 @@ def _compute_attention_mapped_steering_vector(
     mu_s_star = normalize_on_n(mu_s, n)
     mu_l_star = normalize_on_n(mu_l, n)
 
-    # 最終對消：v* = normalize(mu_s* - mu_l*) 
     v_star = mu_s_star - mu_l_star
     v_opt = F.normalize(v_star, dim=0) * float(alpha)
 
-    # --- 5. 強制確保與 mu_s - mu_l 呈負相關 ---
+    # --- 5. 強制確保與 mu_s - mu_l 呈負相關/正交 ---
     mu_diff = mu_s - mu_l
     cos_vopt_mu = F.cosine_similarity(v_opt, mu_diff, dim=0).item()
     
     if cos_vopt_mu > 0.0:
-        v_opt = -v_opt  # 翻轉向量方向
+        v_opt = -v_opt  
         cos_vopt_mu = F.cosine_similarity(v_opt, mu_diff, dim=0).item()
         print("[Math Engine] cos(v_opt, mu_s-mu_l) was positive; flipped v_opt sign.")
 
-    print(f"[Math Engine] Neutral axis alignment (Activation Space): {torch.max(abs_cos).item():.4f}")
     print(f"[Math Engine] final cos(v_opt, mu_s-mu_l): {cos_vopt_mu:.6f}")
 
     return v_opt.reshape(1, -1).to(device=original_device, dtype=torch.float32)
+
 
 def _calculate_steering_vector_single_layer(root_dir, classifier_path, decay_span, alpha):
     """At interrupt_start, we calculate the steering vector with length alpha, 
