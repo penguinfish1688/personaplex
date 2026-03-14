@@ -938,7 +938,8 @@ class LMGen(StreamingModule[_LMGenState]):
                check_silence_token: bool=False, steering_vector: torch.Tensor | None = None,
                steering_layer: int | None = None,
              steering_vectors_by_layer: dict[int, torch.Tensor] | None = None,
-             steer_attn_only: bool = False) \
+                         steer_attn_only: bool = False,
+                         return_step_input_tokens: bool = False) \
         -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]] | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]] | tuple[torch.Tensor, HiddenLayerOutputs] | tuple[torch.Tensor, HiddenLayerOutputs, bool]:
         """Run a single step of the language model.
         
@@ -952,6 +953,8 @@ class LMGen(StreamingModule[_LMGenState]):
             check_silence_token: If True, also return a boolean indicating if silence was detected
             steering_vector: 1D steering vector for this token step. If None, no steering is applied.
             steering_layer: Main transformer layer index where steering is injected.
+            return_step_input_tokens: If True, append model input token ids for this step
+                (shape [B, K_in, 1]) where K_in is typically 17.
             
         Returns:
             Generated tokens and optionally embeddings, hidden layers, and silence detection flag
@@ -965,7 +968,7 @@ class LMGen(StreamingModule[_LMGenState]):
         # print("INPUT:", None if input_tokens is None else input_tokens.squeeze().cpu().tolist()) # DEBUG
         # print("MOSHI:", None if moshi_tokens is None else moshi_tokens.squeeze().cpu().tolist()) # DEBUG
         if prepared_inputs is None:
-            requested_extras = int(return_embeddings) + int(capture_hidden) + int(check_silence_token)
+            requested_extras = int(return_embeddings) + int(capture_hidden) + int(check_silence_token) + int(return_step_input_tokens)
             if requested_extras == 0:
                 return None
             pending: list[object] = [None]
@@ -974,6 +977,8 @@ class LMGen(StreamingModule[_LMGenState]):
             if capture_hidden:
                 pending.append(None)
             if check_silence_token:
+                pending.append(None)
+            if return_step_input_tokens:
                 pending.append(None)
             return tuple(pending)
         input_, provided_, target_, model_input_position, target_position = prepared_inputs
@@ -1085,6 +1090,8 @@ class LMGen(StreamingModule[_LMGenState]):
         if check_silence_token:
             is_silence = self.is_silence_token(output)
             returns.append(is_silence)
+        if return_step_input_tokens:
+            returns.append(input_)
             
         if len(returns) == 1:
             return returns[0]

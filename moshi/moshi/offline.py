@@ -233,6 +233,25 @@ def _extract_full_input_embedding_for_step(step_embedding: torch.Tensor) -> torc
     return x
 
 
+def _extract_step_token_ids(step_tokens: torch.Tensor) -> torch.Tensor:
+    """Convert one-step token tensor to dense `[K]` int64 CPU ids.
+
+    Accepts shape `[B, K, 1]` (expected in step mode) and returns the first batch item.
+    """
+    x = step_tokens.detach().cpu().long()
+    if x.dim() == 3:
+        if x.shape[0] < 1 or x.shape[2] != 1:
+            raise ValueError(f"Expected step token shape [B, K, 1], got {tuple(x.shape)}")
+        x = x[0, :, 0]
+    elif x.dim() == 2:
+        if x.shape[0] < 1:
+            raise ValueError(f"Expected step token shape [B, K], got {tuple(x.shape)}")
+        x = x[0]
+    elif x.dim() != 1:
+        raise ValueError(f"Unsupported step token shape: {tuple(x.shape)}")
+    return x
+
+
 def _extract_target_layer_text_keys_and_positions(
     target_layer_module: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, int]]:
@@ -302,6 +321,8 @@ def _build_hidden_payload(
     text_hidden_layers_per_token: list[torch.Tensor],
     text_pre_unembed_states_per_token: list[torch.Tensor],
     full_input_embeddings_per_token: list[torch.Tensor],
+    input_token_ids_per_token: list[torch.Tensor],
+    output_token_ids_per_token: list[torch.Tensor],
     text_attention_layers_per_token: list[Optional[torch.Tensor]],
     text_target_layer_keys: torch.Tensor,
     text_key_positions: torch.Tensor,
@@ -309,7 +330,7 @@ def _build_hidden_payload(
 ) -> Dict[str, Any]:
     """Build the serialized `.pt` payload consumed by premature decode tools.
 
-    Saved schema (`schema_version=5`):
+    Saved schema (`schema_version=6`):
         - `text_hidden_layers`: `torch.FloatTensor[T, L, D]`
           - `T`: number of generated output tokens from `input.wav` processing only.
           - `L`: number of main text transformer layers.
@@ -320,6 +341,10 @@ def _build_hidden_payload(
           - `K_t`: available key length at token `t` (can vary with causal growth).
         - `token_ids`: `torch.LongTensor[T]` generated text token ids.
         - `token_names`: `list[str]` generated token pieces (special tokens preserved).
+                - `input_token_ids`: `torch.LongTensor[T, K_in]` per-step model input token ids.
+                    - `K_in` is typically 17: text(1) + model-audio(8) + user-audio(8).
+                - `output_token_ids`: `torch.LongTensor[T, K_out]` per-step model output token ids.
+                    - `K_out` is typically 9: text(1) + model-audio(8).
         - `times`: `torch.FloatTensor[T]` token start time in seconds.
         - `token_time_ranges_sec`: `torch.FloatTensor[T, 2]` token `[start, end)`.
         - `hidden_states`: `torch.FloatTensor[T, D]` final-layer hidden states (compat key).
@@ -359,15 +384,34 @@ def _build_hidden_payload(
             "Mismatch in payload lengths: "
             f"hidden={t}, full_input_embeddings={len(full_input_embeddings_per_token)}"
         )
+    if len(input_token_ids_per_token) != t:
+        raise RuntimeError(
+            "Mismatch in payload lengths: "
+            f"hidden={t}, input_token_ids={len(input_token_ids_per_token)}"
+        )
+    if len(output_token_ids_per_token) != t:
+        raise RuntimeError(
+            "Mismatch in payload lengths: "
+            f"hidden={t}, output_token_ids={len(output_token_ids_per_token)}"
+        )
+
+    input_token_ids = torch.stack(input_token_ids_per_token, dim=0)
+    output_token_ids = torch.stack(output_token_ids_per_token, dim=0)
+    input_token_width = int(input_token_ids.shape[1])
+    output_token_width = int(output_token_ids.shape[1])
 
     payload: Dict[str, Any] = {
-        "schema_version": 5,
+        "schema_version": 6,
         "input_wav": input_wav,
         "output_wav": output_wav,
         "output_text": output_text,
         "frame_rate": float(frame_rate_hz),
         "token_ids": token_ids_tensor,
         "token_names": text_token_pieces,
+        "input_token_ids": input_token_ids,
+        "input_token_width": input_token_width,
+        "output_token_ids": output_token_ids,
+        "output_token_width": output_token_width,
         "times": times,
         "token_time_ranges_sec": token_time_ranges,
         "text_hidden_layers": hidden_tensor,
@@ -910,6 +954,8 @@ def run_batch_inference(
         text_hidden_layers_per_token: list[torch.Tensor] = []
         text_pre_unembed_states_per_token: list[torch.Tensor] = []
         full_input_embeddings_per_token: list[torch.Tensor] = []
+        input_token_ids_per_token: list[torch.Tensor] = []
+        output_token_ids_per_token: list[torch.Tensor] = []
         text_attention_layers_per_token: list[Optional[torch.Tensor]] = []
         steer_idx = 0
         for user_encoded in lm_encode_from_sphn(
@@ -951,14 +997,15 @@ def run_batch_inference(
                         return_embeddings=save_hidden_payload,
                         return_hidden_layers=True,
                         return_attention_weights=save_hidden_payload,
+                        return_step_input_tokens=save_hidden_payload,
                         steering_vector=step_steering_vector,
                         steering_layer=steering_layer,
                         steering_vectors_by_layer=step_steering_vectors_by_layer,
                         steer_attn_only=steer_attn_only,
                     )
                     if save_hidden_payload:
-                        tokens, step_embeddings, hidden_layers = cast(
-                            tuple[torch.Tensor, torch.Tensor, HiddenLayerOutputs],
+                        tokens, step_embeddings, hidden_layers, step_input_tokens = cast(
+                            tuple[torch.Tensor, torch.Tensor, HiddenLayerOutputs, torch.Tensor],
                             result,
                         )
                     else:
@@ -985,11 +1032,14 @@ def run_batch_inference(
                     if return_hidden_layers:
                         hidden_layers_list.append(hidden_layers)
                     if save_hidden_payload:
+                        tokens = cast(torch.Tensor, tokens)
                         text_hidden_layers_per_token.append(_extract_text_hidden_per_layer(hidden_layers))
                         text_pre_unembed_states_per_token.append(_extract_text_pre_unembed_state(hidden_layers))
                         full_input_embeddings_per_token.append(
                             _extract_full_input_embedding_for_step(step_embeddings)
                         )
+                        input_token_ids_per_token.append(_extract_step_token_ids(step_input_tokens))
+                        output_token_ids_per_token.append(_extract_step_token_ids(tokens))
                         text_attention_layers_per_token.append(_extract_text_attention_per_layer(hidden_layers))
                     
                 # Decode current sampled agent frame to PCM
@@ -1081,6 +1131,8 @@ def run_batch_inference(
                 text_hidden_layers_per_token=text_hidden_layers_per_token,
                 text_pre_unembed_states_per_token=text_pre_unembed_states_per_token,
                 full_input_embeddings_per_token=full_input_embeddings_per_token,
+                input_token_ids_per_token=input_token_ids_per_token,
+                output_token_ids_per_token=output_token_ids_per_token,
                 text_attention_layers_per_token=text_attention_layers_per_token,
                 text_target_layer_keys=text_target_layer_keys,
                 text_key_positions=text_key_positions,
