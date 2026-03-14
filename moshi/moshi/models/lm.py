@@ -84,6 +84,7 @@ class HiddenLayerOutputs:
     """Container for hidden layer outputs from both text and depth transformers."""
     text_transformer: Optional[List[torch.Tensor]] = None  # List of hidden states from text transformer layers
     text_attention_weights: Optional[List[torch.Tensor]] = None  # List of attention weights from text transformer layers
+    text_pre_unembed: Optional[torch.Tensor] = None  # Main transformer output after out_norm, before text unembedding.
     depth_transformer: Optional[List[List[torch.Tensor]]] = None  # List of hidden states from depth transformer layers
 
 
@@ -1061,6 +1062,7 @@ class LMGen(StreamingModule[_LMGenState]):
             combined_hidden_layers = HiddenLayerOutputs(
                 text_transformer=text_hidden_layers,  # The text transformer hidden layers for this step
                 text_attention_weights=text_attention_weights,
+                text_pre_unembed=transformer_out,
                 depth_transformer=depth_hidden_layers # The depth_hidden_layers is a list of hidden transformer layers for each acoustic token in this step
             )
         else:

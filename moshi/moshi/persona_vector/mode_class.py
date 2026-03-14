@@ -16,6 +16,7 @@ CLI (``python -m moshi.persona_vector.mode_class``):
     --train-mode-classifier <dataset_path> --output <dir> [--layer L]
     --predict-mode <hidden.pt> --model <model.pt> --output <out.json>
     --plot-prediction <prediction.json> --hidden <hidden.pt> --output <out.png>
+    --plot-output-hidden-alignment-dataset <root_dir> [--layer L]
 """
 
 from __future__ import annotations
@@ -992,6 +993,180 @@ def plot_prediction_dataset(
     print(f"\n[plot-dataset] Done. Processed {len(hidden_files)} files.")
 
 
+def _load_mono_wav(path: Path) -> tuple[Any, int]:
+    """Load mono waveform from WAV path and return ``(samples[T], sample_rate)``."""
+    import numpy as np
+    import sphn
+
+    if not path.exists():
+        raise FileNotFoundError(f"WAV file not found: {path}")
+    pcm, sr = sphn.read(str(path))
+    wav = np.asarray(pcm)
+    if wav.ndim == 2:
+        wav = wav[0]
+    elif wav.ndim != 1:
+        wav = wav.reshape(-1)
+    return wav.astype(np.float32), int(sr)
+
+
+def plot_output_hidden_alignment(
+    hidden_path: str,
+    output_path: str,
+    *,
+    layer: int = -1,
+) -> None:
+    """Plot token-step alignments and synchronized user/model waveforms.
+
+    Top subplot (token-rate):
+      - Listen alignment: cosine(hidden[L, n], user_audio_embedding[n+1])
+      - Speak alignment: cosine(hidden[L, n], model_output_state[n+1])
+
+    Bottom subplot (sample-rate):
+      - input.wav and output.wav amplitudes over time.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    payload = _load_hidden_payload(hidden_path)
+    frame_rate_hz = float(payload.get("frame_rate", 12.5))
+
+    hidden_l = _extract_layer(payload, layer)  # [T, D]
+    user_emb = payload.get("user_audio_embeddings", None)
+    if user_emb is None:
+        raise KeyError(
+            "Payload is missing 'user_audio_embeddings'. "
+            "Re-run inference with updated hidden payload saving."
+        )
+    user_emb = user_emb.float()
+
+    model_state = payload.get("text_pre_unembed_states", None)
+    if model_state is None:
+        model_state = payload.get("hidden_states", None)
+    if model_state is None:
+        raise KeyError(
+            "Payload is missing both 'text_pre_unembed_states' and 'hidden_states'."
+        )
+    model_state = model_state.float()
+
+    if hidden_l.ndim != 2 or user_emb.ndim != 2 or model_state.ndim != 2:
+        raise ValueError(
+            "Expected [T, D] tensors for hidden/user/model states, got "
+            f"hidden={tuple(hidden_l.shape)}, user={tuple(user_emb.shape)}, "
+            f"model={tuple(model_state.shape)}"
+        )
+
+    n_steps = min(hidden_l.shape[0], user_emb.shape[0] - 1, model_state.shape[0] - 1)
+    if n_steps <= 0:
+        raise ValueError(
+            "Not enough token steps for n->n+1 alignment. "
+            f"hidden={hidden_l.shape[0]}, user={user_emb.shape[0]}, model={model_state.shape[0]}"
+        )
+
+    h_n = hidden_l[:n_steps]
+    u_n1 = user_emb[1 : 1 + n_steps]
+    s_n1 = model_state[1 : 1 + n_steps]
+
+    listen_align = torch.nn.functional.cosine_similarity(h_n, u_n1, dim=1)
+    speak_align = torch.nn.functional.cosine_similarity(h_n, s_n1, dim=1)
+
+    token_times_sec = torch.arange(n_steps, dtype=torch.float32) / frame_rate_hz
+    token_times_np = token_times_sec.numpy()
+    listen_np = listen_align.detach().cpu().numpy()
+    speak_np = speak_align.detach().cpu().numpy()
+
+    hidden_p = Path(hidden_path)
+    input_wav = Path(str(payload.get("input_wav", hidden_p.with_name("input.wav"))))
+    output_wav = Path(str(payload.get("output_wav", hidden_p.with_name("output.wav"))))
+
+    in_wav, in_sr = _load_mono_wav(input_wav)
+    out_wav, out_sr = _load_mono_wav(output_wav)
+    in_times = np.arange(in_wav.shape[0], dtype=np.float32) / float(in_sr)
+    out_times = np.arange(out_wav.shape[0], dtype=np.float32) / float(out_sr)
+
+    top_end = float(n_steps) / frame_rate_hz
+    max_t = max(
+        top_end,
+        float(in_wav.shape[0]) / float(in_sr),
+        float(out_wav.shape[0]) / float(out_sr),
+    )
+
+    fig_w = max(11.0, min(18.0, max_t * 2.0))
+    fig, (ax_top, ax_bot) = plt.subplots(
+        2,
+        1,
+        figsize=(fig_w, 6.5),
+        dpi=180,
+        sharex=True,
+        gridspec_kw={"height_ratios": [2.2, 1.0]},
+    )
+
+    ax_top.plot(
+        token_times_np,
+        listen_np,
+        color="#1f77b4",
+        linewidth=1.6,
+        label="Listen Alignment: cos(hidden[n], user_emb[n+1])",
+    )
+    ax_top.plot(
+        token_times_np,
+        speak_np,
+        color="#d62728",
+        linewidth=1.6,
+        label="Speak Alignment: cos(hidden[n], model_state[n+1])",
+    )
+    ax_top.axhline(0.0, color="#666666", linewidth=0.8, linestyle="--", alpha=0.7)
+    ax_top.set_ylim(-1.05, 1.05)
+    ax_top.set_ylabel("Cosine similarity")
+    ax_top.set_title(
+        f"Token Alignment vs Audio Timeline (layer={layer}, steps={n_steps})"
+    )
+    ax_top.grid(True, axis="y", linestyle=":", linewidth=0.7, alpha=0.65)
+    ax_top.legend(loc="lower right", fontsize=8)
+
+    ax_bot.plot(in_times, in_wav, color="#2ca02c", linewidth=0.7, alpha=0.9, label="input.wav (user)")
+    ax_bot.plot(out_times, out_wav, color="#9467bd", linewidth=0.7, alpha=0.85, label="output.wav (model)")
+    ax_bot.set_ylabel("Amplitude")
+    ax_bot.set_xlabel("Time (seconds)")
+    ax_bot.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
+    ax_bot.legend(loc="upper right", fontsize=8)
+    ax_bot.set_xlim(0.0, max_t)
+
+    out_p = Path(output_path)
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_p, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] Saved output-hidden alignment plot to {output_path}")
+
+
+def plot_output_hidden_alignment_dataset(
+    root_dir: str,
+    *,
+    layer: int = -1,
+) -> None:
+    """Recursively find all ``output_hidden.pt`` files and plot alignments."""
+    root = Path(root_dir)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Root directory not found: {root}")
+
+    hidden_files = sorted(p for p in root.rglob("output_hidden.pt") if p.is_file())
+    if not hidden_files:
+        raise FileNotFoundError(f"No output_hidden.pt files found under {root}")
+
+    print(f"[plot-align] Found {len(hidden_files)} output_hidden.pt files under {root}")
+    ok = 0
+    for hp in hidden_files:
+        out_png = hp.with_name(f"output_hidden_alignment_layer_{layer}.png")
+        print(f"\n--- {hp} ---")
+        try:
+            plot_output_hidden_alignment(str(hp), str(out_png), layer=layer)
+            ok += 1
+        except Exception as exc:
+            print(f"  [SKIP] alignment plot failed: {exc}")
+
+    print(f"\n[plot-align] Done. Generated {ok}/{len(hidden_files)} plots.")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1045,6 +1220,12 @@ def main() -> None:
         type=str,
         metavar="HIDDEN_PT",
         help="Plot token-token hidden self-similarity heatmap for a hidden .pt file.",
+    )
+    group.add_argument(
+        "--plot-output-hidden-alignment-dataset",
+        type=str,
+        metavar="ROOT_DIR",
+        help="Recursively plot output_hidden alignment for all output_hidden.pt under ROOT_DIR.",
     )
 
     # Shared inference options (used by --gen-*)
@@ -1178,6 +1359,12 @@ def main() -> None:
             output_path=args.output,
             layer=args.layer,
             window=args.window,
+        )
+
+    elif args.plot_output_hidden_alignment_dataset:
+        plot_output_hidden_alignment_dataset(
+            root_dir=args.plot_output_hidden_alignment_dataset,
+            layer=args.layer,
         )
 
 

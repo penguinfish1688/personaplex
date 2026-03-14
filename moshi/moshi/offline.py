@@ -44,7 +44,6 @@ import os
 import tarfile
 import gc
 import pickle
-import math
 from pathlib import Path
 import json
 from typing import Optional, List, Dict, Any
@@ -145,9 +144,16 @@ def average_hidden_layers(hidden_layers_list: List[HiddenLayerOutputs]) -> Hidde
             ]
             for c in range(num_codebooks)
         ]
+
+    avg_text_pre_unembed = None
+    if hidden_layers_list[0].text_pre_unembed is not None:
+        avg_text_pre_unembed = torch.stack(
+            [h.text_pre_unembed for h in hidden_layers_list if h.text_pre_unembed is not None]
+        ).mean(dim=0)
     
     return HiddenLayerOutputs(
         text_transformer=avg_text_transformer,
+        text_pre_unembed=avg_text_pre_unembed,
         depth_transformer=avg_depth_transformer
     )
 
@@ -195,6 +201,68 @@ def _extract_text_attention_per_layer(step_hidden: HiddenLayerOutputs) -> Option
             raise RuntimeError(f"Unexpected attention shape {tuple(attn.shape)}")
         per_layer.append(attn)
     return torch.stack(per_layer, dim=0)
+
+
+def _extract_text_pre_unembed_state(step_hidden: HiddenLayerOutputs) -> torch.Tensor:
+    """Convert one step of pre-unembedding text state to a dense `[D]` CPU tensor."""
+    if step_hidden.text_pre_unembed is None:
+        raise RuntimeError("Missing pre-unembedding text state in step output.")
+    x = step_hidden.text_pre_unembed.detach().cpu().float()
+    if x.dim() == 3 and x.shape[0] == 1 and x.shape[1] == 1:
+        x = x[0, 0]
+    elif x.dim() == 2 and x.shape[0] == 1:
+        x = x[0]
+    elif x.dim() != 1:
+        x = x.reshape(-1)
+    return x
+
+
+def _extract_user_audio_embedding_for_step(
+    lm: Any,
+    step_user_tokens: torch.Tensor,
+) -> torch.Tensor:
+    """Build per-step user audio embedding by summing 8 RVQ codebook embeddings.
+
+    Args:
+        lm: Loaded LM model containing codebook embedding tables.
+        step_user_tokens: Tensor `[B, 8, 1]` (or compatible) of user audio RVQ tokens.
+
+    Returns:
+        Tensor `[D]` float32 on CPU.
+    """
+    if step_user_tokens.dim() != 3:
+        raise ValueError(
+            "Expected step_user_tokens shape [B, 8, 1], "
+            f"got {tuple(step_user_tokens.shape)}"
+        )
+    if step_user_tokens.shape[-1] != 1:
+        raise ValueError(
+            "Expected a single token step (last dim = 1), "
+            f"got shape {tuple(step_user_tokens.shape)}"
+        )
+
+    # In LM cache layout, user channels come after text + 8 Moshi audio channels.
+    user_cb_offset = 8
+    num_user_codebooks = int(step_user_tokens.shape[1])
+    emb_sum = None
+    for q in range(num_user_codebooks):
+        emb_idx = user_cb_offset + q
+        if emb_idx >= len(lm.emb):
+            raise ValueError(
+                f"User codebook embedding index {emb_idx} out of range for {len(lm.emb)} embeddings."
+            )
+        emb_q = lm.emb[emb_idx](step_user_tokens[:, q])  # [B, 1, D]
+        emb_sum = emb_q if emb_sum is None else emb_sum + emb_q
+
+    assert emb_sum is not None
+    emb_sum = emb_sum.detach().cpu().float()
+    if emb_sum.dim() == 3 and emb_sum.shape[0] == 1 and emb_sum.shape[1] == 1:
+        emb_sum = emb_sum[0, 0]
+    elif emb_sum.dim() == 2 and emb_sum.shape[0] == 1:
+        emb_sum = emb_sum[0]
+    elif emb_sum.dim() != 1:
+        emb_sum = emb_sum.reshape(-1)
+    return emb_sum
 
 
 def _extract_target_layer_text_keys_and_positions(
@@ -255,75 +323,6 @@ def _extract_target_layer_text_keys_and_positions(
     )
 
 
-def _extract_target_layer_wq(
-    target_layer_module: Any,
-    step_index: Optional[int] = None,
-) -> tuple[torch.Tensor, int, int]:
-    """Extract raw query projection weights from target attention layer.
-
-    Supports packed QKV in `in_proj_weight` with optional weights-per-step layout.
-    Returns:
-      - W_q: [embed_dim, embed_dim] on CPU
-      - selected_step_index: effective step index used for W_q selection
-      - weights_per_step: number of available per-step projections (0 means shared)
-    """
-    attn = target_layer_module.self_attn
-    w = attn.in_proj_weight.detach().cpu().float()
-    embed_dim = int(attn.embed_dim)
-    weights_per_step = int(getattr(attn, "weights_per_step", 0))
-    selected_step_index = 0
-
-    if weights_per_step > 0 and w.dim() == 2 and w.shape[0] == weights_per_step * 3 * embed_dim:
-        w_steps = w.view(weights_per_step, 3 * embed_dim, embed_dim)
-        if step_index is None:
-            state = getattr(attn, "_streaming_state", None)
-            if state is not None and hasattr(state, "offset_cpu"):
-                step_index = int(state.offset_cpu) - 1
-        if step_index is None:
-            step_index = 0
-        if step_index < 0:
-            step_index = 0
-        if step_index >= weights_per_step:
-            raise RuntimeError(
-                f"Step index {step_index} out of range for weights_per_step={weights_per_step}"
-            )
-        selected_step_index = int(step_index)
-        w = w_steps[selected_step_index]
-
-    if w.dim() != 2 or w.shape[0] != 3 * embed_dim or w.shape[1] != embed_dim:
-        raise RuntimeError(f"Unexpected in_proj_weight shape for packed QKV: {tuple(w.shape)}")
-
-    return w[:embed_dim, :].contiguous(), selected_step_index, weights_per_step
-
-
-def _extract_target_layer_rope_cache(target_layer_module: Any, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Extract compact RoPE cos/sin caches (not dense rotation matrices).
-
-    Returns:
-      rope_cos: [K, D_h/2]
-      rope_sin: [K, D_h/2]
-    """
-    attn = target_layer_module.self_attn
-    rope = getattr(attn, "rope", None)
-    if rope is None:
-        return torch.empty(0), torch.empty(0)
-    if seq_len <= 0:
-        return torch.empty(0), torch.empty(0)
-
-    head_dim = int(attn.embed_dim // attn.num_heads)
-    if head_dim % 2 != 0:
-        raise RuntimeError(f"Expected even head_dim for RoPE, got {head_dim}")
-
-    half_dim = head_dim // 2
-    ds = torch.arange(half_dim, dtype=torch.float32)
-    freqs = torch.exp(ds * (-math.log(float(rope.max_period)) * 2.0 / float(head_dim)))
-    ts = torch.arange(int(seq_len), dtype=torch.float32).view(-1, 1)
-    angles = ts * freqs.view(1, -1)
-    rope_cos = torch.cos(angles).contiguous()
-    rope_sin = torch.sin(angles).contiguous()
-    return rope_cos, rope_sin
-
-
 def _build_hidden_payload(
     *,
     input_wav: str,
@@ -333,19 +332,16 @@ def _build_hidden_payload(
     text_token_ids: list[int],
     text_token_pieces: list[str],
     text_hidden_layers_per_token: list[torch.Tensor],
+    text_pre_unembed_states_per_token: list[torch.Tensor],
+    user_audio_embeddings_per_token: list[torch.Tensor],
     text_attention_layers_per_token: list[Optional[torch.Tensor]],
     text_target_layer_keys: torch.Tensor,
     text_key_positions: torch.Tensor,
     text_key_cache_meta: dict[str, int],
-    target_layer_W_q: torch.Tensor,
-    w_q_step_index: int,
-    w_q_weights_per_step: int,
-    rope_cos: torch.Tensor,
-    rope_sin: torch.Tensor,
 ) -> Dict[str, Any]:
     """Build the serialized `.pt` payload consumed by premature decode tools.
 
-    Saved schema (`schema_version=3`):
+    Saved schema (`schema_version=4`):
         - `text_hidden_layers`: `torch.FloatTensor[T, L, D]`
           - `T`: number of generated output tokens from `input.wav` processing only.
           - `L`: number of main text transformer layers.
@@ -359,16 +355,15 @@ def _build_hidden_payload(
         - `times`: `torch.FloatTensor[T]` token start time in seconds.
         - `token_time_ranges_sec`: `torch.FloatTensor[T, 2]` token `[start, end)`.
         - `hidden_states`: `torch.FloatTensor[T, D]` final-layer hidden states (compat key).
+                - `text_pre_unembed_states`: `torch.FloatTensor[T, D]` main transformer output
+                    after output norm and before text unembedding matrix.
+                - `user_audio_embeddings`: `torch.FloatTensor[T, D]` per-step user-audio embedding
+                    built by summing the 8 user RVQ codebook embeddings.
         - `frame_rate`: scalar float, default 12.5 for Moshi.
         - `text_keys`: `torch.FloatTensor[1, H, K, D_h]` final accumulated text KV-cache keys.
                 - `text_key_positions`: `torch.LongTensor[K]` absolute key positions aligned to `text_keys`.
                 - `text_key_cache_meta`: scalar cache metadata (`capacity`, `end_offset`, `valid_len`,
                     `dropped_prefix_tokens`).
-        - `W_q`: `torch.FloatTensor[D, D]` query projection weight matrix for target layer.
-                - `W_q_step_index`: int step index used when selecting per-step query projection weights.
-                - `W_q_weights_per_step`: int number of available per-step query projections (0 means shared).
-        - `rope_cos`: compact RoPE cosine cache, typically `[K, D_h/2]`.
-        - `rope_sin`: compact RoPE sine cache, typically `[K, D_h/2]`.
 
     Token-time alignment:
         token `0` corresponds to `[0, 1/frame_rate_hz)` seconds of generated response,
@@ -386,8 +381,19 @@ def _build_hidden_payload(
         dim=1,
     )
 
+    if len(text_pre_unembed_states_per_token) != t:
+        raise RuntimeError(
+            "Mismatch in payload lengths: "
+            f"hidden={t}, text_pre_unembed={len(text_pre_unembed_states_per_token)}"
+        )
+    if len(user_audio_embeddings_per_token) != t:
+        raise RuntimeError(
+            "Mismatch in payload lengths: "
+            f"hidden={t}, user_audio_embeddings={len(user_audio_embeddings_per_token)}"
+        )
+
     payload: Dict[str, Any] = {
-        "schema_version": 3,
+        "schema_version": 4,
         "input_wav": input_wav,
         "output_wav": output_wav,
         "output_text": output_text,
@@ -397,16 +403,13 @@ def _build_hidden_payload(
         "times": times,
         "token_time_ranges_sec": token_time_ranges,
         "text_hidden_layers": hidden_tensor,
+        "text_pre_unembed_states": torch.stack(text_pre_unembed_states_per_token, dim=0),
+        "user_audio_embeddings": torch.stack(user_audio_embeddings_per_token, dim=0),
         "text_attention_weights": text_attention_layers_per_token,
         "hidden_states": hidden_tensor[:, -1, :],
         "text_keys": text_target_layer_keys,
         "text_key_positions": text_key_positions,
         "text_key_cache_meta": text_key_cache_meta,
-        "W_q": target_layer_W_q,
-        "W_q_step_index": int(w_q_step_index),
-        "W_q_weights_per_step": int(w_q_weights_per_step),
-        "rope_cos": rope_cos,
-        "rope_sin": rope_sin,
     }
     return payload
 
@@ -937,6 +940,8 @@ def run_batch_inference(
         
         hidden_layers_list: List[HiddenLayerOutputs] = []
         text_hidden_layers_per_token: list[torch.Tensor] = []
+        text_pre_unembed_states_per_token: list[torch.Tensor] = []
+        user_audio_embeddings_per_token: list[torch.Tensor] = []
         text_attention_layers_per_token: list[Optional[torch.Tensor]] = []
         steer_idx = 0
         for user_encoded in lm_encode_from_sphn(
@@ -1003,6 +1008,10 @@ def run_batch_inference(
                         hidden_layers_list.append(hidden_layers)
                     if save_hidden_payload:
                         text_hidden_layers_per_token.append(_extract_text_hidden_per_layer(hidden_layers))
+                        text_pre_unembed_states_per_token.append(_extract_text_pre_unembed_state(hidden_layers))
+                        user_audio_embeddings_per_token.append(
+                            _extract_user_audio_embedding_for_step(lm, step_in)
+                        )
                         text_attention_layers_per_token.append(_extract_text_attention_per_layer(hidden_layers))
                     
                 # Decode current sampled agent frame to PCM
@@ -1071,12 +1080,6 @@ def run_batch_inference(
 
             target_layer = lm.transformer.layers[target_layer_idx]
             text_target_layer_keys, text_key_positions, text_key_cache_meta = _extract_target_layer_text_keys_and_positions(target_layer)
-            target_layer_W_q, w_q_step_index, w_q_weights_per_step = _extract_target_layer_wq(target_layer)
-            rope_cache_len = int(text_key_positions.max().item()) + 1 if text_key_positions.numel() > 0 else 0
-            rope_cos, rope_sin = _extract_target_layer_rope_cache(
-                target_layer,
-                seq_len=rope_cache_len,
-            )
             key_pos_start = int(text_key_positions[0].item()) if text_key_positions.numel() > 0 else -1
             key_pos_end = int(text_key_positions[-1].item()) if text_key_positions.numel() > 0 else -1
 
@@ -1086,12 +1089,7 @@ def run_batch_inference(
                     f"Target layer {target_layer_idx} shapes: "
                     f"text_keys={tuple(text_target_layer_keys.shape)}, "
                     f"text_key_positions={tuple(text_key_positions.shape)} [{key_pos_start}..{key_pos_end}], "
-                    f"W_q={tuple(target_layer_W_q.shape)}, "
-                    f"W_q_step_index={w_q_step_index}, "
-                    f"W_q_weights_per_step={w_q_weights_per_step}, "
-                    f"text_key_cache_meta={text_key_cache_meta}, "
-                    f"rope_cos={tuple(rope_cos.shape)}, "
-                    f"rope_sin={tuple(rope_sin.shape)}"
+                    f"text_key_cache_meta={text_key_cache_meta}"
                 ),
             )
 
@@ -1103,15 +1101,12 @@ def run_batch_inference(
                 text_token_ids=generated_text_token_ids,
                 text_token_pieces=generated_text_tokens,
                 text_hidden_layers_per_token=text_hidden_layers_per_token,
+                text_pre_unembed_states_per_token=text_pre_unembed_states_per_token,
+                user_audio_embeddings_per_token=user_audio_embeddings_per_token,
                 text_attention_layers_per_token=text_attention_layers_per_token,
                 text_target_layer_keys=text_target_layer_keys,
                 text_key_positions=text_key_positions,
                 text_key_cache_meta=text_key_cache_meta,
-                target_layer_W_q=target_layer_W_q,
-                w_q_step_index=w_q_step_index,
-                w_q_weights_per_step=w_q_weights_per_step,
-                rope_cos=rope_cos,
-                rope_sin=rope_sin,
             )
             torch.save(payload, output_hidden)
             log("info", f"Wrote hidden payload to {output_hidden}")
@@ -1575,7 +1570,7 @@ def main():
         default=None,
         help=(
             "Text transformer layer index used to extract payload fields "
-            "(text_keys, W_q, rope_cos, rope_sin). "
+            "(text_keys, text_key_positions, text_key_cache_meta). "
             "If not set, defaults to steering_layer (if provided) else last layer."
         ),
     )
