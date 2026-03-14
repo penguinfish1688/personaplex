@@ -1097,11 +1097,9 @@ def plot_output_hidden_alignment(
     out_times = np.arange(out_wav.shape[0], dtype=np.float32) / float(out_sr)
 
     token_end = float(T) / frame_rate_hz
-    max_t = max(
-        token_end,
-        float(in_wav.shape[0]) / float(in_sr),
-        float(out_wav.shape[0]) / float(out_sr),
-    )
+    # Strict alignment: waveform subplot uses the exact same x-domain as the
+    # attention heatmap key axis.
+    max_t = token_end
 
     fig_w = max(11.0, min(18.0, max_t * 2.0))
     fig, (ax_top, ax_bot) = plt.subplots(
