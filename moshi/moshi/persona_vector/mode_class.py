@@ -1182,11 +1182,11 @@ def plot_residual_routing(
     *,
     layer: int = -1,
 ) -> None:
-        """Plot per-step residual routing JSD curves and aligned audio waveforms.
+    """Plot per-step residual routing JSD curves and aligned audio waveforms.
 
     Top subplot (token step n):
-            - Input JSD: JSD(h_L[n] || full_input_embeddings[n])
-            - Output JSD: JSD(h_L[n] || text_pre_unembed_states[n])
+      - Input JSD: JSD(h_L[n] || full_input_embeddings[n])
+      - Output JSD: JSD(h_L[n] || text_pre_unembed_states[n])
 
     Bottom subplot:
       - input.wav and output.wav waveform amplitudes over physical time.
