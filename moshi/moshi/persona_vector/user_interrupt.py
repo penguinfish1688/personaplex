@@ -787,7 +787,8 @@ def _calculate_steering_vector_single_layer(root_dir, classifier_path, decay_spa
                 f"Classifier checkpoint {classifier_path} missing 'layer' field and filename does not contain layer index"
             )
         layer = int(m.group(1))
-    layer_key = f"layer_{_internal_layer_to_json_layer(int(layer))}"
+    # Keep legacy key schema for normal (non-attn-optimized) vectors.
+    layer_key = f"layer_{int(layer)}"
 
     input_paths = [p for p in root.glob("*/input.wav") if p.is_file()]
     input_paths.sort(key=lambda p: int(p.parent.name) if p.parent.name.isdigit() else p.parent.name)
@@ -929,6 +930,67 @@ def inference_with_steering(
     )
 
     requested_layers = [int(x) for x in inject_layers]
+    legacy_single_layer = (
+        len(requested_layers) == 1
+        and int(requested_layers[0]) != -1
+        and not bool(steer_attn_only)
+    )
+
+    def _extract_layer_vector_legacy(
+        raw: dict,
+        layer: int,
+        offset: int = 0,
+    ) -> list[Optional[torch.Tensor]]:
+        candidate_keys = [
+            f"layer_{layer}",
+            f"layer{layer}",
+            str(layer),
+            layer,
+        ]
+        layer_payload = None
+        for key in candidate_keys:
+            if key in raw:
+                layer_payload = raw[key]
+                break
+        if layer_payload is None:
+            available = ", ".join([str(k) for k in raw.keys()])
+            raise KeyError(
+                f"Layer {layer} not found in steering file. Available keys: {available}"
+            )
+        if not isinstance(layer_payload, dict):
+            raise ValueError(
+                f"Expected dict for layer payload at layer {layer}, got {type(layer_payload)}"
+            )
+
+        token_entries: dict[int, Optional[torch.Tensor]] = {}
+        max_idx = 0
+        for token_key, token_vec in layer_payload.items():
+            try:
+                token_idx = int(token_key)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Token index must be an integer-like key, got '{token_key}'"
+                ) from exc
+            if token_idx < 0:
+                raise ValueError(f"Token indices must be >= 0, got {token_idx}")
+            shifted_idx = token_idx + int(offset)
+            if shifted_idx < 0:
+                continue
+            if token_vec is None:
+                token_entries[shifted_idx] = None
+            else:
+                token_entries[shifted_idx] = torch.as_tensor(token_vec, dtype=torch.float32).reshape(-1)
+            max_idx = max(max_idx, shifted_idx)
+
+        if len(token_entries) == 0:
+            raise ValueError(
+                f"Layer payload has no usable steering vectors after applying offset={offset}"
+            )
+
+        vectors: list[Optional[torch.Tensor]] = [None] * (max_idx + 1)
+        for token_idx, token_vec in token_entries.items():
+            vectors[token_idx] = token_vec
+        return vectors
 
     def _extract_layer_vectors(
         raw: dict,
@@ -1036,11 +1098,19 @@ def inference_with_steering(
         if not isinstance(steering_payload, dict):
             raise ValueError(f"Expected dict in {steering_json}, got {type(steering_payload)}")
 
-        steering_vectors_by_layer = _extract_layer_vectors(
-            steering_payload,
-            requested_layers,
-            int(offset),
-        )
+        if legacy_single_layer:
+            inject_layer = int(requested_layers[0])
+            steering_vectors = _extract_layer_vector_legacy(
+                steering_payload,
+                inject_layer,
+                int(offset),
+            )
+        else:
+            steering_vectors_by_layer = _extract_layer_vectors(
+                steering_payload,
+                requested_layers,
+                int(offset),
+            )
 
         # Guard against one-step tail mismatch by ensuring vectors cover at least
         # the WAV-derived token count at 12.5 Hz.
@@ -1053,41 +1123,77 @@ def inference_with_steering(
             info = sf.info(input_wav)
             duration_s = float(info.frames) / float(info.samplerate)
         min_tokens = int(math.ceil(duration_s * 12.5))
-        for layer, vectors in steering_vectors_by_layer.items():
-            if len(vectors) < min_tokens:
-                vectors.extend([None] * (min_tokens - len(vectors)))
-            non_null = sum(1 for v in vectors if v is not None)
+        if legacy_single_layer:
+            if len(steering_vectors) < min_tokens:
+                steering_vectors.extend([None] * (min_tokens - len(steering_vectors)))
+            non_null = sum(1 for v in steering_vectors if v is not None)
             print(
-                f"[user_interrupt] {entry_dir.name}: layer={layer} loaded steering vectors len={len(vectors)}, "
+                f"[user_interrupt] {entry_dir.name}: loaded steering vectors len={len(steering_vectors)}, "
                 f"min_tokens={min_tokens}, non_null={non_null}"
             )
+        else:
+            for layer, vectors in steering_vectors_by_layer.items():
+                if len(vectors) < min_tokens:
+                    vectors.extend([None] * (min_tokens - len(vectors)))
+                non_null = sum(1 for v in vectors if v is not None)
+                print(
+                    f"[user_interrupt] {entry_dir.name}: layer={layer} loaded steering vectors len={len(vectors)}, "
+                    f"min_tokens={min_tokens}, non_null={non_null}"
+                )
 
         with torch.no_grad():
-            run_batch_inference(
-                input_wavs=[input_wav],
-                output_wavs=[output_wav],
-                output_texts=[output_text],
-                text_prompts=[SYSTEM_PROMPT],
-                voice_prompt_path=voice_prompt_path,
-                tokenizer_path=None,
-                moshi_weight=None,
-                mimi_weight=None,
-                hf_repo=loaders.DEFAULT_REPO,
-                device="cuda",
-                seed=42,
-                temp_audio=0.8,
-                temp_text=0.7,
-                topk_audio=250,
-                topk_text=25,
-                greedy=False,
-                save_voice_prompt_embeddings=False,
-                cpu_offload=False,
-                return_hidden_layers=False,
-                save_hidden_payload=bool(save_hidden),
-                output_hiddens=[output_hidden] if save_hidden else None,
-                steering_vectors_by_layer=steering_vectors_by_layer,
-                steer_attn_only=bool(steer_attn_only),
-            )
+            if legacy_single_layer:
+                run_batch_inference(
+                    input_wavs=[input_wav],
+                    output_wavs=[output_wav],
+                    output_texts=[output_text],
+                    text_prompts=[SYSTEM_PROMPT],
+                    voice_prompt_path=voice_prompt_path,
+                    tokenizer_path=None,
+                    moshi_weight=None,
+                    mimi_weight=None,
+                    hf_repo=loaders.DEFAULT_REPO,
+                    device="cuda",
+                    seed=42,
+                    temp_audio=0.8,
+                    temp_text=0.7,
+                    topk_audio=250,
+                    topk_text=25,
+                    greedy=False,
+                    save_voice_prompt_embeddings=False,
+                    cpu_offload=False,
+                    return_hidden_layers=False,
+                    save_hidden_payload=bool(save_hidden),
+                    output_hiddens=[output_hidden] if save_hidden else None,
+                    steering_vectors=steering_vectors,
+                    steering_layer=int(requested_layers[0]),
+                )
+            else:
+                run_batch_inference(
+                    input_wavs=[input_wav],
+                    output_wavs=[output_wav],
+                    output_texts=[output_text],
+                    text_prompts=[SYSTEM_PROMPT],
+                    voice_prompt_path=voice_prompt_path,
+                    tokenizer_path=None,
+                    moshi_weight=None,
+                    mimi_weight=None,
+                    hf_repo=loaders.DEFAULT_REPO,
+                    device="cuda",
+                    seed=42,
+                    temp_audio=0.8,
+                    temp_text=0.7,
+                    topk_audio=250,
+                    topk_text=25,
+                    greedy=False,
+                    save_voice_prompt_embeddings=False,
+                    cpu_offload=False,
+                    return_hidden_layers=False,
+                    save_hidden_payload=bool(save_hidden),
+                    output_hiddens=[output_hidden] if save_hidden else None,
+                    steering_vectors_by_layer=steering_vectors_by_layer,
+                    steer_attn_only=bool(steer_attn_only),
+                )
 
     if save_hidden:
         print(f"[user_interrupt] Done. Wrote output.wav/output.json/output_hidden.pt for {len(input_paths)} items.")
@@ -1215,6 +1321,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--classifier-path",
+        type=str,
+        default=None,
+        help=(
+            "Legacy path to a single mode-classifier checkpoint. "
+            "If provided with --generate-steering-vectors, uses f6f-compatible single-layer generation logic."
+        ),
+    )
+    parser.add_argument(
         "--layer",
         type=int,
         nargs="+",
@@ -1285,8 +1400,17 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.generate_steering_vectors:
+        if args.classifier_path is not None:
+            _calculate_steering_vector_single_layer(
+                root_dir=args.root_dir,
+                classifier_path=str(args.classifier_path),
+                decay_span=args.decay_span,
+                alpha=args.alpha,
+            )
+            return
+
         if args.classifier_dir is None:
-            parser.error("--generate-steering-vectors requires --classifier-dir")
+            parser.error("--generate-steering-vectors requires --classifier-dir or --classifier-path")
         calculate_steering_vector(
             root_dir=args.root_dir,
             classifier_dir=args.classifier_dir,
