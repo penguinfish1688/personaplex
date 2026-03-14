@@ -46,7 +46,7 @@ import gc
 import pickle
 from pathlib import Path
 import json
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, cast
 
 import numpy as np
 import torch
@@ -217,52 +217,20 @@ def _extract_text_pre_unembed_state(step_hidden: HiddenLayerOutputs) -> torch.Te
     return x
 
 
-def _extract_user_audio_embedding_for_step(
-    lm: Any,
-    step_user_tokens: torch.Tensor,
-) -> torch.Tensor:
-    """Build per-step user audio embedding by summing 8 RVQ codebook embeddings.
+def _extract_full_input_embedding_for_step(step_embedding: torch.Tensor) -> torch.Tensor:
+    """Convert one step of full transformer input embedding to a dense `[D]` CPU tensor.
 
-    Args:
-        lm: Loaded LM model containing codebook embedding tables.
-        step_user_tokens: Tensor `[B, 8, 1]` (or compatible) of user audio RVQ tokens.
-
-    Returns:
-        Tensor `[D]` float32 on CPU.
+    `step_embedding` is expected to be the output of `LMGen.step(..., return_embeddings=True)`
+    for a single token step, i.e. embedding of (text + autoregressive audio + user audio).
     """
-    if step_user_tokens.dim() != 3:
-        raise ValueError(
-            "Expected step_user_tokens shape [B, 8, 1], "
-            f"got {tuple(step_user_tokens.shape)}"
-        )
-    if step_user_tokens.shape[-1] != 1:
-        raise ValueError(
-            "Expected a single token step (last dim = 1), "
-            f"got shape {tuple(step_user_tokens.shape)}"
-        )
-
-    # In LM cache layout, user channels come after text + 8 Moshi audio channels.
-    user_cb_offset = 8
-    num_user_codebooks = int(step_user_tokens.shape[1])
-    emb_sum = None
-    for q in range(num_user_codebooks):
-        emb_idx = user_cb_offset + q
-        if emb_idx >= len(lm.emb):
-            raise ValueError(
-                f"User codebook embedding index {emb_idx} out of range for {len(lm.emb)} embeddings."
-            )
-        emb_q = lm.emb[emb_idx](step_user_tokens[:, q])  # [B, 1, D]
-        emb_sum = emb_q if emb_sum is None else emb_sum + emb_q
-
-    assert emb_sum is not None
-    emb_sum = emb_sum.detach().cpu().float()
-    if emb_sum.dim() == 3 and emb_sum.shape[0] == 1 and emb_sum.shape[1] == 1:
-        emb_sum = emb_sum[0, 0]
-    elif emb_sum.dim() == 2 and emb_sum.shape[0] == 1:
-        emb_sum = emb_sum[0]
-    elif emb_sum.dim() != 1:
-        emb_sum = emb_sum.reshape(-1)
-    return emb_sum
+    x = step_embedding.detach().cpu().float()
+    if x.dim() == 3 and x.shape[0] == 1 and x.shape[1] == 1:
+        x = x[0, 0]
+    elif x.dim() == 2 and x.shape[0] == 1:
+        x = x[0]
+    elif x.dim() != 1:
+        x = x.reshape(-1)
+    return x
 
 
 def _extract_target_layer_text_keys_and_positions(
@@ -333,7 +301,7 @@ def _build_hidden_payload(
     text_token_pieces: list[str],
     text_hidden_layers_per_token: list[torch.Tensor],
     text_pre_unembed_states_per_token: list[torch.Tensor],
-    user_audio_embeddings_per_token: list[torch.Tensor],
+    full_input_embeddings_per_token: list[torch.Tensor],
     text_attention_layers_per_token: list[Optional[torch.Tensor]],
     text_target_layer_keys: torch.Tensor,
     text_key_positions: torch.Tensor,
@@ -341,7 +309,7 @@ def _build_hidden_payload(
 ) -> Dict[str, Any]:
     """Build the serialized `.pt` payload consumed by premature decode tools.
 
-    Saved schema (`schema_version=4`):
+    Saved schema (`schema_version=5`):
         - `text_hidden_layers`: `torch.FloatTensor[T, L, D]`
           - `T`: number of generated output tokens from `input.wav` processing only.
           - `L`: number of main text transformer layers.
@@ -357,8 +325,8 @@ def _build_hidden_payload(
         - `hidden_states`: `torch.FloatTensor[T, D]` final-layer hidden states (compat key).
                 - `text_pre_unembed_states`: `torch.FloatTensor[T, D]` main transformer output
                     after output norm and before text unembedding matrix.
-                - `user_audio_embeddings`: `torch.FloatTensor[T, D]` per-step user-audio embedding
-                    built by summing the 8 user RVQ codebook embeddings.
+                - `full_input_embeddings`: `torch.FloatTensor[T, D]` per-step full transformer input
+                    embedding from `embed_codes` (text + autoregressive audio + user audio).
         - `frame_rate`: scalar float, default 12.5 for Moshi.
         - `text_keys`: `torch.FloatTensor[1, H, K, D_h]` final accumulated text KV-cache keys.
                 - `text_key_positions`: `torch.LongTensor[K]` absolute key positions aligned to `text_keys`.
@@ -386,14 +354,14 @@ def _build_hidden_payload(
             "Mismatch in payload lengths: "
             f"hidden={t}, text_pre_unembed={len(text_pre_unembed_states_per_token)}"
         )
-    if len(user_audio_embeddings_per_token) != t:
+    if len(full_input_embeddings_per_token) != t:
         raise RuntimeError(
             "Mismatch in payload lengths: "
-            f"hidden={t}, user_audio_embeddings={len(user_audio_embeddings_per_token)}"
+            f"hidden={t}, full_input_embeddings={len(full_input_embeddings_per_token)}"
         )
 
     payload: Dict[str, Any] = {
-        "schema_version": 4,
+        "schema_version": 5,
         "input_wav": input_wav,
         "output_wav": output_wav,
         "output_text": output_text,
@@ -404,7 +372,7 @@ def _build_hidden_payload(
         "token_time_ranges_sec": token_time_ranges,
         "text_hidden_layers": hidden_tensor,
         "text_pre_unembed_states": torch.stack(text_pre_unembed_states_per_token, dim=0),
-        "user_audio_embeddings": torch.stack(user_audio_embeddings_per_token, dim=0),
+        "full_input_embeddings": torch.stack(full_input_embeddings_per_token, dim=0),
         "text_attention_weights": text_attention_layers_per_token,
         "hidden_states": hidden_tensor[:, -1, :],
         "text_keys": text_target_layer_keys,
@@ -941,7 +909,7 @@ def run_batch_inference(
         hidden_layers_list: List[HiddenLayerOutputs] = []
         text_hidden_layers_per_token: list[torch.Tensor] = []
         text_pre_unembed_states_per_token: list[torch.Tensor] = []
-        user_audio_embeddings_per_token: list[torch.Tensor] = []
+        full_input_embeddings_per_token: list[torch.Tensor] = []
         text_attention_layers_per_token: list[Optional[torch.Tensor]] = []
         steer_idx = 0
         for user_encoded in lm_encode_from_sphn(
@@ -980,6 +948,7 @@ def run_batch_inference(
                 if capture_hidden:
                     result = lm_gen.step(
                         step_in,
+                        return_embeddings=save_hidden_payload,
                         return_hidden_layers=True,
                         return_attention_weights=save_hidden_payload,
                         steering_vector=step_steering_vector,
@@ -987,7 +956,16 @@ def run_batch_inference(
                         steering_vectors_by_layer=step_steering_vectors_by_layer,
                         steer_attn_only=steer_attn_only,
                     )
-                    tokens, hidden_layers = result  # type: ignore
+                    if save_hidden_payload:
+                        tokens, step_embeddings, hidden_layers = cast(
+                            tuple[torch.Tensor, torch.Tensor, HiddenLayerOutputs],
+                            result,
+                        )
+                    else:
+                        tokens, hidden_layers = cast(
+                            tuple[torch.Tensor, HiddenLayerOutputs],
+                            result,
+                        )
                     assert isinstance(hidden_layers, HiddenLayerOutputs), "Hidden layers were requested but not captured."
                 else:
                     tokens = lm_gen.step(
@@ -1009,8 +987,8 @@ def run_batch_inference(
                     if save_hidden_payload:
                         text_hidden_layers_per_token.append(_extract_text_hidden_per_layer(hidden_layers))
                         text_pre_unembed_states_per_token.append(_extract_text_pre_unembed_state(hidden_layers))
-                        user_audio_embeddings_per_token.append(
-                            _extract_user_audio_embedding_for_step(lm, step_in)
+                        full_input_embeddings_per_token.append(
+                            _extract_full_input_embedding_for_step(step_embeddings)
                         )
                         text_attention_layers_per_token.append(_extract_text_attention_per_layer(hidden_layers))
                     
@@ -1102,7 +1080,7 @@ def run_batch_inference(
                 text_token_pieces=generated_text_tokens,
                 text_hidden_layers_per_token=text_hidden_layers_per_token,
                 text_pre_unembed_states_per_token=text_pre_unembed_states_per_token,
-                user_audio_embeddings_per_token=user_audio_embeddings_per_token,
+                full_input_embeddings_per_token=full_input_embeddings_per_token,
                 text_attention_layers_per_token=text_attention_layers_per_token,
                 text_target_layer_keys=text_target_layer_keys,
                 text_key_positions=text_key_positions,

@@ -16,7 +16,7 @@ CLI (``python -m moshi.persona_vector.mode_class``):
     --train-mode-classifier <dataset_path> --output <dir> [--layer L]
     --predict-mode <hidden.pt> --model <model.pt> --output <out.json>
     --plot-prediction <prediction.json> --hidden <hidden.pt> --output <out.png>
-    --plot-output-hidden-alignment-dataset <root_dir> [--layer L]
+    --plot-attention-heatmap-dataset <root_dir> [--layer L]
 """
 
 from __future__ import annotations
@@ -1009,7 +1009,7 @@ def _load_mono_wav(path: Path) -> tuple[Any, int]:
     return wav.astype(np.float32), int(sr)
 
 
-def plot_output_hidden_alignment(
+def plot_attention_heatmap(
     hidden_path: str,
     output_path: str,
     *,
@@ -1144,10 +1144,10 @@ def plot_output_hidden_alignment(
     fig.tight_layout()
     fig.savefig(out_p, bbox_inches="tight")
     plt.close(fig)
-    print(f"[plot] Saved output-hidden alignment plot to {output_path}")
+    print(f"[plot] Saved attention heatmap plot to {output_path}")
 
 
-def plot_output_hidden_alignment_dataset(
+def plot_attention_heatmap_dataset(
     root_dir: str,
     *,
     layer: int = -1,
@@ -1164,10 +1164,10 @@ def plot_output_hidden_alignment_dataset(
     print(f"[plot-attn] Found {len(hidden_files)} output_hidden.pt files under {root}")
     ok = 0
     for hp in hidden_files:
-        out_png = hp.with_name(f"output_hidden_attention_layer_{layer}.png")
+        out_png = hp.with_name(f"attention_heatmap_layer_{layer}.png")
         print(f"\n--- {hp} ---")
         try:
-            plot_output_hidden_alignment(str(hp), str(out_png), layer=layer)
+            plot_attention_heatmap(str(hp), str(out_png), layer=layer)
             ok += 1
         except Exception as exc:
             print(f"  [SKIP] attention plot failed: {exc}")
@@ -1230,7 +1230,7 @@ def main() -> None:
         help="Plot token-token hidden self-similarity heatmap for a hidden .pt file.",
     )
     group.add_argument(
-        "--plot-output-hidden-alignment-dataset",
+        "--plot-attention-heatmap-dataset",
         type=str,
         metavar="ROOT_DIR",
         help="Recursively plot output_hidden attention heatmap + audio waveform for all output_hidden.pt under ROOT_DIR.",
@@ -1369,9 +1369,9 @@ def main() -> None:
             window=args.window,
         )
 
-    elif args.plot_output_hidden_alignment_dataset:
-        plot_output_hidden_alignment_dataset(
-            root_dir=args.plot_output_hidden_alignment_dataset,
+    elif args.plot_attention_heatmap_dataset:
+        plot_attention_heatmap_dataset(
+            root_dir=args.plot_attention_heatmap_dataset,
             layer=args.layer,
         )
 
