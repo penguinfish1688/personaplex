@@ -1311,6 +1311,7 @@ def plot_logit_lens_step_n(
 
     ce_user_s = _moving_average(ce_user.detach().cpu().float(), window_size=max(1, ma_window))
     ce_model_s = _moving_average(ce_model.detach().cpu().float(), window_size=max(1, ma_window))
+    ratio = ce_user_s / ce_model_s.clamp_min(1e-6)
 
     times = payload.get("times", None)
     if isinstance(times, torch.Tensor) and times.ndim == 1 and times.shape[0] == T:
@@ -1342,23 +1343,16 @@ def plot_logit_lens_step_n(
 
     ax_top.plot(
         x_sec,
-        ce_user_s.numpy(),
+        ratio.numpy(),
         color="#1f77b4",
         linewidth=1.2,
-        label=f"User Multi-modal CE (audio+text)/2, MA={max(1, ma_window)}",
+        label=f"CE ratio: line1/line2 (MA={max(1, ma_window)})",
     )
-    ax_top.plot(
-        x_sec,
-        ce_model_s.numpy(),
-        color="#d62728",
-        linewidth=1.2,
-        label=f"Model Multi-modal CE (audio+text)/2, MA={max(1, ma_window)}",
-    )
-    ax_top.set_ylabel("Cross-Entropy Loss")
+    ax_top.set_ylabel("CE ratio")
     ax_top.set_title(
-        f"Logit Lens Multi-modal CE (User shifted to n+1) (layer={layer}, tokens={T})"
+        f"Logit Lens CE Ratio line1/line2 (layer={layer}, tokens={T})"
     )
-    y_all = torch.cat([ce_user_s, ce_model_s], dim=0).numpy()
+    y_all = ratio.numpy()
     y_all = y_all[np.isfinite(y_all)]
     if y_all.size > 0:
         y_lo = float(np.percentile(y_all, 1.0))
