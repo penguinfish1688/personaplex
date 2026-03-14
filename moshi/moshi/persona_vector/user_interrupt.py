@@ -19,8 +19,8 @@ from moshi.persona_vector.mode_class import extract_normal_vector
 
 MAIN_LAYER_MIN = 0
 MAIN_LAYER_MAX = 31
-JSON_LAYER_MIN = MAIN_LAYER_MIN + 1
-JSON_LAYER_MAX = MAIN_LAYER_MAX + 1
+JSON_LAYER_MIN = MAIN_LAYER_MIN
+JSON_LAYER_MAX = MAIN_LAYER_MAX
 
 
 _MODE_CLASS_HIDDEN_CACHE: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
@@ -68,14 +68,11 @@ def _is_valid_main_layer(layer: int) -> bool:
 
 
 def _internal_layer_to_json_layer(layer: int) -> int:
-    return int(layer) + 1
+    return int(layer)
 
 
 def _json_layer_to_internal_layer(layer: int) -> Optional[int]:
-    # Preferred schema: JSON uses 1-based layer numbers (1..32).
-    if JSON_LAYER_MIN <= int(layer) <= JSON_LAYER_MAX:
-        return int(layer) - 1
-    # Backward compatibility for older 0-based JSON (0..31).
+    # Steering JSON schema is 0-based layer numbers (0..31).
     if _is_valid_main_layer(int(layer)):
         return int(layer)
     return None
