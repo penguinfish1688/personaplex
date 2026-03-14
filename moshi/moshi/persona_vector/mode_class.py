@@ -1182,11 +1182,11 @@ def plot_residual_routing(
     *,
     layer: int = -1,
 ) -> None:
-    """Plot per-step residual routing affinities and aligned audio waveforms.
+        """Plot per-step residual routing JSD curves and aligned audio waveforms.
 
     Top subplot (token step n):
-      - Input Affinity: cos(h_L[n], full_input_embeddings[n])
-      - Output Affinity: cos(h_L[n], text_pre_unembed_states[n])
+            - Input JSD: JSD(h_L[n] || full_input_embeddings[n])
+            - Output JSD: JSD(h_L[n] || text_pre_unembed_states[n])
 
     Bottom subplot:
       - input.wav and output.wav waveform amplitudes over physical time.
@@ -1259,8 +1259,21 @@ def plot_residual_routing(
     h_l = hidden[:, actual_layer, :]  # [T, D]
 
     # Strictly same-step routing: n-th hidden is compared to n-th input/output vectors.
-    input_affinity = F.cosine_similarity(h_l, full_input, dim=1).detach().cpu().numpy()
-    output_affinity = F.cosine_similarity(h_l, full_output, dim=1).detach().cpu().numpy()
+    # Convert each vector to a probability distribution with softmax, then compute
+    # token-wise JSD and normalize by ln(2) to map into [0, 1].
+    eps = 1e-12
+
+    def _jsd_per_token(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        pa = F.softmax(a, dim=1).clamp_min(eps)
+        pb = F.softmax(b, dim=1).clamp_min(eps)
+        m = 0.5 * (pa + pb)
+        kl_a_m = F.kl_div(pa.log(), m, reduction="none").sum(dim=1)
+        kl_b_m = F.kl_div(pb.log(), m, reduction="none").sum(dim=1)
+        jsd = 0.5 * (kl_a_m + kl_b_m)
+        return jsd / float(np.log(2.0))
+
+    input_jsd = _jsd_per_token(h_l, full_input).detach().cpu().numpy()
+    output_jsd = _jsd_per_token(h_l, full_output).detach().cpu().numpy()
 
     times = payload.get("times", None)
     if isinstance(times, torch.Tensor) and times.ndim == 1 and times.shape[0] == T:
@@ -1292,23 +1305,23 @@ def plot_residual_routing(
 
     ax_top.plot(
         x_sec,
-        input_affinity,
+        input_jsd,
         color="#1f77b4",
         linewidth=1.2,
-        label="Input Affinity: cos(h_L[n], full_input[n])",
+        label="Input JSD: JSD(h_L[n] || full_input[n])",
     )
     ax_top.plot(
         x_sec,
-        output_affinity,
+        output_jsd,
         color="#d62728",
         linewidth=1.2,
-        label="Output Affinity: cos(h_L[n], full_output[n])",
+        label="Output JSD: JSD(h_L[n] || full_output[n])",
     )
-    ax_top.set_ylabel("Cosine similarity")
+    ax_top.set_ylabel("JSD (normalized)")
     ax_top.set_title(
-        f"Residual Routing at Step n (layer={layer}, tokens={T})"
+        f"Residual Routing at Step n via JSD (layer={layer}, tokens={T})"
     )
-    ax_top.set_ylim(-1.05, 1.05)
+    ax_top.set_ylim(0.0, 1.05)
     ax_top.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
     ax_top.legend(loc="upper right", fontsize=8)
 
