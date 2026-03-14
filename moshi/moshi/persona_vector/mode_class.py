@@ -1321,7 +1321,26 @@ def plot_residual_routing(
     ax_top.set_title(
         f"Residual Routing at Step n via JSD (layer={layer}, tokens={T})"
     )
-    ax_top.set_ylim(0.0, 1.05)
+    # Adaptive y-range to avoid flattening informative variation when JSD values
+    # occupy a narrow band.
+    y_all = np.concatenate([input_jsd, output_jsd], axis=0)
+    y_all = y_all[np.isfinite(y_all)]
+    if y_all.size > 0:
+        y_lo = float(np.percentile(y_all, 1.0))
+        y_hi = float(np.percentile(y_all, 99.0))
+        if y_hi <= y_lo:
+            y_mid = float(y_all.mean())
+            y_lo, y_hi = y_mid - 0.05, y_mid + 0.05
+        pad = max(0.01, 0.12 * (y_hi - y_lo))
+        y_min = max(0.0, y_lo - pad)
+        y_max = min(1.0, y_hi + pad)
+        if y_max - y_min < 0.04:
+            y_mid = 0.5 * (y_min + y_max)
+            y_min = max(0.0, y_mid - 0.02)
+            y_max = min(1.0, y_mid + 0.02)
+        ax_top.set_ylim(y_min, y_max)
+    else:
+        ax_top.set_ylim(0.0, 1.0)
     ax_top.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
     ax_top.legend(loc="upper right", fontsize=8)
 
