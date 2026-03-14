@@ -10,6 +10,7 @@ from typing import Any, Optional
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
+from huggingface_hub import hf_hub_download
 
 from moshi.offline import run_batch_inference, _get_voice_prompt_dir
 from moshi.models import loaders
@@ -267,6 +268,35 @@ def _load_mode_class_hidden_sets(
     return H_s, H_l
 
 
+def _extract_qk_weights_for_layer(lm: Any, layer: int) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Extract packed Q/K projection weights for a model layer as [d_model, d_model]."""
+    num_layers = len(lm.transformer.layers)
+    layer_idx = int(layer) if int(layer) >= 0 else num_layers + int(layer)
+    if layer_idx < 0 or layer_idx >= num_layers:
+        raise ValueError(
+            f"Layer index {layer} (resolved to {layer_idx}) out of range for model with {num_layers} layers"
+        )
+
+    target_layer = lm.transformer.layers[layer_idx]
+    attn = target_layer.self_attn
+    w = attn.in_proj_weight.detach().cpu().float()
+    embed_dim = int(attn.embed_dim)
+    weights_per_step = int(getattr(attn, "weights_per_step", 0))
+
+    if weights_per_step > 0 and w.dim() == 2 and w.shape[0] == weights_per_step * 3 * embed_dim:
+        # Use step 0 for offline steering-vector generation.
+        w = w.view(weights_per_step, 3 * embed_dim, embed_dim)[0]
+
+    if w.dim() != 2 or w.shape[0] != 3 * embed_dim or w.shape[1] != embed_dim:
+        raise RuntimeError(
+            f"Unexpected in_proj_weight shape for packed QKV at layer {layer}: {tuple(w.shape)}"
+        )
+
+    w_q = w[:embed_dim, :].contiguous()
+    w_k = w[embed_dim : 2 * embed_dim, :].contiguous()
+    return w_q, w_k, embed_dim
+
+
 def inference(
     root_dir: str,
     save_hidden: bool = False,
@@ -359,16 +389,24 @@ def _compute_attention_mapped_steering_vector_single_layer(root_dir, classifier_
         raise ValueError(f"Invalid layer {layer}; expected [{MAIN_LAYER_MIN}..{MAIN_LAYER_MAX}]")
     layer_key = f"layer_{_internal_layer_to_json_layer(layer)}"
 
+    moshi_weight = hf_hub_download(loaders.DEFAULT_REPO, loaders.MOSHI_NAME)
+    lm = loaders.get_moshi_lm(moshi_weight, device="cpu", cpu_offload=False)
+    lm.eval()
+
+    w_q, w_k, embed_dim = _extract_qk_weights_for_layer(lm, layer)
+
     H_s, H_l = _load_mode_class_hidden_sets(classifier_dir, layer)
-    if int(H_s.shape[-1]) != int(H_l.shape[-1]):
+    if int(H_s.shape[-1]) != int(H_l.shape[-1]) or int(H_s.shape[-1]) != int(embed_dim):
         raise ValueError(
             f"Hidden dim mismatch for layer {layer}: H_s={int(H_s.shape[-1])}, "
-            f"H_l={int(H_l.shape[-1])}"
+            f"H_l={int(H_l.shape[-1])}, expected={int(embed_dim)}"
         )
 
     mapped_vector = _compute_attention_mapped_steering_vector(
         H_s=H_s,
         H_l=H_l,
+        W_q_weights=w_q,
+        W_k_weights=w_k,
         alpha=float(alpha),
     ).reshape(-1)
     mu_diff = H_s.mean(dim=0) - H_l.mean(dim=0)
@@ -506,12 +544,17 @@ def compute_attention_mapped_steering_vector_average(
     layer_vectors: list[torch.Tensor] = []
     layer_mean_diffs: list[tuple[int, torch.Tensor]] = []  # (layer, mean(H_s) - mean(H_l))
 
+    moshi_weight = hf_hub_download(loaders.DEFAULT_REPO, loaders.MOSHI_NAME)
+    lm = loaders.get_moshi_lm(moshi_weight, device="cpu", cpu_offload=False)
+    lm.eval()
+
     for layer in all_layers:
+        w_q, w_k, embed_dim = _extract_qk_weights_for_layer(lm, layer)
         H_s, H_l = _load_mode_class_hidden_sets(classifier_dir, layer)
-        if int(H_s.shape[-1]) != int(H_l.shape[-1]):
+        if int(H_s.shape[-1]) != int(H_l.shape[-1]) or int(H_s.shape[-1]) != int(embed_dim):
             raise ValueError(
                 f"Hidden dim mismatch at layer {layer}: H_s={int(H_s.shape[-1])}, "
-                f"H_l={int(H_l.shape[-1])}"
+                f"H_l={int(H_l.shape[-1])}, expected={int(embed_dim)}"
             )
         layer_mean_diffs.append((layer, H_s.mean(dim=0) - H_l.mean(dim=0)))
 
@@ -520,6 +563,8 @@ def compute_attention_mapped_steering_vector_average(
         mapped = _compute_attention_mapped_steering_vector(
             H_s=H_s,
             H_l=H_l,
+            W_q_weights=w_q,
+            W_k_weights=w_k,
             alpha=1.0,
         ).reshape(-1)
         layer_vectors.append(mapped)
@@ -650,8 +695,125 @@ def get_rope_matrix(
     
     return R_n
 
-
 def _compute_attention_mapped_steering_vector(
+    H_s: torch.Tensor,        # [N_s, d_model] - Speaking mode hidden states
+    H_l: torch.Tensor,        # [N_l, d_model] - Listening mode hidden states
+    W_q_weights: torch.Tensor, # [num_heads, head_dim, d_model] or [d_model, d_model]
+    W_k_weights: torch.Tensor, # [num_heads, head_dim, d_model] or [d_model, d_model]
+    rope_base: float = 10000.0,
+    rope_context_len: int = 200,
+    alpha: float = 1.0,
+) -> torch.Tensor:
+    """
+    Persona Vector Theory v4 (SVD Enhanced): Gradient Space Subspace Intersection.
+    
+    1. Maps H_s and H_l to Attention Gradient Space (D_s, D_l).
+    2. Performs expanded PCA (q=5) to find the high-dimensional subspace of each mode.
+    3. Uses SVD to find the true principal intersection (neutral direction 'n').
+    4. Normalizes gradients such that their projection on 'n' is exactly 1.
+    5. Subtracts normalized gradients to annihilate the neutral component.
+    """
+    original_device = W_q_weights.device
+    compute_device = torch.device("cuda") if torch.cuda.is_available() else original_device
+    dtype = torch.float32 # 確保幾何運算的精度
+    
+    # --- 1. 權重與維度處理 ---
+    if W_q_weights.dim() == 2:
+        d_model = W_q_weights.shape[0]
+        head_dim = 128 
+        num_heads = d_model // head_dim
+        w_q = W_q_weights.reshape(num_heads, head_dim, d_model).to(device=compute_device, dtype=dtype)
+        w_k = W_k_weights.reshape(num_heads, head_dim, d_model).to(device=compute_device, dtype=dtype)
+    else:
+        num_heads, head_dim, d_model = W_q_weights.shape
+        w_q = W_q_weights.to(device=compute_device, dtype=dtype)
+        w_k = W_k_weights.to(device=compute_device, dtype=dtype)
+
+    H_s = H_s.to(device=compute_device, dtype=dtype)
+    H_l = H_l.to(device=compute_device, dtype=dtype)
+
+    # --- 2. 映射至梯度空間 (D_s, D_l) ---
+    def get_attention_gradients(H_states):
+        D = []
+        combined_rope_map = torch.zeros(num_heads, d_model, d_model, device=compute_device, dtype=dtype)
+        for n in tqdm(range(rope_context_len), desc="Computing RoPE Matrix"):
+            # 假設 get_rope_matrix 在外部已定義
+            r_n = get_rope_matrix(n, head_dim, rope_base, device=compute_device).to(dtype=dtype)
+            for i in range(num_heads):
+                combined_rope_map[i] += torch.matmul(w_q[i].T, torch.matmul(r_n, w_k[i]))
+        combined_rope_map /= rope_context_len
+
+        for h in H_states:
+            grad = torch.zeros(d_model, device=compute_device, dtype=dtype)
+            for i in range(num_heads):
+                grad += torch.matmul(combined_rope_map[i], h)
+            D.append(grad)
+        return torch.stack(D) # [N, d_model]
+
+    print("[Math Engine] Mapping activations to gradient space...")
+    D_s = get_attention_gradients(H_s) # [N_s, d_model]
+    D_l = get_attention_gradients(H_l) # [N_l, d_model]
+
+    # --- 3. 擴張的 PCA 子空間提取 ---
+    q_dim = 5 
+    _, _, V_s = torch.pca_lowrank(D_s, q=q_dim) # V_s: [d_model, q_dim]
+    _, _, V_l = torch.pca_lowrank(D_l, q=q_dim) # V_l: [d_model, q_dim]
+
+    # --- 4. 使用 SVD 尋找真實的子空間交集 (True Subspace Intersection) ---
+    M = torch.matmul(V_s.T, V_l) # [q_dim, q_dim]
+    
+    # SVD 解構：找出梯度空間中最完美重合的「中性常識軸」
+    U, S, Vh = torch.linalg.svd(M)
+    max_alignment = S[0].item()
+
+    # 組合出真正的中性軸方向 n
+    n_dir_s = torch.matmul(V_s, U[:, 0])      # [d_model]
+    n_dir_l = torch.matmul(V_l, Vh[0, :])     # [d_model]
+    
+    # 確保符號一致並融合
+    if torch.dot(n_dir_s, n_dir_l) < 0:
+        n_dir_l = -n_dir_l
+    n = F.normalize(n_dir_s + n_dir_l, dim=0)
+
+    # 診斷：看看這根 n 軸是由哪些 PC 構成的
+    cos_sim_Vs = torch.matmul(V_s.T, n)
+    idx_s = torch.argmax(torch.abs(cos_sim_Vs)).item()
+    print(f"[Math Engine] n aligns most with D_s PC{idx_s} (cos: {cos_sim_Vs[idx_s].item():.4f})")
+
+    # --- 5. 分量歸一化與相減 (Normalization Annihilation) ---
+    grad_s_avg = D_s.mean(dim=0) # [d_model]
+    grad_l_avg = D_l.mean(dim=0) # [d_model]
+
+    def normalize_on_n(v, n_vec):
+        projection_len = torch.dot(v, n_vec)
+        return v / projection_len
+
+    # 在梯度空間中進行消融
+    grad_s_norm = normalize_on_n(grad_s_avg, n)
+    grad_l_norm = normalize_on_n(grad_l_avg, n)
+
+    # 最終對消：獲得純淨的神經網路意圖向量
+    v_star = grad_s_norm - grad_l_norm
+    v_opt = F.normalize(v_star, dim=0) * float(alpha)
+
+    # --- 6. 最終防呆與輸出 ---
+    mu_s = H_s.mean(dim=0)
+    mu_l = H_l.mean(dim=0)
+    mu_diff = mu_s - mu_l
+    cos_vopt_mu = F.cosine_similarity(v_opt, mu_diff, dim=0).item()
+    
+    if cos_vopt_mu > 0.0:
+        v_opt = -v_opt
+        cos_vopt_mu = F.cosine_similarity(v_opt, mu_diff, dim=0).item()
+        print("[Math Engine] cos(v_opt, mu_s-mu_l) was positive; flipped v_opt sign.")
+
+    print(f"[Math Engine] True Neutral axis alignment (SVD, q={q_dim}): {max_alignment:.4f}")
+    print(f"[Math Engine] final cos(v_opt, mu_s-mu_l): {cos_vopt_mu:.6f}")
+
+    return v_opt.reshape(1, -1).to(device=original_device, dtype=W_q_weights.dtype)
+
+
+def _compute_attention_mapped_steering_vector_simple(
     H_s: torch.Tensor,        # [N_s, d_model] - Speaking mode hidden states
     H_l: torch.Tensor,        # [N_l, d_model] - Listening mode hidden states
     alpha: float = 1.0,
