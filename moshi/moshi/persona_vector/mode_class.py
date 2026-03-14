@@ -1264,19 +1264,20 @@ def plot_logit_lens_step_n(
     model_text_target = output_token_ids[:, 0]
 
     device = lm.device
+    lm_dtype = next(lm.parameters()).dtype
     with torch.no_grad():
-        x = h_l.to(device=device, dtype=torch.float32)[:, None, :]  # [T, 1, D]
+        x = h_l.to(device=device, dtype=lm_dtype)[:, None, :]  # [T, 1, D]
         if getattr(lm, "out_norm", None) is not None:
             x = lm.out_norm(x)
 
         # Premature text logits directly from the text decode head.
-        text_logits = lm.text_linear(x)[:, 0, :]  # [T, text_card(+pad)]
+        text_logits = lm.text_linear(x)[:, 0, :].float()  # [T, text_card(+pad)]
 
         dep_in = text_tokens.to(device=device, dtype=torch.long)[:, None, None]  # [T,1,1]
         # First audio codebook decode head logits.
         with lm.depformer.streaming(T):
             logits0 = lm.forward_depformer(0, dep_in, x)  # [T, 1, 1, card]
-        logits0 = logits0[:, 0, 0, :]  # [T, card]
+        logits0 = logits0[:, 0, 0, :].float()  # [T, card]
 
         user_audio_ce = F.cross_entropy(
             logits0,
