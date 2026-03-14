@@ -1017,8 +1017,9 @@ def plot_output_hidden_alignment(
 ) -> None:
     """Plot attention heatmap (top) and aligned user/model waveforms (bottom).
 
-    Top subplot:
-      - 2D attention heatmap for selected layer from ``text_attention_weights``.
+        Top subplot:
+            - 2D attention-logit heatmap for selected layer from
+                ``text_attention_weights``.
       - X-axis: key token position/time.
       - Y-axis: query token position.
 
@@ -1073,8 +1074,10 @@ def plot_output_hidden_alignment(
             raise ValueError(
                 f"Layer count mismatch at step {t}: got {entry.shape[0]}, expected {num_layers}"
             )
-        # Mean over heads -> [K_t]
+        # Mean over heads -> [K_t], then convert weight p to logit log(p/(1-p)).
         vec = entry[actual_layer].float().mean(dim=0).detach().cpu().numpy()
+        vec = np.clip(vec, 1e-6, 1.0 - 1e-6)
+        vec = np.log(vec / (1.0 - vec)).astype(np.float32)
         if vec.ndim != 1:
             raise ValueError(f"Expected [K_t] after head-mean at step {t}, got {vec.shape}")
 
@@ -1113,18 +1116,17 @@ def plot_output_hidden_alignment(
     # Map key-axis [0..T] to seconds for direct alignment with waveform axis.
     img = ax_top.imshow(
         attn_matrix,
-        cmap="Blues",
+        cmap="coolwarm",
         aspect="auto",
         interpolation="nearest",
         origin="lower",
         extent=[0.0, token_end, -0.5, T - 0.5],
-        vmin=0.0,
     )
     cbar = fig.colorbar(img, ax=ax_top, fraction=0.03, pad=0.02)
-    cbar.set_label("Attention weight")
+    cbar.set_label("Attention logit")
     ax_top.set_ylabel("Query token position")
     ax_top.set_title(
-        f"Attention Heatmap + Audio Timeline (layer={layer}, steps={T})"
+        f"Attention Logit Heatmap + Audio Timeline (layer={layer}, steps={T})"
     )
     ax_top.grid(False)
 
