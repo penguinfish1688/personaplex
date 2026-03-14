@@ -17,6 +17,7 @@ CLI (``python -m moshi.persona_vector.mode_class``):
     --predict-mode <hidden.pt> --model <model.pt> --output <out.json>
     --plot-prediction <prediction.json> --hidden <hidden.pt> --output <out.png>
     --plot-attention-heatmap-dataset <root_dir> [--layer L]
+    --plot-residual-routing-dataset <root_dir> [--layer L]
 """
 
 from __future__ import annotations
@@ -1175,6 +1176,214 @@ def plot_attention_heatmap_dataset(
     print(f"\n[plot-attn] Done. Generated {ok}/{len(hidden_files)} plots.")
 
 
+def plot_residual_routing(
+    hidden_path: str,
+    output_path: str,
+    *,
+    layer: int = -1,
+) -> None:
+    """Plot per-step residual routing affinities and aligned audio waveforms.
+
+    Top subplot (token step n):
+      - Input Affinity: cos(h_L[n], full_input_embeddings[n])
+      - Output Affinity: cos(h_L[n], text_pre_unembed_states[n])
+
+    Bottom subplot:
+      - input.wav and output.wav waveform amplitudes over physical time.
+
+    X-axis alignment is strict: both subplots share identical time domain in seconds.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import torch.nn.functional as F
+
+    payload = _load_hidden_payload(hidden_path)
+    frame_rate_hz = float(payload.get("frame_rate", 12.5))
+
+    if "text_hidden_layers" not in payload:
+        raise KeyError(
+            "Payload is missing 'text_hidden_layers'. "
+            "Re-run inference with hidden payload capture enabled."
+        )
+    if "full_input_embeddings" not in payload:
+        raise KeyError(
+            "Payload is missing 'full_input_embeddings'. "
+            "Re-run inference with schema_version=5 payload capture."
+        )
+    if "text_pre_unembed_states" not in payload:
+        raise KeyError(
+            "Payload is missing 'text_pre_unembed_states'. "
+            "Re-run inference with pre-unembed state capture enabled."
+        )
+
+    hidden = payload["text_hidden_layers"].float()  # [T, L, D]
+    full_input = payload["full_input_embeddings"].float()  # [T, D]
+    full_output = payload["text_pre_unembed_states"].float()  # [T, D]
+
+    if hidden.ndim != 3:
+        raise ValueError(
+            "Expected 'text_hidden_layers' shape [T, L, D], "
+            f"got {tuple(hidden.shape)}"
+        )
+    if full_input.ndim != 2:
+        raise ValueError(
+            "Expected 'full_input_embeddings' shape [T, D], "
+            f"got {tuple(full_input.shape)}"
+        )
+    if full_output.ndim != 2:
+        raise ValueError(
+            "Expected 'text_pre_unembed_states' shape [T, D], "
+            f"got {tuple(full_output.shape)}"
+        )
+
+    T, num_layers, d_hidden = hidden.shape
+    if full_input.shape[0] != T or full_output.shape[0] != T:
+        raise ValueError(
+            "Token-length mismatch across payload tensors: "
+            f"text_hidden_layers={T}, full_input_embeddings={full_input.shape[0]}, "
+            f"text_pre_unembed_states={full_output.shape[0]}"
+        )
+    if full_input.shape[1] != d_hidden or full_output.shape[1] != d_hidden:
+        raise ValueError(
+            "Hidden dimension mismatch across payload tensors: "
+            f"text_hidden_layers={d_hidden}, full_input_embeddings={full_input.shape[1]}, "
+            f"text_pre_unembed_states={full_output.shape[1]}"
+        )
+
+    actual_layer = layer if layer >= 0 else num_layers + layer
+    if actual_layer < 0 or actual_layer >= num_layers:
+        raise ValueError(
+            f"Layer {layer} out of range for hidden with {num_layers} layers."
+        )
+
+    h_l = hidden[:, actual_layer, :]  # [T, D]
+
+    # Strictly same-step routing: n-th hidden is compared to n-th input/output vectors.
+    input_affinity = F.cosine_similarity(h_l, full_input, dim=1).detach().cpu().numpy()
+    output_affinity = F.cosine_similarity(h_l, full_output, dim=1).detach().cpu().numpy()
+
+    times = payload.get("times", None)
+    if isinstance(times, torch.Tensor) and times.ndim == 1 and times.shape[0] == T:
+        x_sec = times.detach().cpu().float().numpy()
+    else:
+        x_sec = (np.arange(T, dtype=np.float32) / float(frame_rate_hz)).astype(np.float32)
+
+    hidden_p = Path(hidden_path)
+    input_wav = Path(str(payload.get("input_wav", hidden_p.with_name("input.wav"))))
+    output_wav = Path(str(payload.get("output_wav", hidden_p.with_name("output.wav"))))
+
+    in_wav, in_sr = _load_mono_wav(input_wav)
+    out_wav, out_sr = _load_mono_wav(output_wav)
+    in_times = np.arange(in_wav.shape[0], dtype=np.float32) / float(in_sr)
+    out_times = np.arange(out_wav.shape[0], dtype=np.float32) / float(out_sr)
+
+    token_end = float(T) / frame_rate_hz
+    max_t = token_end
+
+    fig_w = max(11.0, min(18.0, max_t * 2.0))
+    fig, (ax_top, ax_bot) = plt.subplots(
+        2,
+        1,
+        figsize=(fig_w, 6.8),
+        dpi=180,
+        sharex=True,
+        gridspec_kw={"height_ratios": [1.8, 1.0]},
+    )
+
+    ax_top.plot(
+        x_sec,
+        input_affinity,
+        color="#1f77b4",
+        linewidth=1.2,
+        label="Input Affinity: cos(h_L[n], full_input[n])",
+    )
+    ax_top.plot(
+        x_sec,
+        output_affinity,
+        color="#d62728",
+        linewidth=1.2,
+        label="Output Affinity: cos(h_L[n], full_output[n])",
+    )
+    ax_top.set_ylabel("Cosine similarity")
+    ax_top.set_title(
+        f"Residual Routing at Step n (layer={layer}, tokens={T})"
+    )
+    ax_top.set_ylim(-1.05, 1.05)
+    ax_top.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
+    ax_top.legend(loc="upper right", fontsize=8)
+
+    ax_bot.plot(
+        in_times,
+        in_wav,
+        color="#2ca02c",
+        linewidth=0.7,
+        alpha=0.9,
+        label="input.wav (user)",
+    )
+    ax_bot.plot(
+        out_times,
+        out_wav,
+        color="#9467bd",
+        linewidth=0.7,
+        alpha=0.85,
+        label="output.wav (model)",
+    )
+    ax_bot.set_ylabel("Amplitude")
+    ax_bot.set_xlabel("Time (seconds)")
+    ax_bot.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
+    ax_bot.legend(loc="upper right", fontsize=8)
+
+    # Crucial alignment: both subplots use exactly the same physical time range.
+    ax_bot.set_xlim(0.0, max_t)
+
+    out_p = Path(output_path)
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_p, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] Saved residual routing plot to {output_path}")
+
+
+def plot_residual_routing_dataset(
+    root_dir: str,
+    *,
+    layer: int = -1,
+) -> None:
+    """Find ``root_dir/*/output_hidden(.pt)`` and plot residual routing for each."""
+    root = Path(root_dir)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Root directory not found: {root}")
+
+    hidden_files: list[Path] = []
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        cands = [child / "output_hidden.pt", child / "output_hidden"]
+        found = next((p for p in cands if p.is_file()), None)
+        if found is not None:
+            hidden_files.append(found)
+
+    if not hidden_files:
+        raise FileNotFoundError(
+            f"No output_hidden(.pt) files found under {root}/*/"
+        )
+
+    print(
+        f"[plot-routing] Found {len(hidden_files)} output_hidden(.pt) files under {root}/*/"
+    )
+    ok = 0
+    for hp in hidden_files:
+        out_png = hp.with_name(f"residual_routing_layer_{layer}.png")
+        print(f"\n--- {hp} ---")
+        try:
+            plot_residual_routing(str(hp), str(out_png), layer=layer)
+            ok += 1
+        except Exception as exc:
+            print(f"  [SKIP] residual routing plot failed: {exc}")
+
+    print(f"\n[plot-routing] Done. Generated {ok}/{len(hidden_files)} plots.")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1234,6 +1443,12 @@ def main() -> None:
         type=str,
         metavar="ROOT_DIR",
         help="Recursively plot output_hidden attention heatmap + audio waveform for all output_hidden.pt under ROOT_DIR.",
+    )
+    group.add_argument(
+        "--plot-residual-routing-dataset",
+        type=str,
+        metavar="ROOT_DIR",
+        help="Plot residual-stream routing affinities + aligned waveforms for ROOT_DIR/*/output_hidden(.pt).",
     )
 
     # Shared inference options (used by --gen-*)
@@ -1372,6 +1587,12 @@ def main() -> None:
     elif args.plot_attention_heatmap_dataset:
         plot_attention_heatmap_dataset(
             root_dir=args.plot_attention_heatmap_dataset,
+            layer=args.layer,
+        )
+
+    elif args.plot_residual_routing_dataset:
+        plot_residual_routing_dataset(
+            root_dir=args.plot_residual_routing_dataset,
             layer=args.layer,
         )
 
