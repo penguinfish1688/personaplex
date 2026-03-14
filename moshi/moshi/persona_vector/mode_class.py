@@ -17,7 +17,7 @@ CLI (``python -m moshi.persona_vector.mode_class``):
     --predict-mode <hidden.pt> --model <model.pt> --output <out.json>
     --plot-prediction <prediction.json> --hidden <hidden.pt> --output <out.png>
     --plot-attention-heatmap-dataset <root_dir> [--layer L]
-    --plot-residual-routing-dataset <root_dir> [--layer L]
+    --plot-logit-lens-dataset <root_dir> [--layer L]
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
+from huggingface_hub import hf_hub_download
 
 from moshi.offline import run_batch_inference, _get_voice_prompt_dir
 from moshi.models import loaders
@@ -1176,22 +1177,36 @@ def plot_attention_heatmap_dataset(
     print(f"\n[plot-attn] Done. Generated {ok}/{len(hidden_files)} plots.")
 
 
-def plot_residual_routing(
+def _moving_average(x: torch.Tensor, window_size: int = 5) -> torch.Tensor:
+    """Simple centered moving average with reflect padding."""
+    if window_size <= 1:
+        return x
+    if x.ndim != 1:
+        raise ValueError(f"Expected 1D tensor, got shape {tuple(x.shape)}")
+    pad = window_size // 2
+    x2 = x[None, None, :]
+    x2 = torch.nn.functional.pad(x2, (pad, pad), mode="reflect")
+    kernel = torch.ones(1, 1, window_size, dtype=x.dtype, device=x.device) / float(window_size)
+    out = torch.nn.functional.conv1d(x2, kernel)
+    return out[0, 0, :]
+
+
+def plot_logit_lens_step_n(
     hidden_path: str,
     output_path: str,
     *,
+    lm: Any,
     layer: int = -1,
+    ma_window: int = 5,
 ) -> None:
-    """Plot per-step residual routing JSD curves and aligned audio waveforms.
+    """Plot step-n premature-decode CE losses and aligned waveforms.
 
-    Top subplot (token step n):
-      - Input JSD: JSD(h_L[n] || full_input_embeddings[n])
-      - Output JSD: JSD(h_L[n] || text_pre_unembed_states[n])
+    Top subplot:
+    - User Multi-modal CE: (CE_audio_user + CE_text_user) / 2
+    - Model Multi-modal CE: (CE_audio_model + CE_text_model) / 2
 
     Bottom subplot:
-      - input.wav and output.wav waveform amplitudes over physical time.
-
-    X-axis alignment is strict: both subplots share identical time domain in seconds.
+      - input.wav and output.wav amplitudes over physical time.
     """
     import matplotlib.pyplot as plt
     import numpy as np
@@ -1200,80 +1215,96 @@ def plot_residual_routing(
     payload = _load_hidden_payload(hidden_path)
     frame_rate_hz = float(payload.get("frame_rate", 12.5))
 
-    if "text_hidden_layers" not in payload:
-        raise KeyError(
-            "Payload is missing 'text_hidden_layers'. "
-            "Re-run inference with hidden payload capture enabled."
-        )
-    if "full_input_embeddings" not in payload:
-        raise KeyError(
-            "Payload is missing 'full_input_embeddings'. "
-            "Re-run inference with schema_version=5 payload capture."
-        )
-    if "text_pre_unembed_states" not in payload:
-        raise KeyError(
-            "Payload is missing 'text_pre_unembed_states'. "
-            "Re-run inference with pre-unembed state capture enabled."
-        )
+    required = ["text_hidden_layers", "input_token_ids", "output_token_ids"]
+    for key in required:
+        if key not in payload:
+            raise KeyError(
+                f"Payload is missing '{key}'. Re-run inference with latest hidden payload saving."
+            )
 
     hidden = payload["text_hidden_layers"].float()  # [T, L, D]
-    full_input = payload["full_input_embeddings"].float()  # [T, D]
-    full_output = payload["text_pre_unembed_states"].float()  # [T, D]
+    input_token_ids = payload["input_token_ids"].long()  # [T, K_in]
+    output_token_ids = payload["output_token_ids"].long()  # [T, K_out]
 
     if hidden.ndim != 3:
-        raise ValueError(
-            "Expected 'text_hidden_layers' shape [T, L, D], "
-            f"got {tuple(hidden.shape)}"
-        )
-    if full_input.ndim != 2:
-        raise ValueError(
-            "Expected 'full_input_embeddings' shape [T, D], "
-            f"got {tuple(full_input.shape)}"
-        )
-    if full_output.ndim != 2:
-        raise ValueError(
-            "Expected 'text_pre_unembed_states' shape [T, D], "
-            f"got {tuple(full_output.shape)}"
-        )
+        raise ValueError(f"Expected text_hidden_layers [T, L, D], got {tuple(hidden.shape)}")
+    if input_token_ids.ndim != 2:
+        raise ValueError(f"Expected input_token_ids [T, K_in], got {tuple(input_token_ids.shape)}")
+    if output_token_ids.ndim != 2:
+        raise ValueError(f"Expected output_token_ids [T, K_out], got {tuple(output_token_ids.shape)}")
 
     T, num_layers, d_hidden = hidden.shape
-    if full_input.shape[0] != T or full_output.shape[0] != T:
+    if input_token_ids.shape[0] != T or output_token_ids.shape[0] != T:
         raise ValueError(
-            "Token-length mismatch across payload tensors: "
-            f"text_hidden_layers={T}, full_input_embeddings={full_input.shape[0]}, "
-            f"text_pre_unembed_states={full_output.shape[0]}"
-        )
-    if full_input.shape[1] != d_hidden or full_output.shape[1] != d_hidden:
-        raise ValueError(
-            "Hidden dimension mismatch across payload tensors: "
-            f"text_hidden_layers={d_hidden}, full_input_embeddings={full_input.shape[1]}, "
-            f"text_pre_unembed_states={full_output.shape[1]}"
+            "Token-length mismatch across hidden/token-id tensors: "
+            f"hidden={T}, input_token_ids={input_token_ids.shape[0]}, output_token_ids={output_token_ids.shape[0]}"
         )
 
     actual_layer = layer if layer >= 0 else num_layers + layer
     if actual_layer < 0 or actual_layer >= num_layers:
+        raise ValueError(f"Layer {layer} out of range for hidden with {num_layers} layers.")
+
+    # Expected token layout:
+    # input_token_ids: [text(0), model_audio(1..8), user_audio(9..16)]
+    # output_token_ids: [text(0), model_audio(1..8)]
+    if input_token_ids.shape[1] < 10:
         raise ValueError(
-            f"Layer {layer} out of range for hidden with {num_layers} layers."
+            f"input_token_ids width too small ({input_token_ids.shape[1]}), expected >=10 for user audio cb0 at index 9."
+        )
+    if output_token_ids.shape[1] < 2:
+        raise ValueError(
+            f"output_token_ids width too small ({output_token_ids.shape[1]}), expected >=2 for model audio cb0 at index 1."
         )
 
     h_l = hidden[:, actual_layer, :]  # [T, D]
+    text_tokens = output_token_ids[:, 0]  # [T], used to condition depformer audio decode.
+    user_audio_target = input_token_ids[:, 9]  # first user-audio codebook
+    model_audio_target = output_token_ids[:, 1]  # first model-audio codebook
+    user_text_target = input_token_ids[:, 0]
+    model_text_target = output_token_ids[:, 0]
 
-    # Strictly same-step routing: n-th hidden is compared to n-th input/output vectors.
-    # Convert each vector to a probability distribution with softmax, then compute
-    # token-wise raw JSD (natural-log base).
-    eps = 1e-12
+    device = lm.device
+    with torch.no_grad():
+        x = h_l.to(device=device, dtype=torch.float32)[:, None, :]  # [T, 1, D]
+        if getattr(lm, "out_norm", None) is not None:
+            x = lm.out_norm(x)
 
-    def _jsd_per_token(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        pa = F.softmax(a, dim=1).clamp_min(eps)
-        pb = F.softmax(b, dim=1).clamp_min(eps)
-        m = 0.5 * (pa + pb)
-        kl_a_m = F.kl_div(pa.log(), m, reduction="none").sum(dim=1)
-        kl_b_m = F.kl_div(pb.log(), m, reduction="none").sum(dim=1)
-        jsd = 0.5 * (kl_a_m + kl_b_m)
-        return jsd
+        # Premature text logits directly from the text decode head.
+        text_logits = lm.text_linear(x)[:, 0, :]  # [T, text_card(+pad)]
 
-    input_jsd = _jsd_per_token(h_l, full_input).detach().cpu().numpy()
-    output_jsd = _jsd_per_token(h_l, full_output).detach().cpu().numpy()
+        dep_in = text_tokens.to(device=device, dtype=torch.long)[:, None, None]  # [T,1,1]
+        # First audio codebook decode head logits.
+        with lm.depformer.streaming(T):
+            logits0 = lm.forward_depformer(0, dep_in, x)  # [T, 1, 1, card]
+        logits0 = logits0[:, 0, 0, :]  # [T, card]
+
+        user_audio_ce = F.cross_entropy(
+            logits0,
+            user_audio_target.to(device=device, dtype=torch.long),
+            reduction="none",
+        )
+        model_audio_ce = F.cross_entropy(
+            logits0,
+            model_audio_target.to(device=device, dtype=torch.long),
+            reduction="none",
+        )
+
+        user_text_ce = F.cross_entropy(
+            text_logits,
+            user_text_target.to(device=device, dtype=torch.long),
+            reduction="none",
+        )
+        model_text_ce = F.cross_entropy(
+            text_logits,
+            model_text_target.to(device=device, dtype=torch.long),
+            reduction="none",
+        )
+
+        ce_user = 0.5 * (user_audio_ce + user_text_ce)
+        ce_model = 0.5 * (model_audio_ce + model_text_ce)
+
+    ce_user_s = _moving_average(ce_user.detach().cpu().float(), window_size=max(1, ma_window))
+    ce_model_s = _moving_average(ce_model.detach().cpu().float(), window_size=max(1, ma_window))
 
     times = payload.get("times", None)
     if isinstance(times, torch.Tensor) and times.ndim == 1 and times.shape[0] == T:
@@ -1305,25 +1336,23 @@ def plot_residual_routing(
 
     ax_top.plot(
         x_sec,
-        input_jsd,
+        ce_user_s.numpy(),
         color="#1f77b4",
         linewidth=1.2,
-        label="Input JSD: JSD(h_L[n] || full_input[n])",
+        label=f"User Multi-modal CE (audio+text)/2, MA={max(1, ma_window)}",
     )
     ax_top.plot(
         x_sec,
-        output_jsd,
+        ce_model_s.numpy(),
         color="#d62728",
         linewidth=1.2,
-        label="Output JSD: JSD(h_L[n] || full_output[n])",
+        label=f"Model Multi-modal CE (audio+text)/2, MA={max(1, ma_window)}",
     )
-    ax_top.set_ylabel("JSD")
+    ax_top.set_ylabel("Cross-Entropy Loss")
     ax_top.set_title(
-        f"Residual Routing at Step n via JSD (layer={layer}, tokens={T})"
+        f"Logit Lens Multi-modal CE at Step n (layer={layer}, tokens={T})"
     )
-    # Adaptive y-range to avoid flattening informative variation when JSD values
-    # occupy a narrow band.
-    y_all = np.concatenate([input_jsd, output_jsd], axis=0)
+    y_all = torch.cat([ce_user_s, ce_model_s], dim=0).numpy()
     y_all = y_all[np.isfinite(y_all)]
     if y_all.size > 0:
         y_lo = float(np.percentile(y_all, 1.0))
@@ -1332,15 +1361,7 @@ def plot_residual_routing(
             y_mid = float(y_all.mean())
             y_lo, y_hi = y_mid - 0.05, y_mid + 0.05
         pad = max(0.01, 0.12 * (y_hi - y_lo))
-        y_min = y_lo - pad
-        y_max = y_hi + pad
-        if y_max - y_min < 0.04:
-            y_mid = 0.5 * (y_min + y_max)
-            y_min = y_mid - 0.02
-            y_max = y_mid + 0.02
-        ax_top.set_ylim(y_min, y_max)
-    else:
-        ax_top.set_ylim(0.0, 0.5)
+        ax_top.set_ylim(y_lo - pad, y_hi + pad)
     ax_top.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
     ax_top.legend(loc="upper right", fontsize=8)
 
@@ -1364,8 +1385,7 @@ def plot_residual_routing(
     ax_bot.set_xlabel("Time (seconds)")
     ax_bot.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
     ax_bot.legend(loc="upper right", fontsize=8)
-
-    # Crucial alignment: both subplots use exactly the same physical time range.
+    # Crucial alignment: same physical-time x-range for both subplots.
     ax_bot.set_xlim(0.0, max_t)
 
     out_p = Path(output_path)
@@ -1373,15 +1393,19 @@ def plot_residual_routing(
     fig.tight_layout()
     fig.savefig(out_p, bbox_inches="tight")
     plt.close(fig)
-    print(f"[plot] Saved residual routing plot to {output_path}")
+    print(f"[plot] Saved logit-lens CE plot to {output_path}")
 
 
-def plot_residual_routing_dataset(
+def plot_logit_lens_dataset(
     root_dir: str,
     *,
     layer: int = -1,
+    hf_repo: str = loaders.DEFAULT_REPO,
+    moshi_weight: Optional[str] = None,
+    device: str = "cuda",
+    ma_window: int = 5,
 ) -> None:
-    """Find ``root_dir/*/output_hidden(.pt)`` and plot residual routing for each."""
+    """Find ``root_dir/*/output_hidden(.pt)`` and plot logit-lens CE for each."""
     root = Path(root_dir)
     if not root.is_dir():
         raise FileNotFoundError(f"Root directory not found: {root}")
@@ -1400,20 +1424,31 @@ def plot_residual_routing_dataset(
             f"No output_hidden(.pt) files found under {root}/*/"
         )
 
+    if moshi_weight is None:
+        moshi_weight = hf_hub_download(hf_repo, loaders.MOSHI_NAME)  # type: ignore
+    lm = loaders.get_moshi_lm(moshi_weight, device=device, cpu_offload=False)
+    lm.eval()
+
     print(
-        f"[plot-routing] Found {len(hidden_files)} output_hidden(.pt) files under {root}/*/"
+        f"[plot-logit-lens] Found {len(hidden_files)} output_hidden(.pt) files under {root}/*/"
     )
     ok = 0
     for hp in hidden_files:
-        out_png = hp.with_name(f"residual_routing_layer_{layer}.png")
+        out_png = hp.with_name(f"logit_lens_ce_layer_{layer}.png")
         print(f"\n--- {hp} ---")
         try:
-            plot_residual_routing(str(hp), str(out_png), layer=layer)
+            plot_logit_lens_step_n(
+                str(hp),
+                str(out_png),
+                lm=lm,
+                layer=layer,
+                ma_window=ma_window,
+            )
             ok += 1
         except Exception as exc:
-            print(f"  [SKIP] residual routing plot failed: {exc}")
+            print(f"  [SKIP] logit-lens plot failed: {exc}")
 
-    print(f"\n[plot-routing] Done. Generated {ok}/{len(hidden_files)} plots.")
+    print(f"\n[plot-logit-lens] Done. Generated {ok}/{len(hidden_files)} plots.")
 
 
 # ---------------------------------------------------------------------------
@@ -1477,10 +1512,10 @@ def main() -> None:
         help="Recursively plot output_hidden attention heatmap + audio waveform for all output_hidden.pt under ROOT_DIR.",
     )
     group.add_argument(
-        "--plot-residual-routing-dataset",
+        "--plot-logit-lens-dataset",
         type=str,
         metavar="ROOT_DIR",
-        help="Plot residual-stream routing affinities + aligned waveforms for ROOT_DIR/*/output_hidden(.pt).",
+        help="Plot step-n logit-lens CE + aligned waveforms for ROOT_DIR/*/output_hidden(.pt).",
     )
 
     # Shared inference options (used by --gen-*)
@@ -1622,10 +1657,14 @@ def main() -> None:
             layer=args.layer,
         )
 
-    elif args.plot_residual_routing_dataset:
-        plot_residual_routing_dataset(
-            root_dir=args.plot_residual_routing_dataset,
+    elif args.plot_logit_lens_dataset:
+        plot_logit_lens_dataset(
+            root_dir=args.plot_logit_lens_dataset,
             layer=args.layer,
+            hf_repo=args.hf_repo,
+            moshi_weight=args.moshi_weight,
+            device=args.device,
+            ma_window=args.window,
         )
 
 
