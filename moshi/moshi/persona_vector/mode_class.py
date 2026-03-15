@@ -1311,8 +1311,9 @@ def plot_attention_heatmap_at_turn_taking(root_dir, span=20, layer=-1):
 
         user_stack = np.stack(per_anchor_user_wavs[anchor], axis=0)
         model_stack = np.stack(per_anchor_model_wavs[anchor], axis=0)
-        avg_user = np.nanmean(user_stack, axis=0)
-        avg_model = np.nanmean(model_stack, axis=0)
+        # Average absolute amplitude to avoid sign cancellation across samples.
+        avg_user = np.nanmean(np.abs(user_stack), axis=0)
+        avg_model = np.nanmean(np.abs(model_stack), axis=0)
 
         frame_rate_hz = float(np.nanmedian(np.asarray(per_anchor_frame_rate[anchor], dtype=np.float32)))
         window_sec = float(span) / frame_rate_hz
@@ -1687,30 +1688,27 @@ def plot_logit_lens_dataset(
 
 
 def plot_logit_lens_turn_taking_from_saved(
-    root_dir: str,
+    root_dirs: List[str],
     *,
     span: int = 50,
 ) -> None:
     """Average saved logit-lens CE traces around turn-taking anchors.
 
-    Reads ``root_dir/*/in_out_ce.json`` and ``root_dir/*/input_timing.json``.
-    For each anchor (``question_start``, ``interrupt_start``), aligns each sample
-    by anchor time and averages a token window ``[t-span, t+span]``.
+    Reads ``<root>/*/in_out_ce.json`` and ``<root>/*/input_timing.json`` for
+    each root in ``root_dirs``. For each anchor (``question_start``,
+    ``interrupt_start``), aligns each sample by anchor time and averages a token
+    window ``[t-span, t+span]``.
 
-    Saves figures under ``root_dir/``.
+    If multiple roots are provided, their averaged curves are overlaid on the
+    same graph (one line per root). Outputs are saved under the first root.
     """
     import matplotlib.pyplot as plt
     import numpy as np
 
-    root = Path(root_dir)
-    if not root.is_dir():
-        raise FileNotFoundError(f"Root directory not found: {root}")
+    if not root_dirs:
+        raise ValueError("root_dirs must contain at least one directory")
     if span < 1:
         raise ValueError(f"span must be >= 1, got {span}")
-
-    sample_dirs = sorted([p for p in root.iterdir() if p.is_dir()])
-    if not sample_dirs:
-        raise FileNotFoundError(f"No sample directories found under {root}")
 
     anchors = ["question_start", "interrupt_start"]
 
@@ -1727,97 +1725,158 @@ def plot_logit_lens_turn_taking_from_saved(
         out[dst_l : dst_r + 1] = arr[src_l : src_r + 1]
         return out
 
-    per_anchor_line1: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
-    per_anchor_line2: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
-    per_anchor_ratio: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
+    def _collect_per_root(root: Path) -> Dict[str, Dict[str, Any]]:
+        sample_dirs = sorted([p for p in root.iterdir() if p.is_dir()])
+        if not sample_dirs:
+            return {}
 
-    for sample_dir in sample_dirs:
-        timing_path = sample_dir / "input_timing.json"
-        ce_path = sample_dir / "in_out_ce.json"
-        if not timing_path.exists() or not ce_path.exists():
-            continue
+        per_anchor_line1: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
+        per_anchor_line2: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
+        per_anchor_ratio: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
 
-        try:
-            with timing_path.open("r", encoding="utf-8") as f:
-                timing = json.load(f)
-            with ce_path.open("r", encoding="utf-8") as f:
-                ce_data = json.load(f)
-            if not isinstance(timing, dict) or not isinstance(ce_data, dict):
+        for sample_dir in sample_dirs:
+            timing_path = sample_dir / "input_timing.json"
+            ce_path = sample_dir / "in_out_ce.json"
+            if not timing_path.exists() or not ce_path.exists():
                 continue
 
-            line1 = np.asarray(ce_data.get("line1_user_multimodal_ce", []), dtype=np.float32)
-            line2 = np.asarray(ce_data.get("line2_model_multimodal_ce", []), dtype=np.float32)
-            ratio = np.asarray(ce_data.get("ratio_line1_over_line2", []), dtype=np.float32)
-            if line1.ndim != 1 or line2.ndim != 1 or ratio.ndim != 1:
-                continue
-            if line1.shape[0] == 0 or line2.shape[0] == 0 or ratio.shape[0] == 0:
-                continue
-
-            n = min(line1.shape[0], line2.shape[0], ratio.shape[0])
-            line1 = line1[:n]
-            line2 = line2[:n]
-            ratio = ratio[:n]
-
-            frame_rate_hz = 12.5
-            hidden_cands = [sample_dir / "output_hidden.pt", sample_dir / "output_hidden"]
-            hidden_found = next((p for p in hidden_cands if p.is_file()), None)
-            if hidden_found is not None:
-                try:
-                    payload = _load_hidden_payload(str(hidden_found))
-                    frame_rate_hz = float(payload.get("frame_rate", frame_rate_hz))
-                except Exception:
-                    pass
-
-            for anchor in anchors:
-                if anchor not in timing:
-                    continue
-                anchor_sec = float(timing[anchor])
-                center_tok = int(round(anchor_sec * frame_rate_hz))
-                if center_tok < 0:
+            try:
+                with timing_path.open("r", encoding="utf-8") as f:
+                    timing = json.load(f)
+                with ce_path.open("r", encoding="utf-8") as f:
+                    ce_data = json.load(f)
+                if not isinstance(timing, dict) or not isinstance(ce_data, dict):
                     continue
 
-                per_anchor_line1[anchor].append(_extract_centered_1d(line1, center_tok, span))
-                per_anchor_line2[anchor].append(_extract_centered_1d(line2, center_tok, span))
-                per_anchor_ratio[anchor].append(_extract_centered_1d(ratio, center_tok, span))
-        except Exception:
-            continue
+                line1 = np.asarray(ce_data.get("line1_user_multimodal_ce", []), dtype=np.float32)
+                line2 = np.asarray(ce_data.get("line2_model_multimodal_ce", []), dtype=np.float32)
+                ratio = np.asarray(ce_data.get("ratio_line1_over_line2", []), dtype=np.float32)
+                if line1.ndim != 1 or line2.ndim != 1 or ratio.ndim != 1:
+                    continue
+                if line1.shape[0] == 0 or line2.shape[0] == 0 or ratio.shape[0] == 0:
+                    continue
+
+                n = min(line1.shape[0], line2.shape[0], ratio.shape[0])
+                line1 = line1[:n]
+                line2 = line2[:n]
+                ratio = ratio[:n]
+
+                frame_rate_hz = 12.5
+                hidden_cands = [sample_dir / "output_hidden.pt", sample_dir / "output_hidden"]
+                hidden_found = next((p for p in hidden_cands if p.is_file()), None)
+                if hidden_found is not None:
+                    try:
+                        payload = _load_hidden_payload(str(hidden_found))
+                        frame_rate_hz = float(payload.get("frame_rate", frame_rate_hz))
+                    except Exception:
+                        pass
+
+                for anchor in anchors:
+                    if anchor not in timing:
+                        continue
+                    anchor_sec = float(timing[anchor])
+                    center_tok = int(round(anchor_sec * frame_rate_hz))
+                    if center_tok < 0:
+                        continue
+
+                    per_anchor_line1[anchor].append(_extract_centered_1d(line1, center_tok, span))
+                    per_anchor_line2[anchor].append(_extract_centered_1d(line2, center_tok, span))
+                    per_anchor_ratio[anchor].append(_extract_centered_1d(ratio, center_tok, span))
+            except Exception:
+                continue
+
+        out: Dict[str, Dict[str, Any]] = {}
+        for anchor in anchors:
+            if len(per_anchor_ratio[anchor]) == 0:
+                continue
+            ratio_stack = np.stack(per_anchor_ratio[anchor], axis=0)
+            if not np.isfinite(ratio_stack).any():
+                continue
+
+            out[anchor] = {
+                "avg_line1": np.nanmean(np.stack(per_anchor_line1[anchor], axis=0), axis=0),
+                "avg_line2": np.nanmean(np.stack(per_anchor_line2[anchor], axis=0), axis=0),
+                "avg_ratio": np.nanmean(ratio_stack, axis=0),
+                "num_samples": int(len(per_anchor_ratio[anchor])),
+            }
+        return out
+
+    parsed_roots: List[Path] = []
+    for rd in root_dirs:
+        rp = Path(rd)
+        if not rp.is_dir():
+            raise FileNotFoundError(f"Root directory not found: {rp}")
+        parsed_roots.append(rp)
+
+    per_root: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for rp in parsed_roots:
+        root_data = _collect_per_root(rp)
+        if root_data:
+            per_root[rp.name] = root_data
+
+    if not per_root:
+        raise FileNotFoundError(
+            "No valid aligned samples found across provided root directories. "
+            "Expected each root to contain subdirs with input_timing.json and in_out_ce.json."
+        )
 
     rel_tok = np.arange(-span, span + 1, dtype=np.int32)
+    save_root = parsed_roots[0]
     for anchor in anchors:
-        if len(per_anchor_ratio[anchor]) == 0:
+        datasets_for_anchor = [
+            (name, data[anchor])
+            for name, data in per_root.items()
+            if anchor in data
+        ]
+        if not datasets_for_anchor:
             print(f"[plot-logit-turn] No valid samples for {anchor}; skipping")
             continue
 
-        line1_stack = np.stack(per_anchor_line1[anchor], axis=0)
-        line2_stack = np.stack(per_anchor_line2[anchor], axis=0)
-        ratio_stack = np.stack(per_anchor_ratio[anchor], axis=0)
-
-        if not np.isfinite(ratio_stack).any():
-            print(f"[plot-logit-turn] No finite ratio values for {anchor}; skipping")
-            continue
-
-        avg_line1 = np.nanmean(line1_stack, axis=0)
-        avg_line2 = np.nanmean(line2_stack, axis=0)
-        avg_ratio = np.nanmean(ratio_stack, axis=0)
-
         fig, ax = plt.subplots(figsize=(11.0, 4.6), dpi=180)
-        ax.plot(
-            rel_tok,
-            avg_ratio,
-            color="#1f77b4",
-            linewidth=1.6,
-            label="avg ratio line1/line2",
-        )
+        combined_ratio_values: list[np.ndarray] = []
+        merged_json: Dict[str, Any] = {
+            "anchor": anchor,
+            "window_tokens": int(span),
+            "relative_token_index": rel_tok.tolist(),
+            "datasets": {},
+        }
+        for ds_name, ds in datasets_for_anchor:
+            avg_ratio = ds["avg_ratio"]
+            avg_line1 = ds["avg_line1"]
+            avg_line2 = ds["avg_line2"]
+            n_samples = int(ds["num_samples"])
+
+            ax.plot(
+                rel_tok,
+                avg_ratio,
+                linewidth=1.6,
+                label=f"{ds_name} (n={n_samples})",
+            )
+            finite_ratio = avg_ratio[np.isfinite(avg_ratio)]
+            if finite_ratio.size > 0:
+                combined_ratio_values.append(finite_ratio)
+
+            merged_json["datasets"][ds_name] = {
+                "num_samples": n_samples,
+                "avg_line1_user_multimodal_ce": avg_line1.tolist(),
+                "avg_line2_model_multimodal_ce": avg_line2.tolist(),
+                "avg_ratio_line1_over_line2": avg_ratio.tolist(),
+            }
+
         ax.axvline(0, color="#444444", linestyle="--", linewidth=0.9, alpha=0.8)
         ax.set_xlabel(f"Relative token index to {anchor}")
         ax.set_ylabel("CE ratio")
         ax.set_title(
-            f"Average Logit-Lens CE Ratio Around {anchor} (window=+/-{span}, n={len(per_anchor_ratio[anchor])})"
+            f"Average Logit-Lens CE Ratio Around {anchor} (window=+/-{span})"
         )
         ax.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
         ax.legend(loc="upper right", fontsize=8)
 
-        y_all = avg_ratio[np.isfinite(avg_ratio)]
+        y_all = (
+            np.concatenate(combined_ratio_values)
+            if combined_ratio_values
+            else np.asarray([], dtype=np.float32)
+        )
         if y_all.size > 0:
             y_lo = float(np.percentile(y_all, 1.0))
             y_hi = float(np.percentile(y_all, 99.0))
@@ -1827,28 +1886,15 @@ def plot_logit_lens_turn_taking_from_saved(
             pad = max(0.01, 0.12 * (y_hi - y_lo))
             ax.set_ylim(y_lo - pad, y_hi + pad)
 
-        out_png = root / f"logit_lens_turn_taking_{anchor}.png"
+        suffix = "multi" if len(parsed_roots) > 1 else parsed_roots[0].name
+        out_png = save_root / f"logit_lens_turn_taking_{anchor}_{suffix}.png"
         fig.tight_layout()
         fig.savefig(out_png, bbox_inches="tight")
         plt.close(fig)
 
-        # Save averaged points for downstream use.
-        out_json = root / f"logit_lens_turn_taking_{anchor}.json"
+        out_json = save_root / f"logit_lens_turn_taking_{anchor}_{suffix}.json"
         with out_json.open("w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "anchor": anchor,
-                    "window_tokens": int(span),
-                    "num_samples": int(len(per_anchor_ratio[anchor])),
-                    "relative_token_index": rel_tok.tolist(),
-                    "avg_line1_user_multimodal_ce": avg_line1.tolist(),
-                    "avg_line2_model_multimodal_ce": avg_line2.tolist(),
-                    "avg_ratio_line1_over_line2": avg_ratio.tolist(),
-                },
-                f,
-                indent=2,
-                ensure_ascii=False,
-            )
+            json.dump(merged_json, f, indent=2, ensure_ascii=False)
         print(f"[plot-logit-turn] Saved {out_png}")
         print(f"[plot-logit-turn] Saved {out_json}")
 
@@ -1928,8 +1974,9 @@ def main() -> None:
     group.add_argument(
         "--plot-logit-lens-turn-taking-from-saved",
         type=str,
+        nargs="+",
         metavar="ROOT_DIR",
-        help="Average saved in_out_ce.json traces aligned by question_start/interrupt_start from ROOT_DIR/*/input_timing.json.",
+        help="Average saved in_out_ce.json traces aligned by question_start/interrupt_start. Accepts one or more ROOT_DIR values and overlays them.",
     )
 
     # Shared inference options (used by --gen-*)
@@ -2090,7 +2137,7 @@ def main() -> None:
 
     elif args.plot_logit_lens_turn_taking_from_saved:
         plot_logit_lens_turn_taking_from_saved(
-            root_dir=args.plot_logit_lens_turn_taking_from_saved,
+            root_dirs=args.plot_logit_lens_turn_taking_from_saved,
             span=50,
         )
 
