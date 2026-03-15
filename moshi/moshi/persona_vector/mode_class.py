@@ -1147,9 +1147,23 @@ def plot_attention_heatmap(
     )
     ax_top.grid(False)
 
-    ax_bot.plot(in_times, in_wav, color="#2ca02c", linewidth=0.7, alpha=0.9, label="input.wav (user)")
-    ax_bot.plot(out_times, out_wav, color="#9467bd", linewidth=0.7, alpha=0.85, label="output.wav (model)")
-    ax_bot.set_ylabel("Amplitude")
+    ax_bot.plot(
+        in_times,
+        np.abs(in_wav),
+        color="#2ca02c",
+        linewidth=0.7,
+        alpha=0.9,
+        label="|input.wav| (user)",
+    )
+    ax_bot.plot(
+        out_times,
+        np.abs(out_wav),
+        color="#9467bd",
+        linewidth=0.7,
+        alpha=0.85,
+        label="|output.wav| (model)",
+    )
+    ax_bot.set_ylabel("Absolute amplitude")
     ax_bot.set_xlabel("Time (seconds)  [aligned with key-axis above]")
     ax_bot.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
     ax_bot.legend(loc="upper right", fontsize=8)
@@ -1365,10 +1379,10 @@ def plot_attention_heatmap_at_turn_taking(root_dir, span=20, layer=-1):
             f"Average Attention Around {anchor} (layer={layer}, span={span}, n={len(per_anchor_heatmaps[anchor])})"
         )
 
-        ax_bot.plot(rel_sec, avg_user, color="#2ca02c", linewidth=0.9, alpha=0.95, label="input.wav avg")
-        ax_bot.plot(rel_sec, avg_model, color="#9467bd", linewidth=0.9, alpha=0.9, label="output.wav avg")
+        ax_bot.plot(rel_sec, avg_user, color="#2ca02c", linewidth=0.9, alpha=0.95, label="|input.wav| avg")
+        ax_bot.plot(rel_sec, avg_model, color="#9467bd", linewidth=0.9, alpha=0.9, label="|output.wav| avg")
         ax_bot.axvline(0.0, color="#444444", linestyle="--", linewidth=0.8, alpha=0.8)
-        ax_bot.set_ylabel("Amplitude")
+        ax_bot.set_ylabel("Absolute amplitude")
         ax_bot.set_xlabel(f"Relative time to {anchor} (s)")
         ax_bot.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
         ax_bot.legend(loc="upper right", fontsize=8)
