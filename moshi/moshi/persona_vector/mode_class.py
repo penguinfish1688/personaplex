@@ -1589,27 +1589,19 @@ def plot_logit_lens_step_n(
         gridspec_kw={"height_ratios": [1.8, 1.0]},
     )
 
-    line1_np = ce_user_s.numpy()
-    line2_np = ce_model_s.numpy()
+    ratio_np = ratio.numpy()
     ax_top.plot(
         x_sec,
-        line1_np,
+        ratio_np,
         color="#1f77b4",
         linewidth=1.2,
-        label="line1: user multimodal CE (n->n+1)",
+        label="CE ratio: line1/line2 (raw)",
     )
-    ax_top.plot(
-        x_sec,
-        line2_np,
-        color="#d62728",
-        linewidth=1.2,
-        label="line2: model multimodal CE (n->n)",
-    )
-    ax_top.set_ylabel("Cross-entropy")
+    ax_top.set_ylabel("CE ratio")
     ax_top.set_title(
-        f"Logit Lens CE Lines (layer={layer}, tokens={T})"
+        f"Logit Lens CE Ratio line1/line2 (layer={layer}, tokens={T})"
     )
-    y_all = np.concatenate([line1_np[np.isfinite(line1_np)], line2_np[np.isfinite(line2_np)]])
+    y_all = ratio_np[np.isfinite(ratio_np)]
     if y_all.size > 0:
         y_lo = float(np.percentile(y_all, 1.0))
         y_hi = float(np.percentile(y_all, 99.0))
@@ -1973,7 +1965,7 @@ def plot_logit_lens_turn_taking_from_saved(
             sharex=True,
             gridspec_kw={"height_ratios": [1.9, 1.0]},
         )
-        combined_line_values: list[np.ndarray] = []
+        combined_ratio_values: list[np.ndarray] = []
         combined_amp_values: list[np.ndarray] = []
         merged_json: Dict[str, Any] = {
             "anchor": anchor,
@@ -1984,22 +1976,16 @@ def plot_logit_lens_turn_taking_from_saved(
         for ds_name, ds in datasets_for_anchor:
             avg_line1 = ds["avg_line1"]
             avg_line2 = ds["avg_line2"]
+            avg_ratio = ds["avg_ratio"]
             n_samples = int(ds["num_samples"])
             avg_input_amp = ds["avg_input_amp"]
             n_input = int(ds["num_samples_input_amp"])
 
             ax_top.plot(
                 rel_tok,
-                avg_line1,
+                avg_ratio,
                 linewidth=1.6,
-                label=f"{ds_name} line1 (n={n_samples})",
-            )
-            ax_top.plot(
-                rel_tok,
-                avg_line2,
-                linewidth=1.6,
-                linestyle="--",
-                label=f"{ds_name} line2 (n={n_samples})",
+                label=f"{ds_name} ratio (n={n_samples})",
             )
 
             ax_bot.plot(
@@ -2009,12 +1995,9 @@ def plot_logit_lens_turn_taking_from_saved(
                 label=f"{ds_name} (n={n_input})",
             )
 
-            finite_line1 = avg_line1[np.isfinite(avg_line1)]
-            if finite_line1.size > 0:
-                combined_line_values.append(finite_line1)
-            finite_line2 = avg_line2[np.isfinite(avg_line2)]
-            if finite_line2.size > 0:
-                combined_line_values.append(finite_line2)
+            finite_ratio = avg_ratio[np.isfinite(avg_ratio)]
+            if finite_ratio.size > 0:
+                combined_ratio_values.append(finite_ratio)
             finite_amp = avg_input_amp[np.isfinite(avg_input_amp)]
             if finite_amp.size > 0:
                 combined_amp_values.append(finite_amp)
@@ -2031,9 +2014,9 @@ def plot_logit_lens_turn_taking_from_saved(
             }
 
         ax_top.axvline(0, color="#444444", linestyle="--", linewidth=0.9, alpha=0.8)
-        ax_top.set_ylabel("Cross-entropy")
+        ax_top.set_ylabel("CE ratio")
         ax_top.set_title(
-            f"Average Logit-Lens CE Lines Around {anchor} (window=+/-{span})"
+            f"Average Logit-Lens CE Ratio Around {anchor} (window=+/-{span})"
         )
         ax_top.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
         ax_top.legend(loc="upper right", fontsize=8)
@@ -2045,8 +2028,8 @@ def plot_logit_lens_turn_taking_from_saved(
         ax_bot.legend(loc="upper right", fontsize=8)
 
         y_all = (
-            np.concatenate(combined_line_values)
-            if combined_line_values
+            np.concatenate(combined_ratio_values)
+            if combined_ratio_values
             else np.asarray([], dtype=np.float32)
         )
         if y_all.size > 0:
