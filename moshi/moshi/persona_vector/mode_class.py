@@ -1589,19 +1589,27 @@ def plot_logit_lens_step_n(
         gridspec_kw={"height_ratios": [1.8, 1.0]},
     )
 
+    line1_np = ce_user_s.numpy()
+    line2_np = ce_model_s.numpy()
     ax_top.plot(
         x_sec,
-        ratio.numpy(),
+        line1_np,
         color="#1f77b4",
         linewidth=1.2,
-        label="CE ratio: line1/line2 (raw)",
+        label="line1: user multimodal CE (n->n+1)",
     )
-    ax_top.set_ylabel("CE ratio")
+    ax_top.plot(
+        x_sec,
+        line2_np,
+        color="#d62728",
+        linewidth=1.2,
+        label="line2: model multimodal CE (n->n)",
+    )
+    ax_top.set_ylabel("Cross-entropy")
     ax_top.set_title(
-        f"Logit Lens CE Ratio line1/line2 (layer={layer}, tokens={T})"
+        f"Logit Lens CE Lines (layer={layer}, tokens={T})"
     )
-    y_all = ratio.numpy()
-    y_all = y_all[np.isfinite(y_all)]
+    y_all = np.concatenate([line1_np[np.isfinite(line1_np)], line2_np[np.isfinite(line2_np)]])
     if y_all.size > 0:
         y_lo = float(np.percentile(y_all, 1.0))
         y_hi = float(np.percentile(y_all, 99.0))
@@ -1769,15 +1777,18 @@ def plot_logit_lens_turn_taking_from_saved(
                 line1 = np.asarray(ce_data.get("line1_user_multimodal_ce", []), dtype=np.float32)
                 line2 = np.asarray(ce_data.get("line2_model_multimodal_ce", []), dtype=np.float32)
                 ratio = np.asarray(ce_data.get("ratio_line1_over_line2", []), dtype=np.float32)
-                if line1.ndim != 1 or line2.ndim != 1 or ratio.ndim != 1:
+                if line1.ndim != 1 or line2.ndim != 1:
                     continue
-                if line1.shape[0] == 0 or line2.shape[0] == 0 or ratio.shape[0] == 0:
+                if line1.shape[0] == 0 or line2.shape[0] == 0:
                     continue
 
-                n = min(line1.shape[0], line2.shape[0], ratio.shape[0])
+                n = min(line1.shape[0], line2.shape[0])
                 line1 = line1[:n]
                 line2 = line2[:n]
-                ratio = ratio[:n]
+                if ratio.ndim == 1 and ratio.shape[0] >= n:
+                    ratio = ratio[:n]
+                else:
+                    ratio = line1 / np.clip(line2, 1e-6, None)
 
                 frame_rate_hz = 12.5
                 input_wav_path = sample_dir / "input.wav"
@@ -1962,7 +1973,7 @@ def plot_logit_lens_turn_taking_from_saved(
             sharex=True,
             gridspec_kw={"height_ratios": [1.9, 1.0]},
         )
-        combined_ratio_values: list[np.ndarray] = []
+        combined_line_values: list[np.ndarray] = []
         combined_amp_values: list[np.ndarray] = []
         merged_json: Dict[str, Any] = {
             "anchor": anchor,
@@ -1971,7 +1982,6 @@ def plot_logit_lens_turn_taking_from_saved(
             "datasets": {},
         }
         for ds_name, ds in datasets_for_anchor:
-            avg_ratio = ds["avg_ratio"]
             avg_line1 = ds["avg_line1"]
             avg_line2 = ds["avg_line2"]
             n_samples = int(ds["num_samples"])
@@ -1980,9 +1990,16 @@ def plot_logit_lens_turn_taking_from_saved(
 
             ax_top.plot(
                 rel_tok,
-                avg_ratio,
+                avg_line1,
                 linewidth=1.6,
-                label=f"{ds_name} (n={n_samples})",
+                label=f"{ds_name} line1 (n={n_samples})",
+            )
+            ax_top.plot(
+                rel_tok,
+                avg_line2,
+                linewidth=1.6,
+                linestyle="--",
+                label=f"{ds_name} line2 (n={n_samples})",
             )
 
             ax_bot.plot(
@@ -1992,9 +2009,12 @@ def plot_logit_lens_turn_taking_from_saved(
                 label=f"{ds_name} (n={n_input})",
             )
 
-            finite_ratio = avg_ratio[np.isfinite(avg_ratio)]
-            if finite_ratio.size > 0:
-                combined_ratio_values.append(finite_ratio)
+            finite_line1 = avg_line1[np.isfinite(avg_line1)]
+            if finite_line1.size > 0:
+                combined_line_values.append(finite_line1)
+            finite_line2 = avg_line2[np.isfinite(avg_line2)]
+            if finite_line2.size > 0:
+                combined_line_values.append(finite_line2)
             finite_amp = avg_input_amp[np.isfinite(avg_input_amp)]
             if finite_amp.size > 0:
                 combined_amp_values.append(finite_amp)
@@ -2003,15 +2023,17 @@ def plot_logit_lens_turn_taking_from_saved(
                 "num_samples": n_samples,
                 "avg_line1_user_multimodal_ce": avg_line1.tolist(),
                 "avg_line2_model_multimodal_ce": avg_line2.tolist(),
-                "avg_ratio_line1_over_line2": avg_ratio.tolist(),
+                "avg_ratio_line1_over_line2": (
+                    (avg_line1 / np.clip(avg_line2, 1e-6, None)).tolist()
+                ),
                 "num_samples_input_audio": n_input,
                 "avg_input_audio_abs_amplitude": avg_input_amp.tolist(),
             }
 
         ax_top.axvline(0, color="#444444", linestyle="--", linewidth=0.9, alpha=0.8)
-        ax_top.set_ylabel("CE ratio")
+        ax_top.set_ylabel("Cross-entropy")
         ax_top.set_title(
-            f"Average Logit-Lens CE Ratio Around {anchor} (window=+/-{span})"
+            f"Average Logit-Lens CE Lines Around {anchor} (window=+/-{span})"
         )
         ax_top.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
         ax_top.legend(loc="upper right", fontsize=8)
@@ -2023,8 +2045,8 @@ def plot_logit_lens_turn_taking_from_saved(
         ax_bot.legend(loc="upper right", fontsize=8)
 
         y_all = (
-            np.concatenate(combined_ratio_values)
-            if combined_ratio_values
+            np.concatenate(combined_line_values)
+            if combined_line_values
             else np.asarray([], dtype=np.float32)
         )
         if y_all.size > 0:
