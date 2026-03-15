@@ -1739,19 +1739,22 @@ def plot_logit_lens_turn_taking_from_saved(
         out[dst_l : dst_r + 1] = arr[src_l : src_r + 1]
         return out
 
-    def _collect_per_root(root: Path) -> Dict[str, Dict[str, Any]]:
-        sample_dirs = sorted([p for p in root.iterdir() if p.is_dir()])
-        if not sample_dirs:
+    def _collect_per_root(root: Path, sample_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        if not sample_ids:
             return {}
 
         per_anchor_line1: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
         per_anchor_line2: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
         per_anchor_ratio: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
 
-        for sample_dir in sample_dirs:
+        for sample_id in sample_ids:
+            sample_dir = root / sample_id
             timing_path = sample_dir / "input_timing.json"
             ce_path = sample_dir / "in_out_ce.json"
             if not timing_path.exists() or not ce_path.exists():
+                print(
+                    f"[plot-logit-turn][WARN] Missing required files in {sample_dir}; skipping"
+                )
                 continue
 
             try:
@@ -1822,11 +1825,78 @@ def plot_logit_lens_turn_taking_from_saved(
             raise FileNotFoundError(f"Root directory not found: {rp}")
         parsed_roots.append(rp)
 
-    per_root: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    # Build per-root valid sample id sets, then keep only the intersection.
+    # This ensures all overlaid curves are computed from the same shared samples.
+    root_valid_ids: Dict[Path, set[str]] = {}
     for rp in parsed_roots:
-        root_data = _collect_per_root(rp)
+        sample_dirs = sorted([p for p in rp.iterdir() if p.is_dir()])
+        if not sample_dirs:
+            root_valid_ids[rp] = set()
+            print(f"[plot-logit-turn][WARN] No subdirectories found under {rp}")
+            continue
+
+        valid_ids: set[str] = set()
+        missing: list[str] = []
+        for sd in sample_dirs:
+            has_timing = (sd / "input_timing.json").is_file()
+            has_ce = (sd / "in_out_ce.json").is_file()
+            if has_timing and has_ce:
+                valid_ids.add(sd.name)
+            else:
+                missing_parts: list[str] = []
+                if not has_timing:
+                    missing_parts.append("input_timing.json")
+                if not has_ce:
+                    missing_parts.append("in_out_ce.json")
+                missing.append(f"{sd.name} ({'+'.join(missing_parts)})")
+
+        root_valid_ids[rp] = valid_ids
+        if missing:
+            preview = ", ".join(missing[:8])
+            if len(missing) > 8:
+                preview += ", ..."
+            print(
+                f"[plot-logit-turn][WARN] {rp}: {len(missing)} subdirs missing required files: {preview}"
+            )
+
+    common_ids: set[str] = set.intersection(*root_valid_ids.values()) if root_valid_ids else set()
+    if not common_ids:
+        raise FileNotFoundError(
+            "No shared valid subdirectories across provided roots. "
+            "Need subdirs that exist with both input_timing.json and in_out_ce.json in every dataset root."
+        )
+
+    # Warn about subdirs excluded because they are not present/valid in all roots.
+    union_ids: set[str] = set.union(*root_valid_ids.values()) if root_valid_ids else set()
+    excluded_ids = sorted(union_ids - common_ids)
+    if excluded_ids:
+        preview = ", ".join(excluded_ids[:10])
+        if len(excluded_ids) > 10:
+            preview += ", ..."
+        print(
+            f"[plot-logit-turn][WARN] Excluding {len(excluded_ids)} non-shared subdirs; using only common valid subset ({len(common_ids)}): {preview}"
+        )
+    else:
+        print(
+            f"[plot-logit-turn] Using {len(common_ids)} shared valid subdirs across all provided roots."
+        )
+
+    shared_ids = sorted(common_ids)
+
+    # Build unique labels in case root basenames collide.
+    used_labels: set[str] = set()
+    labeled_roots: List[tuple[str, Path]] = []
+    for idx, rp in enumerate(parsed_roots, start=1):
+        base = rp.name
+        label = base if base not in used_labels else f"{base}_{idx}"
+        used_labels.add(label)
+        labeled_roots.append((label, rp))
+
+    per_root: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for label, rp in labeled_roots:
+        root_data = _collect_per_root(rp, shared_ids)
         if root_data:
-            per_root[rp.name] = root_data
+            per_root[label] = root_data
 
     if not per_root:
         raise FileNotFoundError(
