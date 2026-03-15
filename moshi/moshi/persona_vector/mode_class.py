@@ -2304,7 +2304,7 @@ def main() -> None:
     elif args.plot_logit_lens_turn_taking_from_saved:
         plot_logit_lens_turn_taking_from_saved(
             root_dirs=args.plot_logit_lens_turn_taking_from_saved,
-            span=40,
+            span=35,
         )
 
 
