@@ -1148,6 +1148,194 @@ def plot_attention_heatmap(
     plt.close(fig)
     print(f"[plot] Saved attention heatmap plot to {output_path}")
 
+def plot_attention_heatmap_at_turn_taking(root_dir, span=20, layer=-1):
+    """Plot average turn-taking aligned attention windows over ``root_dir/*/``.
+
+    Reads ``input_timing.json`` from each sample directory and aligns around:
+      - ``question_start``
+      - ``interrupt_start``
+
+    For each anchor, creates one output figure with:
+      - top: average attention-logit heatmap over window ``[t-span, t+span]`` tokens
+      - bottom: average aligned user/model waveform over the same relative-time window
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    root = Path(root_dir)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Root directory not found: {root}")
+    if span < 1:
+        raise ValueError(f"span must be >= 1, got {span}")
+
+    sample_dirs = sorted([p for p in root.iterdir() if p.is_dir()])
+    if not sample_dirs:
+        raise FileNotFoundError(f"No sample directories found under {root}")
+
+    anchors = ["question_start", "interrupt_start"]
+
+    def _extract_attention_matrix(payload: Dict[str, Any], layer: int = -1) -> np.ndarray:
+        attn_steps = payload.get("text_attention_weights", None)
+        if not isinstance(attn_steps, list) or len(attn_steps) == 0:
+            raise KeyError("Missing non-empty text_attention_weights in payload")
+        first_attn = next((a for a in attn_steps if isinstance(a, torch.Tensor)), None)
+        if first_attn is None or first_attn.ndim != 3:
+            raise ValueError("Invalid attention tensor shape in payload")
+        num_layers = first_attn.shape[0]
+        use_layer = layer if layer >= 0 else num_layers + layer
+        if use_layer < 0 or use_layer >= num_layers:
+            raise ValueError(f"Layer {layer} out of range for {num_layers} attention layers")
+
+        T = len(attn_steps)
+        mat = np.full((T, T), np.nan, dtype=np.float32)
+        for t, entry in enumerate(attn_steps):
+            if entry is None:
+                continue
+            if not isinstance(entry, torch.Tensor) or entry.ndim != 3:
+                continue
+            vec = entry[use_layer].float().mean(dim=0).detach().cpu().numpy()
+            vec = np.clip(vec, 1e-6, 1.0 - 1e-6)
+            vec = np.log(vec / (1.0 - vec)).astype(np.float32)
+            use_len = min(vec.shape[0], t + 1)
+            if use_len > 0:
+                mat[t, t - use_len + 1 : t + 1] = vec[-use_len:]
+        return mat
+
+    def _extract_centered_square(mat: np.ndarray, center: int, half: int) -> np.ndarray:
+        side = 2 * half + 1
+        out = np.full((side, side), np.nan, dtype=np.float32)
+        for i in range(side):
+            src_i = center - half + i
+            if src_i < 0 or src_i >= mat.shape[0]:
+                continue
+            for j in range(side):
+                src_j = center - half + j
+                if src_j < 0 or src_j >= mat.shape[1]:
+                    continue
+                out[i, j] = mat[src_i, src_j]
+        return out
+
+    # Gather aligned windows per anchor.
+    per_anchor_heatmaps: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
+    per_anchor_user_wavs: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
+    per_anchor_model_wavs: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
+    per_anchor_frame_rate: dict[str, list[float]] = {k: [] for k in anchors}
+
+    for sample_dir in sample_dirs:
+        timing_path = sample_dir / "input_timing.json"
+        hidden_path = sample_dir / "output_hidden.pt"
+        if not hidden_path.exists():
+            hidden_path = sample_dir / "output_hidden"
+        if not timing_path.exists() or not hidden_path.exists():
+            continue
+
+        try:
+            with timing_path.open("r", encoding="utf-8") as f:
+                timing = json.load(f)
+            if not isinstance(timing, dict):
+                continue
+
+            payload = _load_hidden_payload(str(hidden_path))
+            frame_rate_hz = float(payload.get("frame_rate", 12.5))
+            attn_mat = _extract_attention_matrix(payload, layer=layer)
+
+            hidden_p = Path(str(hidden_path))
+            input_wav = Path(str(payload.get("input_wav", hidden_p.with_name("input.wav"))))
+            output_wav = Path(str(payload.get("output_wav", hidden_p.with_name("output.wav"))))
+            in_wav, in_sr = _load_mono_wav(input_wav)
+            out_wav, out_sr = _load_mono_wav(output_wav)
+            in_t = np.arange(in_wav.shape[0], dtype=np.float32) / float(in_sr)
+            out_t = np.arange(out_wav.shape[0], dtype=np.float32) / float(out_sr)
+
+            window_sec = float(span) / frame_rate_hz
+            rel_grid = np.linspace(-window_sec, window_sec, 2 * span + 1, dtype=np.float32)
+
+            for anchor in anchors:
+                if anchor not in timing:
+                    continue
+                anchor_sec = float(timing[anchor])
+                center_tok = int(round(anchor_sec * frame_rate_hz))
+
+                # Attention aligned around anchor token index.
+                local = _extract_centered_square(attn_mat, center_tok, span)
+                per_anchor_heatmaps[anchor].append(local)
+                per_anchor_frame_rate[anchor].append(frame_rate_hz)
+
+                # Waveforms aligned around anchor time (sampled to token-grid length).
+                in_local = np.interp(
+                    anchor_sec + rel_grid,
+                    in_t,
+                    in_wav,
+                    left=np.nan,
+                    right=np.nan,
+                )
+                out_local = np.interp(
+                    anchor_sec + rel_grid,
+                    out_t,
+                    out_wav,
+                    left=np.nan,
+                    right=np.nan,
+                )
+                per_anchor_user_wavs[anchor].append(in_local.astype(np.float32))
+                per_anchor_model_wavs[anchor].append(out_local.astype(np.float32))
+        except Exception:
+            continue
+
+    # Plot one figure per anchor.
+    for anchor in anchors:
+        if len(per_anchor_heatmaps[anchor]) == 0:
+            print(f"[plot-turn] No valid samples for {anchor}; skipping")
+            continue
+
+        import numpy as np
+        heat = np.nanmean(np.stack(per_anchor_heatmaps[anchor], axis=0), axis=0)
+        avg_user = np.nanmean(np.stack(per_anchor_user_wavs[anchor], axis=0), axis=0)
+        avg_model = np.nanmean(np.stack(per_anchor_model_wavs[anchor], axis=0), axis=0)
+
+        frame_rate_hz = float(np.nanmedian(np.asarray(per_anchor_frame_rate[anchor], dtype=np.float32)))
+        window_sec = float(span) / frame_rate_hz
+        rel_sec = np.linspace(-window_sec, window_sec, heat.shape[0], dtype=np.float32)
+
+        fig_w = max(10.5, min(16.0, 10.0 + 0.05 * heat.shape[0]))
+        fig, (ax_top, ax_bot) = plt.subplots(
+            2,
+            1,
+            figsize=(fig_w, 6.6),
+            dpi=180,
+            sharex=True,
+            gridspec_kw={"height_ratios": [2.3, 1.0]},
+        )
+
+        img = ax_top.imshow(
+            heat,
+            cmap="coolwarm",
+            aspect="auto",
+            interpolation="nearest",
+            origin="lower",
+            extent=[-window_sec, window_sec, -window_sec, window_sec],
+        )
+        cax = ax_top.inset_axes([1.01, 0.0, 0.018, 1.0])
+        cbar = fig.colorbar(img, cax=cax)
+        cbar.set_label("Attention logit")
+        ax_top.set_ylabel("Query offset (s)")
+        ax_top.set_title(
+            f"Average Attention Around {anchor} (layer={layer}, span={span}, n={len(per_anchor_heatmaps[anchor])})"
+        )
+
+        ax_bot.plot(rel_sec, avg_user, color="#2ca02c", linewidth=0.9, alpha=0.95, label="input.wav avg")
+        ax_bot.plot(rel_sec, avg_model, color="#9467bd", linewidth=0.9, alpha=0.9, label="output.wav avg")
+        ax_bot.axvline(0.0, color="#444444", linestyle="--", linewidth=0.8, alpha=0.8)
+        ax_bot.set_ylabel("Amplitude")
+        ax_bot.set_xlabel(f"Relative time to {anchor} (s)")
+        ax_bot.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
+        ax_bot.legend(loc="upper right", fontsize=8)
+        ax_bot.set_xlim(-window_sec, window_sec)
+
+        out_path = root / f"attention_heatmap_turn_taking_{anchor}.png"
+        fig.tight_layout()
+        fig.savefig(out_path, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[plot-turn] Saved {out_path}")
 
 def plot_attention_heatmap_dataset(
     root_dir: str,
@@ -1177,20 +1365,6 @@ def plot_attention_heatmap_dataset(
     print(f"\n[plot-attn] Done. Generated {ok}/{len(hidden_files)} plots.")
 
 
-def _moving_average(x: torch.Tensor, window_size: int = 5) -> torch.Tensor:
-    """Simple centered moving average with reflect padding."""
-    if window_size <= 1:
-        return x
-    if x.ndim != 1:
-        raise ValueError(f"Expected 1D tensor, got shape {tuple(x.shape)}")
-    pad = window_size // 2
-    x2 = x[None, None, :]
-    x2 = torch.nn.functional.pad(x2, (pad, pad), mode="reflect")
-    kernel = torch.ones(1, 1, window_size, dtype=x.dtype, device=x.device) / float(window_size)
-    out = torch.nn.functional.conv1d(x2, kernel)
-    return out[0, 0, :]
-
-
 def plot_logit_lens_step_n(
     hidden_path: str,
     output_path: str,
@@ -1198,6 +1372,7 @@ def plot_logit_lens_step_n(
     lm: Any,
     layer: int = -1,
     ma_window: int = 5,
+    ce_json_path: Optional[str] = None,
 ) -> None:
     """Plot step-n premature-decode CE losses and aligned waveforms.
 
@@ -1309,9 +1484,26 @@ def plot_logit_lens_step_n(
         ce_user = 0.5 * (user_audio_ce + user_text_ce)
         ce_model = 0.5 * (model_audio_ce + model_text_ce)
 
-    ce_user_s = _moving_average(ce_user.detach().cpu().float(), window_size=max(1, ma_window))
-    ce_model_s = _moving_average(ce_model.detach().cpu().float(), window_size=max(1, ma_window))
+    ce_user_s = ce_user.detach().cpu().float()
+    ce_model_s = ce_model.detach().cpu().float()
     ratio = ce_user_s / ce_model_s.clamp_min(1e-6)
+
+    if ce_json_path is not None:
+        ce_payload = {
+            "line1_user_multimodal_ce": ce_user_s.tolist(),
+            "line2_model_multimodal_ce": ce_model_s.tolist(),
+            "ratio_line1_over_line2": ratio.tolist(),
+            "line1_shift": "n_to_n_plus_1",
+            "line2_shift": "n_to_n",
+            "moving_average_window": 1,
+            "smoothing": "none",
+            "layer": int(layer),
+            "num_points": int(ce_user_s.shape[0]),
+        }
+        ce_out = Path(ce_json_path)
+        ce_out.parent.mkdir(parents=True, exist_ok=True)
+        with open(ce_out, "w", encoding="utf-8") as f:
+            json.dump(ce_payload, f, indent=2, ensure_ascii=False)
 
     times = payload.get("times", None)
     if isinstance(times, torch.Tensor) and times.ndim == 1 and times.shape[0] == T:
@@ -1346,7 +1538,7 @@ def plot_logit_lens_step_n(
         ratio.numpy(),
         color="#1f77b4",
         linewidth=1.2,
-        label=f"CE ratio: line1/line2 (MA={max(1, ma_window)})",
+        label="CE ratio: line1/line2 (raw)",
     )
     ax_top.set_ylabel("CE ratio")
     ax_top.set_title(
@@ -1435,6 +1627,7 @@ def plot_logit_lens_dataset(
     ok = 0
     for hp in hidden_files:
         out_png = hp.with_name(f"logit_lens_ce_layer_{layer}.png")
+        out_json = hp.with_name("in_out_ce.json")
         print(f"\n--- {hp} ---")
         try:
             plot_logit_lens_step_n(
@@ -1443,6 +1636,7 @@ def plot_logit_lens_dataset(
                 lm=lm,
                 layer=layer,
                 ma_window=ma_window,
+                ce_json_path=str(out_json),
             )
             ok += 1
         except Exception as exc:
@@ -1516,6 +1710,12 @@ def main() -> None:
         type=str,
         metavar="ROOT_DIR",
         help="Plot step-n logit-lens CE + aligned waveforms for ROOT_DIR/*/output_hidden(.pt).",
+    )
+    group.add_argument(
+        "--plot-attention-heatmap-turn-taking",
+        type=str,
+        metavar="ROOT_DIR",
+        help="Average attention windows aligned by question_start/interrupt_start from ROOT_DIR/*/input_timing.json.",
     )
 
     # Shared inference options (used by --gen-*)
@@ -1665,6 +1865,13 @@ def main() -> None:
             moshi_weight=args.moshi_weight,
             device=args.device,
             ma_window=args.window,
+        )
+
+    elif args.plot_attention_heatmap_turn_taking:
+        plot_attention_heatmap_at_turn_taking(
+            root_dir=args.plot_attention_heatmap_turn_taking,
+            span=max(1, int(args.window)),
+            layer=args.layer,
         )
 
 
