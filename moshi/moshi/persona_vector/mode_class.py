@@ -1302,9 +1302,16 @@ def plot_attention_heatmap_at_turn_taking(root_dir, span=20, layer=-1):
             continue
 
         import numpy as np
-        heat = np.nanmean(np.stack(per_anchor_heatmaps[anchor], axis=0), axis=0)
-        avg_user = np.nanmean(np.stack(per_anchor_user_wavs[anchor], axis=0), axis=0)
-        avg_model = np.nanmean(np.stack(per_anchor_model_wavs[anchor], axis=0), axis=0)
+        heat_stack = np.stack(per_anchor_heatmaps[anchor], axis=0)
+        if not np.isfinite(heat_stack).any():
+            print(f"[plot-turn] No finite attention values for {anchor}; skipping")
+            continue
+        heat = np.nanmean(heat_stack, axis=0)
+
+        user_stack = np.stack(per_anchor_user_wavs[anchor], axis=0)
+        model_stack = np.stack(per_anchor_model_wavs[anchor], axis=0)
+        avg_user = np.nanmean(user_stack, axis=0)
+        avg_model = np.nanmean(model_stack, axis=0)
 
         frame_rate_hz = float(np.nanmedian(np.asarray(per_anchor_frame_rate[anchor], dtype=np.float32)))
         window_sec = float(span) / frame_rate_hz
@@ -1321,24 +1328,32 @@ def plot_attention_heatmap_at_turn_taking(root_dir, span=20, layer=-1):
         )
 
         finite_vals = heat[np.isfinite(heat)]
+        imshow_kwargs: dict[str, Any] = {"cmap": "coolwarm"}
         if finite_vals.size > 0:
             lo = float(np.percentile(finite_vals, 5.0))
             hi = float(np.percentile(finite_vals, 95.0))
             if hi <= lo:
-                max_abs = float(np.max(np.abs(finite_vals))) if finite_vals.size > 0 else 1.0
+                max_abs = float(np.max(np.abs(finite_vals)))
                 lo, hi = -max_abs, max_abs
-            norm = TwoSlopeNorm(vmin=lo, vcenter=0.0, vmax=hi)
-        else:
-            norm = None
+
+            # Use zero-centered norm only when range straddles 0.
+            if lo < 0.0 < hi:
+                imshow_kwargs["norm"] = TwoSlopeNorm(vmin=lo, vcenter=0.0, vmax=hi)
+            else:
+                if lo == hi:
+                    pad = max(1e-6, abs(lo) * 0.05)
+                    lo -= pad
+                    hi += pad
+                imshow_kwargs["vmin"] = lo
+                imshow_kwargs["vmax"] = hi
 
         img = ax_top.imshow(
             heat,
-            cmap="coolwarm",
-            norm=norm,
             aspect="auto",
             interpolation="nearest",
             origin="lower",
             extent=[-window_sec, window_sec, -window_sec, window_sec],
+            **imshow_kwargs,
         )
         cax = ax_top.inset_axes([1.01, 0.0, 0.018, 1.0])
         cbar = fig.colorbar(img, cax=cax)
