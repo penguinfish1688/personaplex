@@ -1746,6 +1746,7 @@ def plot_logit_lens_turn_taking_from_saved(
         per_anchor_line1: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
         per_anchor_line2: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
         per_anchor_ratio: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
+        per_anchor_input_amp: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
 
         for sample_id in sample_ids:
             sample_dir = root / sample_id
@@ -1779,14 +1780,28 @@ def plot_logit_lens_turn_taking_from_saved(
                 ratio = ratio[:n]
 
                 frame_rate_hz = 12.5
+                input_wav_path = sample_dir / "input.wav"
                 hidden_cands = [sample_dir / "output_hidden.pt", sample_dir / "output_hidden"]
                 hidden_found = next((p for p in hidden_cands if p.is_file()), None)
                 if hidden_found is not None:
                     try:
                         payload = _load_hidden_payload(str(hidden_found))
                         frame_rate_hz = float(payload.get("frame_rate", frame_rate_hz))
+                        input_wav_path = Path(str(payload.get("input_wav", input_wav_path)))
                     except Exception:
                         pass
+
+                input_wav = None
+                input_times = None
+                try:
+                    wav, sr = _load_mono_wav(input_wav_path)
+                    input_wav = np.abs(wav)
+                    input_times = np.arange(input_wav.shape[0], dtype=np.float32) / float(sr)
+                except Exception:
+                    print(
+                        f"[plot-logit-turn][WARN] Unable to load input wav for {sample_dir}; "
+                        "bottom amplitude plot will skip this sample"
+                    )
 
                 for anchor in anchors:
                     if anchor not in timing:
@@ -1799,6 +1814,23 @@ def plot_logit_lens_turn_taking_from_saved(
                     per_anchor_line1[anchor].append(_extract_centered_1d(line1, center_tok, span))
                     per_anchor_line2[anchor].append(_extract_centered_1d(line2, center_tok, span))
                     per_anchor_ratio[anchor].append(_extract_centered_1d(ratio, center_tok, span))
+
+                    if input_wav is not None and input_times is not None:
+                        window_sec = float(span) / frame_rate_hz
+                        rel_grid = np.linspace(
+                            -window_sec,
+                            window_sec,
+                            2 * span + 1,
+                            dtype=np.float32,
+                        )
+                        input_local = np.interp(
+                            anchor_sec + rel_grid,
+                            input_times,
+                            input_wav,
+                            left=np.nan,
+                            right=np.nan,
+                        ).astype(np.float32)
+                        per_anchor_input_amp[anchor].append(input_local)
             except Exception:
                 continue
 
@@ -1815,6 +1847,12 @@ def plot_logit_lens_turn_taking_from_saved(
                 "avg_line2": np.nanmean(np.stack(per_anchor_line2[anchor], axis=0), axis=0),
                 "avg_ratio": np.nanmean(ratio_stack, axis=0),
                 "num_samples": int(len(per_anchor_ratio[anchor])),
+                "avg_input_amp": (
+                    np.nanmean(np.stack(per_anchor_input_amp[anchor], axis=0), axis=0)
+                    if len(per_anchor_input_amp[anchor]) > 0
+                    else np.full((2 * span + 1,), np.nan, dtype=np.float32)
+                ),
+                "num_samples_input_amp": int(len(per_anchor_input_amp[anchor])),
             }
         return out
 
@@ -1916,8 +1954,16 @@ def plot_logit_lens_turn_taking_from_saved(
             print(f"[plot-logit-turn] No valid samples for {anchor}; skipping")
             continue
 
-        fig, ax = plt.subplots(figsize=(11.0, 4.6), dpi=180)
+        fig, (ax_top, ax_bot) = plt.subplots(
+            2,
+            1,
+            figsize=(11.0, 6.2),
+            dpi=180,
+            sharex=True,
+            gridspec_kw={"height_ratios": [1.9, 1.0]},
+        )
         combined_ratio_values: list[np.ndarray] = []
+        combined_amp_values: list[np.ndarray] = []
         merged_json: Dict[str, Any] = {
             "anchor": anchor,
             "window_tokens": int(span),
@@ -1929,32 +1975,52 @@ def plot_logit_lens_turn_taking_from_saved(
             avg_line1 = ds["avg_line1"]
             avg_line2 = ds["avg_line2"]
             n_samples = int(ds["num_samples"])
+            avg_input_amp = ds["avg_input_amp"]
+            n_input = int(ds["num_samples_input_amp"])
 
-            ax.plot(
+            ax_top.plot(
                 rel_tok,
                 avg_ratio,
                 linewidth=1.6,
                 label=f"{ds_name} (n={n_samples})",
             )
+
+            ax_bot.plot(
+                rel_tok,
+                avg_input_amp,
+                linewidth=1.2,
+                label=f"{ds_name} (n={n_input})",
+            )
+
             finite_ratio = avg_ratio[np.isfinite(avg_ratio)]
             if finite_ratio.size > 0:
                 combined_ratio_values.append(finite_ratio)
+            finite_amp = avg_input_amp[np.isfinite(avg_input_amp)]
+            if finite_amp.size > 0:
+                combined_amp_values.append(finite_amp)
 
             merged_json["datasets"][ds_name] = {
                 "num_samples": n_samples,
                 "avg_line1_user_multimodal_ce": avg_line1.tolist(),
                 "avg_line2_model_multimodal_ce": avg_line2.tolist(),
                 "avg_ratio_line1_over_line2": avg_ratio.tolist(),
+                "num_samples_input_audio": n_input,
+                "avg_input_audio_abs_amplitude": avg_input_amp.tolist(),
             }
 
-        ax.axvline(0, color="#444444", linestyle="--", linewidth=0.9, alpha=0.8)
-        ax.set_xlabel(f"Relative token index to {anchor}")
-        ax.set_ylabel("CE ratio")
-        ax.set_title(
+        ax_top.axvline(0, color="#444444", linestyle="--", linewidth=0.9, alpha=0.8)
+        ax_top.set_ylabel("CE ratio")
+        ax_top.set_title(
             f"Average Logit-Lens CE Ratio Around {anchor} (window=+/-{span})"
         )
-        ax.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
-        ax.legend(loc="upper right", fontsize=8)
+        ax_top.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
+        ax_top.legend(loc="upper right", fontsize=8)
+
+        ax_bot.axvline(0, color="#444444", linestyle="--", linewidth=0.9, alpha=0.8)
+        ax_bot.set_ylabel("Input abs amp")
+        ax_bot.set_xlabel(f"Relative token index to {anchor}")
+        ax_bot.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
+        ax_bot.legend(loc="upper right", fontsize=8)
 
         y_all = (
             np.concatenate(combined_ratio_values)
@@ -1968,7 +2034,23 @@ def plot_logit_lens_turn_taking_from_saved(
                 y_mid = float(np.nanmean(y_all))
                 y_lo, y_hi = y_mid - 0.05, y_mid + 0.05
             pad = max(0.01, 0.12 * (y_hi - y_lo))
-            ax.set_ylim(y_lo - pad, y_hi + pad)
+            ax_top.set_ylim(y_lo - pad, y_hi + pad)
+
+        a_all = (
+            np.concatenate(combined_amp_values)
+            if combined_amp_values
+            else np.asarray([], dtype=np.float32)
+        )
+        if a_all.size > 0:
+            a_lo = float(np.percentile(a_all, 1.0))
+            a_hi = float(np.percentile(a_all, 99.0))
+            if a_hi <= a_lo:
+                a_mid = float(np.nanmean(a_all))
+                a_lo, a_hi = max(0.0, a_mid - 0.05), a_mid + 0.05
+            pad = max(0.005, 0.10 * (a_hi - a_lo))
+            ax_bot.set_ylim(max(0.0, a_lo - pad), a_hi + pad)
+
+        ax_bot.set_xlim(int(rel_tok[0]), int(rel_tok[-1]))
 
         suffix = "multi" if len(parsed_roots) > 1 else parsed_roots[0].name
         out_png = save_root / f"logit_lens_turn_taking_{anchor}_{suffix}.png"
@@ -2222,7 +2304,7 @@ def main() -> None:
     elif args.plot_logit_lens_turn_taking_from_saved:
         plot_logit_lens_turn_taking_from_saved(
             root_dirs=args.plot_logit_lens_turn_taking_from_saved,
-            span=50,
+            span=40,
         )
 
 
