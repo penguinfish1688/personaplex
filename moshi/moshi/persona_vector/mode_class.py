@@ -1031,6 +1031,7 @@ def plot_attention_heatmap(
     The figure uses shared x-axis time in seconds so key-axis and audio are aligned.
     """
     import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
     import numpy as np
 
     payload = _load_hidden_payload(hidden_path)
@@ -1114,9 +1115,21 @@ def plot_attention_heatmap(
     )
 
     # Map key-axis [0..T] to seconds for direct alignment with waveform axis.
+    finite_vals = attn_matrix[np.isfinite(attn_matrix)]
+    if finite_vals.size > 0:
+        lo = float(np.percentile(finite_vals, 5.0))
+        hi = float(np.percentile(finite_vals, 95.0))
+        if hi <= lo:
+            max_abs = float(np.max(np.abs(finite_vals))) if finite_vals.size > 0 else 1.0
+            lo, hi = -max_abs, max_abs
+        norm = TwoSlopeNorm(vmin=lo, vcenter=0.0, vmax=hi)
+    else:
+        norm = None
+
     img = ax_top.imshow(
         attn_matrix,
         cmap="coolwarm",
+        norm=norm,
         aspect="auto",
         interpolation="nearest",
         origin="lower",
@@ -1160,6 +1173,7 @@ def plot_attention_heatmap_at_turn_taking(root_dir, span=20, layer=-1):
       - bottom: average aligned user/model waveform over the same relative-time window
     """
     import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
     import numpy as np
 
     root = Path(root_dir)
@@ -1306,9 +1320,21 @@ def plot_attention_heatmap_at_turn_taking(root_dir, span=20, layer=-1):
             gridspec_kw={"height_ratios": [2.3, 1.0]},
         )
 
+        finite_vals = heat[np.isfinite(heat)]
+        if finite_vals.size > 0:
+            lo = float(np.percentile(finite_vals, 5.0))
+            hi = float(np.percentile(finite_vals, 95.0))
+            if hi <= lo:
+                max_abs = float(np.max(np.abs(finite_vals))) if finite_vals.size > 0 else 1.0
+                lo, hi = -max_abs, max_abs
+            norm = TwoSlopeNorm(vmin=lo, vcenter=0.0, vmax=hi)
+        else:
+            norm = None
+
         img = ax_top.imshow(
             heat,
             cmap="coolwarm",
+            norm=norm,
             aspect="auto",
             interpolation="nearest",
             origin="lower",
