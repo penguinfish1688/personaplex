@@ -18,6 +18,7 @@ CLI (``python -m moshi.persona_vector.mode_class``):
     --plot-prediction <prediction.json> --hidden <hidden.pt> --output <out.png>
     --plot-attention-heatmap-dataset <root_dir> [--layer L]
     --plot-logit-lens-dataset <root_dir> [--layer L]
+    --plot-logit-lens-turn-taking-from-saved <root_dir>
 """
 
 from __future__ import annotations
@@ -1405,7 +1406,6 @@ def plot_attention_heatmap_dataset(
 
     print(f"\n[plot-attn] Done. Generated {ok}/{len(hidden_files)} plots.")
 
-
 def plot_logit_lens_step_n(
     hidden_path: str,
     output_path: str,
@@ -1686,6 +1686,173 @@ def plot_logit_lens_dataset(
     print(f"\n[plot-logit-lens] Done. Generated {ok}/{len(hidden_files)} plots.")
 
 
+def plot_logit_lens_turn_taking_from_saved(
+    root_dir: str,
+    *,
+    span: int = 50,
+) -> None:
+    """Average saved logit-lens CE traces around turn-taking anchors.
+
+    Reads ``root_dir/*/in_out_ce.json`` and ``root_dir/*/input_timing.json``.
+    For each anchor (``question_start``, ``interrupt_start``), aligns each sample
+    by anchor time and averages a token window ``[t-span, t+span]``.
+
+    Saves figures under ``root_dir/``.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    root = Path(root_dir)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Root directory not found: {root}")
+    if span < 1:
+        raise ValueError(f"span must be >= 1, got {span}")
+
+    sample_dirs = sorted([p for p in root.iterdir() if p.is_dir()])
+    if not sample_dirs:
+        raise FileNotFoundError(f"No sample directories found under {root}")
+
+    anchors = ["question_start", "interrupt_start"]
+
+    def _extract_centered_1d(arr: np.ndarray, center: int, half: int) -> np.ndarray:
+        out = np.full((2 * half + 1,), np.nan, dtype=np.float32)
+        start = center - half
+        end = center + half
+        src_l = max(0, start)
+        src_r = min(arr.shape[0] - 1, end)
+        if src_r < src_l:
+            return out
+        dst_l = src_l - start
+        dst_r = dst_l + (src_r - src_l)
+        out[dst_l : dst_r + 1] = arr[src_l : src_r + 1]
+        return out
+
+    per_anchor_line1: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
+    per_anchor_line2: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
+    per_anchor_ratio: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
+
+    for sample_dir in sample_dirs:
+        timing_path = sample_dir / "input_timing.json"
+        ce_path = sample_dir / "in_out_ce.json"
+        if not timing_path.exists() or not ce_path.exists():
+            continue
+
+        try:
+            with timing_path.open("r", encoding="utf-8") as f:
+                timing = json.load(f)
+            with ce_path.open("r", encoding="utf-8") as f:
+                ce_data = json.load(f)
+            if not isinstance(timing, dict) or not isinstance(ce_data, dict):
+                continue
+
+            line1 = np.asarray(ce_data.get("line1_user_multimodal_ce", []), dtype=np.float32)
+            line2 = np.asarray(ce_data.get("line2_model_multimodal_ce", []), dtype=np.float32)
+            ratio = np.asarray(ce_data.get("ratio_line1_over_line2", []), dtype=np.float32)
+            if line1.ndim != 1 or line2.ndim != 1 or ratio.ndim != 1:
+                continue
+            if line1.shape[0] == 0 or line2.shape[0] == 0 or ratio.shape[0] == 0:
+                continue
+
+            n = min(line1.shape[0], line2.shape[0], ratio.shape[0])
+            line1 = line1[:n]
+            line2 = line2[:n]
+            ratio = ratio[:n]
+
+            frame_rate_hz = 12.5
+            hidden_cands = [sample_dir / "output_hidden.pt", sample_dir / "output_hidden"]
+            hidden_found = next((p for p in hidden_cands if p.is_file()), None)
+            if hidden_found is not None:
+                try:
+                    payload = _load_hidden_payload(str(hidden_found))
+                    frame_rate_hz = float(payload.get("frame_rate", frame_rate_hz))
+                except Exception:
+                    pass
+
+            for anchor in anchors:
+                if anchor not in timing:
+                    continue
+                anchor_sec = float(timing[anchor])
+                center_tok = int(round(anchor_sec * frame_rate_hz))
+                if center_tok < 0:
+                    continue
+
+                per_anchor_line1[anchor].append(_extract_centered_1d(line1, center_tok, span))
+                per_anchor_line2[anchor].append(_extract_centered_1d(line2, center_tok, span))
+                per_anchor_ratio[anchor].append(_extract_centered_1d(ratio, center_tok, span))
+        except Exception:
+            continue
+
+    rel_tok = np.arange(-span, span + 1, dtype=np.int32)
+    for anchor in anchors:
+        if len(per_anchor_ratio[anchor]) == 0:
+            print(f"[plot-logit-turn] No valid samples for {anchor}; skipping")
+            continue
+
+        line1_stack = np.stack(per_anchor_line1[anchor], axis=0)
+        line2_stack = np.stack(per_anchor_line2[anchor], axis=0)
+        ratio_stack = np.stack(per_anchor_ratio[anchor], axis=0)
+
+        if not np.isfinite(ratio_stack).any():
+            print(f"[plot-logit-turn] No finite ratio values for {anchor}; skipping")
+            continue
+
+        avg_line1 = np.nanmean(line1_stack, axis=0)
+        avg_line2 = np.nanmean(line2_stack, axis=0)
+        avg_ratio = np.nanmean(ratio_stack, axis=0)
+
+        fig, ax = plt.subplots(figsize=(11.0, 4.6), dpi=180)
+        ax.plot(
+            rel_tok,
+            avg_ratio,
+            color="#1f77b4",
+            linewidth=1.6,
+            label="avg ratio line1/line2",
+        )
+        ax.axvline(0, color="#444444", linestyle="--", linewidth=0.9, alpha=0.8)
+        ax.set_xlabel(f"Relative token index to {anchor}")
+        ax.set_ylabel("CE ratio")
+        ax.set_title(
+            f"Average Logit-Lens CE Ratio Around {anchor} (window=+/-{span}, n={len(per_anchor_ratio[anchor])})"
+        )
+        ax.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
+        ax.legend(loc="upper right", fontsize=8)
+
+        y_all = avg_ratio[np.isfinite(avg_ratio)]
+        if y_all.size > 0:
+            y_lo = float(np.percentile(y_all, 1.0))
+            y_hi = float(np.percentile(y_all, 99.0))
+            if y_hi <= y_lo:
+                y_mid = float(np.nanmean(y_all))
+                y_lo, y_hi = y_mid - 0.05, y_mid + 0.05
+            pad = max(0.01, 0.12 * (y_hi - y_lo))
+            ax.set_ylim(y_lo - pad, y_hi + pad)
+
+        out_png = root / f"logit_lens_turn_taking_{anchor}.png"
+        fig.tight_layout()
+        fig.savefig(out_png, bbox_inches="tight")
+        plt.close(fig)
+
+        # Save averaged points for downstream use.
+        out_json = root / f"logit_lens_turn_taking_{anchor}.json"
+        with out_json.open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "anchor": anchor,
+                    "window_tokens": int(span),
+                    "num_samples": int(len(per_anchor_ratio[anchor])),
+                    "relative_token_index": rel_tok.tolist(),
+                    "avg_line1_user_multimodal_ce": avg_line1.tolist(),
+                    "avg_line2_model_multimodal_ce": avg_line2.tolist(),
+                    "avg_ratio_line1_over_line2": avg_ratio.tolist(),
+                },
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+        print(f"[plot-logit-turn] Saved {out_png}")
+        print(f"[plot-logit-turn] Saved {out_json}")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1757,6 +1924,12 @@ def main() -> None:
         type=str,
         metavar="ROOT_DIR",
         help="Average attention windows aligned by question_start/interrupt_start from ROOT_DIR/*/input_timing.json.",
+    )
+    group.add_argument(
+        "--plot-logit-lens-turn-taking-from-saved",
+        type=str,
+        metavar="ROOT_DIR",
+        help="Average saved in_out_ce.json traces aligned by question_start/interrupt_start from ROOT_DIR/*/input_timing.json.",
     )
 
     # Shared inference options (used by --gen-*)
@@ -1913,6 +2086,12 @@ def main() -> None:
             root_dir=args.plot_attention_heatmap_turn_taking,
             span=max(1, int(args.window)),
             layer=args.layer,
+        )
+
+    elif args.plot_logit_lens_turn_taking_from_saved:
+        plot_logit_lens_turn_taking_from_saved(
+            root_dir=args.plot_logit_lens_turn_taking_from_saved,
+            span=50,
         )
 
 
