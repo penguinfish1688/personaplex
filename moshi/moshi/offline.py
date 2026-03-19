@@ -426,6 +426,72 @@ def _build_hidden_payload(
     return payload
 
 
+def _summarize_scalar_statistics(values: torch.Tensor) -> Dict[str, float]:
+    """Return mean and uncertainty estimates for a 1D tensor."""
+    flat = values.detach().cpu().float().reshape(-1)
+    n = int(flat.numel())
+    if n == 0:
+        raise ValueError("Cannot summarize empty values tensor")
+
+    mean = float(flat.mean().item())
+    if n == 1:
+        std = 0.0
+        sem = 0.0
+    else:
+        std = float(flat.std(unbiased=True).item())
+        sem = float(std / np.sqrt(n))
+
+    ci95_half_width = 1.96 * sem
+    return {
+        "n": float(n),
+        "mean": mean,
+        "std": std,
+        "sem": sem,
+        "ci95_low": mean - ci95_half_width,
+        "ci95_high": mean + ci95_half_width,
+    }
+
+
+def _compute_embed_stats_for_instance(
+    *,
+    lm: Any,
+    input_token_ids_per_token: list[torch.Tensor],
+    device: str,
+) -> Dict[str, Any]:
+    """Compute per-instance text/audio embedding norm stats and cosine similarity stats."""
+    if len(input_token_ids_per_token) == 0:
+        raise RuntimeError("No input tokens collected; cannot compute embed stats")
+
+    input_token_ids = torch.stack(input_token_ids_per_token, dim=0).to(device)  # [T, K]
+    if input_token_ids.dim() != 2 or input_token_ids.shape[1] < 2:
+        raise RuntimeError(f"Unexpected token id shape for embed stats: {tuple(input_token_ids.shape)}")
+
+    text_token_ids = input_token_ids[:, 0]
+    text_emb = lm.text_emb(text_token_ids)  # [T, D]
+
+    num_audio_codebooks = int(min(len(lm.emb), int(input_token_ids.shape[1]) - 1))
+    if num_audio_codebooks <= 0:
+        raise RuntimeError("No audio codebook channels available for embed stats")
+
+    audio_emb_per_codebook: list[torch.Tensor] = []
+    for cb_idx in range(num_audio_codebooks):
+        cb_token_ids = input_token_ids[:, 1 + cb_idx]
+        audio_emb_per_codebook.append(lm.emb[cb_idx](cb_token_ids))
+    avg_audio_emb = torch.stack(audio_emb_per_codebook, dim=1).mean(dim=1)  # [T, D]
+
+    text_norm = torch.linalg.vector_norm(text_emb, ord=2, dim=-1)
+    avg_audio_norm = torch.linalg.vector_norm(avg_audio_emb, ord=2, dim=-1)
+    cos_sim = torch.nn.functional.cosine_similarity(text_emb, avg_audio_emb, dim=-1, eps=1e-8)
+
+    return {
+        "num_steps": int(input_token_ids.shape[0]),
+        "num_audio_codebooks_used": num_audio_codebooks,
+        "text_embedding_norm": _summarize_scalar_statistics(text_norm),
+        "audio_embedding_norm_avg_codebooks": _summarize_scalar_statistics(avg_audio_norm),
+        "cosine_similarity_text_vs_avg_audio": _summarize_scalar_statistics(cos_sim),
+    }
+
+
 def _load_steering_vectors(steering_vectors_path: str) -> list[Optional[torch.Tensor]]:
     """Load per-token steering vectors from disk.
 
@@ -774,6 +840,7 @@ def run_batch_inference(
     steering_vectors_by_layer: Optional[dict[int, list[Optional[torch.Tensor]]]] = None,
     steer_attn_only: bool = False,
     payload_target_layer: Optional[int] = None,
+    embed_stat: bool = False,
 ) -> Optional[List[List[HiddenLayerOutputs]]]:
     """Run batch offline inference using multiple input WAVs and text prompts.
     
@@ -957,6 +1024,7 @@ def run_batch_inference(
         input_token_ids_per_token: list[torch.Tensor] = []
         output_token_ids_per_token: list[torch.Tensor] = []
         text_attention_layers_per_token: list[Optional[torch.Tensor]] = []
+        need_step_input_tokens = save_hidden_payload or embed_stat
         steer_idx = 0
         for user_encoded in lm_encode_from_sphn(
             mimi,
@@ -997,7 +1065,7 @@ def run_batch_inference(
                         return_embeddings=save_hidden_payload,
                         return_hidden_layers=True,
                         return_attention_weights=save_hidden_payload,
-                        return_step_input_tokens=save_hidden_payload,
+                        return_step_input_tokens=need_step_input_tokens,
                         steering_vector=step_steering_vector,
                         steering_layer=steering_layer,
                         steering_vectors_by_layer=step_steering_vectors_by_layer,
@@ -1008,6 +1076,11 @@ def run_batch_inference(
                             tuple[torch.Tensor, torch.Tensor, HiddenLayerOutputs, torch.Tensor],
                             result,
                         )
+                    elif need_step_input_tokens:
+                        tokens, hidden_layers, step_input_tokens = cast(
+                            tuple[torch.Tensor, HiddenLayerOutputs, torch.Tensor],
+                            result,
+                        )
                     else:
                         tokens, hidden_layers = cast(
                             tuple[torch.Tensor, HiddenLayerOutputs],
@@ -1015,13 +1088,21 @@ def run_batch_inference(
                         )
                     assert isinstance(hidden_layers, HiddenLayerOutputs), "Hidden layers were requested but not captured."
                 else:
-                    tokens = lm_gen.step(
+                    result = lm_gen.step(
                         step_in,
+                        return_step_input_tokens=need_step_input_tokens,
                         steering_vector=step_steering_vector,
                         steering_layer=steering_layer,
                         steering_vectors_by_layer=step_steering_vectors_by_layer,
                         steer_attn_only=steer_attn_only,
                     )
+                    if need_step_input_tokens:
+                        tokens, step_input_tokens = cast(
+                            tuple[torch.Tensor, torch.Tensor],
+                            result,
+                        )
+                    else:
+                        tokens = cast(torch.Tensor, result)
                     hidden_layers = None
                 
                 if tokens is None:
@@ -1038,9 +1119,10 @@ def run_batch_inference(
                         full_input_embeddings_per_token.append(
                             _extract_full_input_embedding_for_step(step_embeddings)
                         )
-                        input_token_ids_per_token.append(_extract_step_token_ids(step_input_tokens))
                         output_token_ids_per_token.append(_extract_step_token_ids(tokens))
                         text_attention_layers_per_token.append(_extract_text_attention_per_layer(hidden_layers))
+                if need_step_input_tokens:
+                    input_token_ids_per_token.append(_extract_step_token_ids(step_input_tokens))
                     
                 # Decode current sampled agent frame to PCM
                 pcm = decode_tokens_to_pcm(mimi, other_mimi, lm_gen, tokens)
@@ -1097,6 +1179,18 @@ def run_batch_inference(
         with open(output_text, "w") as file:
             json.dump(generated_text_tokens, file, ensure_ascii=False)
         log("info", f"Wrote output text to {output_text}")
+
+        embed_stats_payload: Optional[Dict[str, Any]] = None
+        if embed_stat:
+            embed_stats_payload = _compute_embed_stats_for_instance(
+                lm=lm,
+                input_token_ids_per_token=input_token_ids_per_token,
+                device=device,
+            )
+            embed_stats_path = str(Path(output_text).with_suffix(".embed_stat.json"))
+            with open(embed_stats_path, "w", encoding="utf-8") as f:
+                json.dump(embed_stats_payload, f, ensure_ascii=False, indent=2)
+            log("info", f"Wrote embed stats to {embed_stats_path}")
         
         # Store hidden layers for this instance
         if return_hidden_layers:
@@ -1138,6 +1232,8 @@ def run_batch_inference(
                 text_key_positions=text_key_positions,
                 text_key_cache_meta=text_key_cache_meta,
             )
+            if embed_stats_payload is not None:
+                payload["embed_stats"] = embed_stats_payload
             torch.save(payload, output_hidden)
             log("info", f"Wrote hidden payload to {output_hidden}")
 
@@ -1604,6 +1700,16 @@ def main():
             "If not set, defaults to steering_layer (if provided) else last layer."
         ),
     )
+    parser.add_argument(
+        "--embed-stat",
+        action="store_true",
+        help=(
+            "If set, compute per-instance embedding statistics over generation steps: "
+            "text embedding norm mean, average-audio embedding norm mean (audio codebooks averaged), "
+            "and cosine similarity between text embedding and averaged audio embedding; "
+            "for each quantity also report uncertainty (std, sem, 95% CI)."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1662,6 +1768,7 @@ def main():
             steering_vectors=steering_vectors,
             steering_layer=args.steering_layer,
             payload_target_layer=args.payload_target_layer,
+            embed_stat=args.embed_stat,
         )
 
 
