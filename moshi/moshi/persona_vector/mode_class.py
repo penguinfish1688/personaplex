@@ -1189,7 +1189,6 @@ def plot_attention_heatmap_at_turn_taking(root_dir, span=20, layer=-1):
       - bottom: average aligned user/model waveform over the same relative-time window
     """
     import matplotlib.pyplot as plt
-    from matplotlib.colors import ListedColormap
     import numpy as np
 
     root = Path(root_dir)
@@ -1344,27 +1343,12 @@ def plot_attention_heatmap_at_turn_taking(root_dir, span=20, layer=-1):
             gridspec_kw={"height_ratios": [2.3, 1.0]},
         )
 
-        finite_vals = heat[np.isfinite(heat)]
-        heat_display = heat.copy()
-        base_cmap = plt.get_cmap("coolwarm")
-        cmap_90_sat = ListedColormap(base_cmap(np.linspace(0.05, 0.95, 256)))
+        heat_display = heat
         imshow_kwargs: dict[str, Any] = {
-            "cmap": cmap_90_sat,
-            "vmin": 2.0,
-            "vmax": 6.0,
+            "cmap": "coolwarm",
+            "vmin": 1.0,
+            "vmax": 7.0,
         }
-        if finite_vals.size > 0:
-            p10 = float(np.percentile(finite_vals, 10.0))
-            p90 = float(np.percentile(finite_vals, 90.0))
-            if p90 <= p10:
-                p90 = p10 + 1e-6
-
-            scale = 4.0 / (p90 - p10)
-            finite_mask = np.isfinite(heat_display)
-            heat_display[finite_mask] = (
-                (heat_display[finite_mask] - p10) * scale
-            ) + 2.0
-            heat_display[finite_mask] = np.clip(heat_display[finite_mask], 2.0, 6.0)
 
         img = ax_top.imshow(
             heat_display,
@@ -1376,7 +1360,7 @@ def plot_attention_heatmap_at_turn_taking(root_dir, span=20, layer=-1):
         )
         cax = ax_top.inset_axes([1.01, 0.0, 0.018, 1.0])
         cbar = fig.colorbar(img, cax=cax)
-        cbar.set_label("Attention logit (P10->2, P90->6)")
+        cbar.set_label("Attention logit (fixed scale: 1=blue, 7=red)")
         ax_top.set_ylabel("Query offset (s)")
         ax_top.set_title(
             f"Average Attention Around {anchor} (layer={layer}, span={span}, n={len(per_anchor_heatmaps[anchor])})"
