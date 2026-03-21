@@ -1201,7 +1201,12 @@ def plot_attention_heatmap_at_turn_taking(root_dir, span=20, layer=-1):
     if not sample_dirs:
         raise FileNotFoundError(f"No sample directories found under {root}")
 
-    anchors = ["question_start", "interrupt_start"]
+    anchors = [
+        "question_start",
+        "question_end",
+        "interrupt_start",
+        "interrupt_end",
+    ]
 
     def _extract_attention_matrix(payload: Dict[str, Any], layer: int = -1) -> np.ndarray:
         attn_steps = payload.get("text_attention_weights", None)
@@ -2161,9 +2166,201 @@ def plot_logit_lens_turn_taking_from_saved(
             print(f"[plot-logit-turn] Saved {out_json}")
 
 
-def logit_lens_heatmap() -> None:
+def logit_lens_heatmap(root_dir) -> None:
+    """
+    For root dir look for
+    logit_lens_turn_taking_layer_{layer}_interrupt_start_user_interrupt_ce.json
+    and logit_lens_turn_taking_layer_{layer}_question_start_user_question_ce.json
+    for each layer 0-31 (raise error if not all 32 layers found).
 
-    pass
+    There should be four plot two for question_start and two for interrupt_start
+    for each CE type (user_interrupt_ce and user_question_ce). 
+    One heatmap is for listening mode CE and the other is for speaking mode CE (i'm not sure which is which (line1 or line2)) remember to show in the plot
+    For each plot, the y axis should be the layer number (0-31) and the x axis should be the relative token index (-span to +span).
+
+    The color scale for for each heatmap should be consistent across all layers
+    decide the scale based on the 5th and 95th percentile to be 95% saturated of blue and 95% staturated for red
+    the percentlie is calcuted from  10th to 20th layers as endpoints layers has some outliers.
+
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.colors import LinearSegmentedColormap
+
+    root = Path(root_dir)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Root directory not found: {root}")
+
+    anchors = ["question_start", "interrupt_start"]
+    layers = list(range(32))
+    frame_rate_hz = 12.5
+    span = 35
+
+    def _extract_centered_1d(arr: np.ndarray, center: int, half: int) -> np.ndarray:
+        out = np.full((2 * half + 1,), np.nan, dtype=np.float32)
+        start = center - half
+        end = center + half
+        src_l = max(0, start)
+        src_r = min(arr.shape[0] - 1, end)
+        if src_r < src_l:
+            return out
+        dst_l = src_l - start
+        dst_r = dst_l + (src_r - src_l)
+        out[dst_l : dst_r + 1] = arr[src_l : src_r + 1]
+        return out
+
+    sample_dirs = sorted([p for p in root.iterdir() if p.is_dir()])
+    if not sample_dirs:
+        raise FileNotFoundError(f"No sample directories found under {root}")
+
+    # line1/line2 windows gathered by anchor and layer.
+    bucket: Dict[str, Dict[str, Dict[int, List[np.ndarray]]]] = {
+        "line1": {a: {lv: [] for lv in layers} for a in anchors},
+        "line2": {a: {lv: [] for lv in layers} for a in anchors},
+    }
+
+    used_samples = 0
+    for sd in sample_dirs:
+        timing_path = sd / "input_timing.json"
+        if not timing_path.is_file():
+            continue
+
+        try:
+            with timing_path.open("r", encoding="utf-8") as f:
+                timing = json.load(f)
+            if not isinstance(timing, dict):
+                continue
+
+            # Require both anchors for a consistent 4-plot output.
+            if any(a not in timing for a in anchors):
+                continue
+
+            # Must have all 32 per-layer CE JSONs in this sample directory.
+            ce_paths = {lv: sd / f"in_out_ce_{lv}.json" for lv in layers}
+            if any(not p.is_file() for p in ce_paths.values()):
+                continue
+
+            per_layer_line1: Dict[int, np.ndarray] = {}
+            per_layer_line2: Dict[int, np.ndarray] = {}
+            ok = True
+            for lv, p in ce_paths.items():
+                with p.open("r", encoding="utf-8") as f:
+                    ce = json.load(f)
+                if not isinstance(ce, dict):
+                    ok = False
+                    break
+                l1 = np.asarray(ce.get("line1_user_multimodal_ce", []), dtype=np.float32)
+                l2 = np.asarray(ce.get("line2_model_multimodal_ce", []), dtype=np.float32)
+                if l1.ndim != 1 or l2.ndim != 1 or l1.size == 0 or l2.size == 0:
+                    ok = False
+                    break
+                n = min(l1.shape[0], l2.shape[0])
+                per_layer_line1[lv] = l1[:n]
+                per_layer_line2[lv] = l2[:n]
+
+            if not ok:
+                continue
+
+            for anchor in anchors:
+                center_tok = int(round(float(timing[anchor]) * frame_rate_hz))
+                if center_tok < 0:
+                    continue
+                for lv in layers:
+                    bucket["line1"][anchor][lv].append(
+                        _extract_centered_1d(per_layer_line1[lv], center_tok, span)
+                    )
+                    bucket["line2"][anchor][lv].append(
+                        _extract_centered_1d(per_layer_line2[lv], center_tok, span)
+                    )
+
+            used_samples += 1
+        except Exception:
+            continue
+
+    if used_samples == 0:
+        raise FileNotFoundError(
+            "No valid samples found. Need root_dir/*/ with input_timing.json and in_out_ce_0..31.json."
+        )
+
+    # Ensure all 32 layers were gathered for each anchor/line pair.
+    for which in ("line1", "line2"):
+        for anchor in anchors:
+            missing_layers = [lv for lv in layers if len(bucket[which][anchor][lv]) == 0]
+            if missing_layers:
+                raise ValueError(
+                    f"Missing aligned data for {which}, {anchor}, layers={missing_layers}. "
+                    "Need all 32 layers (0..31)."
+                )
+
+    def _build_heat(which: str, anchor: str) -> np.ndarray:
+        rows: List[np.ndarray] = []
+        for lv in layers:
+            stack = np.stack(bucket[which][anchor][lv], axis=0)
+            rows.append(np.nanmean(stack, axis=0))
+        return np.stack(rows, axis=0).astype(np.float32)
+
+    def _get_scale_bounds(mat: np.ndarray) -> tuple[float, float]:
+        # Use middle layers (10..20) to reduce endpoint outlier impact.
+        vals = mat[10:21, :]
+        finite = vals[np.isfinite(vals)]
+        if finite.size == 0:
+            finite = mat[np.isfinite(mat)]
+        if finite.size == 0:
+            return 0.0, 1.0
+        p5 = float(np.percentile(finite, 5.0))
+        p95 = float(np.percentile(finite, 95.0))
+        if p95 <= p5:
+            p95 = p5 + 1e-6
+        return p5, p95
+
+    base = plt.get_cmap("coolwarm")
+    cmap = LinearSegmentedColormap.from_list(
+        "coolwarm_soft_sat",
+        base(np.linspace(0.025, 0.975, 256)),
+    )
+
+    rel_tok = np.arange(-span, span + 1, dtype=np.int32)
+    generated = 0
+    for anchor in anchors:
+        for which in ("line1", "line2"):
+            mat = _build_heat(which=which, anchor=anchor)
+            vmin, vmax = _get_scale_bounds(mat)
+
+            fig, ax = plt.subplots(figsize=(11.0, 6.5), dpi=180)
+            img = ax.imshow(
+                mat,
+                aspect="auto",
+                interpolation="nearest",
+                origin="lower",
+                cmap=cmap,
+                vmin=vmin,
+                vmax=vmax,
+                extent=(float(rel_tok[0]), float(rel_tok[-1]), -0.5, 31.5),
+            )
+            cbar = fig.colorbar(img, ax=ax)
+            cbar.set_label("CE value (P5/P95 from layers 10-20)")
+
+            line_desc = (
+                "line1 = user multimodal CE (likely listening-focus)"
+                if which == "line1"
+                else "line2 = model multimodal CE (likely speaking-focus)"
+            )
+            ax.set_title(f"Logit-Lens Heatmap | {anchor} | {which}\n{line_desc}")
+            ax.set_xlabel("Relative token index")
+            ax.set_ylabel("Layer")
+            ax.set_yticks(np.arange(0, 32, 1))
+            ax.set_ylim(-0.5, 31.5)
+
+            out_png = root / f"logit_lens_heatmap_{anchor}_{which}.png"
+            fig.tight_layout()
+            fig.savefig(out_png, bbox_inches="tight")
+            plt.close(fig)
+            print(f"[plot-logit-heatmap] Saved {out_png}")
+            generated += 1
+
+    print(
+        f"[plot-logit-heatmap] Done. Generated {generated} heatmaps from {used_samples} samples."
+    )
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -2243,6 +2440,16 @@ def main() -> None:
         nargs="+",
         metavar="ROOT_DIR",
         help="Average saved in_out_ce.json traces aligned by question_start/interrupt_start. Accepts one or more ROOT_DIR values and overlays them.",
+    )
+    group.add_argument(
+        "--plot-logit-lens-heatmap",
+        type=str,
+        metavar="ROOT_DIR",
+        help=(
+            "Build layer-vs-token heatmaps from saved "
+            "logit_lens_turn_taking_layer_<layer>_<anchor>_<ce_type>.json files "
+            "for layers 0..31."
+        ),
     )
 
     # Shared inference options (used by --gen-*)
@@ -2406,6 +2613,9 @@ def main() -> None:
             root_dirs=args.plot_logit_lens_turn_taking_from_saved,
             span=35,
         )
+
+    elif args.plot_logit_lens_heatmap:
+        logit_lens_heatmap(args.plot_logit_lens_heatmap)
 
 
 if __name__ == "__main__":
