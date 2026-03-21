@@ -2160,6 +2160,11 @@ def plot_logit_lens_turn_taking_from_saved(
             print(f"[plot-logit-turn] Saved {out_png}")
             print(f"[plot-logit-turn] Saved {out_json}")
 
+
+def logit_lens_heatmap() -> None:
+
+    pass
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
