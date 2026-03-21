@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 
 from moshi.offline import run_batch_inference, _get_voice_prompt_dir
@@ -1513,28 +1514,32 @@ def plot_logit_lens_step_n(
             logits0 = lm.forward_depformer(0, dep_in, x)  # [T, 1, 1, card]
         logits0 = logits0[:, 0, 0, :].float()  # [T, card]
 
-        # User-focus CE is shifted by +1 target step: compare logits(n) with user_target(n+1).
-        user_audio_ce = F.cross_entropy(
+        def _ce_from_probs(logits_2d: torch.Tensor, target_1d: torch.Tensor) -> torch.Tensor:
+            probs = torch.softmax(logits_2d, dim=-1)
+            return F.nll_loss(
+                torch.log(probs.clamp_min(1e-12)),
+                target_1d,
+                reduction="none",
+            )
+
+        # User-focus CE is shifted by +1 target step: compare probs(n) with user_target(n+1).
+        user_audio_ce = _ce_from_probs(
             logits0[:-1],
             user_audio_target[1:].to(device=device, dtype=torch.long),
-            reduction="none",
         )
         # Model-focus CE remains step-aligned with n on the same valid plotted range [0..T-2].
-        model_audio_ce = F.cross_entropy(
+        model_audio_ce = _ce_from_probs(
             logits0[:-1],
             model_audio_target[:-1].to(device=device, dtype=torch.long),
-            reduction="none",
         )
 
-        user_text_ce = F.cross_entropy(
+        user_text_ce = _ce_from_probs(
             text_logits[:-1],
             user_text_target[1:].to(device=device, dtype=torch.long),
-            reduction="none",
         )
-        model_text_ce = F.cross_entropy(
+        model_text_ce = _ce_from_probs(
             text_logits[:-1],
             model_text_target[:-1].to(device=device, dtype=torch.long),
-            reduction="none",
         )
 
         ce_user = 0.5 * (user_audio_ce + user_text_ce)
