@@ -1737,10 +1737,10 @@ def plot_logit_lens_turn_taking_from_saved(
 ) -> None:
     """Average saved logit-lens CE traces around turn-taking anchors.
 
-    Reads ``<root>/*/in_out_ce.json`` and ``<root>/*/input_timing.json`` for
-    each root in ``root_dirs``. For each anchor (``question_start``,
-    ``interrupt_start``), aligns each sample by anchor time and averages a token
-    window ``[t-span, t+span]``.
+    Reads ``<root>/*/in_out_ce_*.json`` and ``<root>/*/input_timing.json`` for
+    each root in ``root_dirs``. For each layer and anchor
+    (``question_start``, ``interrupt_start``), aligns each sample by anchor time
+    and averages a token window ``[t-span, t+span]``.
 
     If multiple roots are provided, their averaged curves are overlaid on the
     same graph (one line per root). Outputs are saved under the first root.
@@ -1768,20 +1768,32 @@ def plot_logit_lens_turn_taking_from_saved(
         out[dst_l : dst_r + 1] = arr[src_l : src_r + 1]
         return out
 
-    def _collect_per_root(root: Path, sample_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    def _discover_ce_files(sample_dir: Path) -> Dict[int, Path]:
+        layer_files: Dict[int, Path] = {}
+        for p in sorted(sample_dir.glob("in_out_ce_*.json")):
+            stem = p.stem
+            suffix = stem.replace("in_out_ce_", "", 1)
+            if suffix.lstrip("-").isdigit():
+                layer_files[int(suffix)] = p
+        legacy = sample_dir / "in_out_ce.json"
+        if legacy.is_file() and -1 not in layer_files:
+            layer_files[-1] = legacy
+        return layer_files
+
+    def _collect_per_root(
+        root: Path,
+        sample_ids: List[str],
+    ) -> Dict[int, Dict[str, Dict[str, Any]]]:
         if not sample_ids:
             return {}
 
-        per_anchor_line1: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
-        per_anchor_line2: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
-        per_anchor_ratio: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
-        per_anchor_input_amp: dict[str, list[np.ndarray]] = {k: [] for k in anchors}
+        per_layer: Dict[int, Dict[str, Dict[str, list[np.ndarray]]]] = {}
 
         for sample_id in sample_ids:
             sample_dir = root / sample_id
             timing_path = sample_dir / "input_timing.json"
-            ce_path = sample_dir / "in_out_ce.json"
-            if not timing_path.exists() or not ce_path.exists():
+            ce_files = _discover_ce_files(sample_dir)
+            if not timing_path.exists() or not ce_files:
                 print(
                     f"[plot-logit-turn][WARN] Missing required files in {sample_dir}; skipping"
                 )
@@ -1790,26 +1802,8 @@ def plot_logit_lens_turn_taking_from_saved(
             try:
                 with timing_path.open("r", encoding="utf-8") as f:
                     timing = json.load(f)
-                with ce_path.open("r", encoding="utf-8") as f:
-                    ce_data = json.load(f)
-                if not isinstance(timing, dict) or not isinstance(ce_data, dict):
+                if not isinstance(timing, dict):
                     continue
-
-                line1 = np.asarray(ce_data.get("line1_user_multimodal_ce", []), dtype=np.float32)
-                line2 = np.asarray(ce_data.get("line2_model_multimodal_ce", []), dtype=np.float32)
-                ratio = np.asarray(ce_data.get("ratio_line1_over_line2", []), dtype=np.float32)
-                if line1.ndim != 1 or line2.ndim != 1:
-                    continue
-                if line1.shape[0] == 0 or line2.shape[0] == 0:
-                    continue
-
-                n = min(line1.shape[0], line2.shape[0])
-                line1 = line1[:n]
-                line2 = line2[:n]
-                if ratio.ndim == 1 and ratio.shape[0] >= n:
-                    ratio = ratio[:n]
-                else:
-                    ratio = line1 / np.clip(line2, 1e-6, None)
 
                 frame_rate_hz = 12.5
                 input_wav_path = sample_dir / "input.wav"
@@ -1835,57 +1829,109 @@ def plot_logit_lens_turn_taking_from_saved(
                         "bottom amplitude plot will skip this sample"
                     )
 
-                for anchor in anchors:
-                    if anchor not in timing:
-                        continue
-                    anchor_sec = float(timing[anchor])
-                    center_tok = int(round(anchor_sec * frame_rate_hz))
-                    if center_tok < 0:
+                for layer_val, ce_path in ce_files.items():
+                    with ce_path.open("r", encoding="utf-8") as f:
+                        ce_data = json.load(f)
+                    if not isinstance(ce_data, dict):
                         continue
 
-                    per_anchor_line1[anchor].append(_extract_centered_1d(line1, center_tok, span))
-                    per_anchor_line2[anchor].append(_extract_centered_1d(line2, center_tok, span))
-                    per_anchor_ratio[anchor].append(_extract_centered_1d(ratio, center_tok, span))
+                    line1 = np.asarray(
+                        ce_data.get("line1_user_multimodal_ce", []), dtype=np.float32
+                    )
+                    line2 = np.asarray(
+                        ce_data.get("line2_model_multimodal_ce", []), dtype=np.float32
+                    )
+                    ratio = np.asarray(
+                        ce_data.get("ratio_line1_over_line2", []), dtype=np.float32
+                    )
+                    if line1.ndim != 1 or line2.ndim != 1:
+                        continue
+                    if line1.shape[0] == 0 or line2.shape[0] == 0:
+                        continue
 
-                    if input_wav is not None and input_times is not None:
-                        window_sec = float(span) / frame_rate_hz
-                        rel_grid = np.linspace(
-                            -window_sec,
-                            window_sec,
-                            2 * span + 1,
-                            dtype=np.float32,
+                    n = min(line1.shape[0], line2.shape[0])
+                    line1 = line1[:n]
+                    line2 = line2[:n]
+                    if ratio.ndim == 1 and ratio.shape[0] >= n:
+                        ratio = ratio[:n]
+                    else:
+                        ratio = line1 / np.clip(line2, 1e-6, None)
+
+                    bucket = per_layer.setdefault(
+                        int(layer_val),
+                        {
+                            "line1": {k: [] for k in anchors},
+                            "line2": {k: [] for k in anchors},
+                            "ratio": {k: [] for k in anchors},
+                            "amp": {k: [] for k in anchors},
+                        },
+                    )
+
+                    for anchor in anchors:
+                        if anchor not in timing:
+                            continue
+                        anchor_sec = float(timing[anchor])
+                        center_tok = int(round(anchor_sec * frame_rate_hz))
+                        if center_tok < 0:
+                            continue
+
+                        bucket["line1"][anchor].append(
+                            _extract_centered_1d(line1, center_tok, span)
                         )
-                        input_local = np.interp(
-                            anchor_sec + rel_grid,
-                            input_times,
-                            input_wav,
-                            left=np.nan,
-                            right=np.nan,
-                        ).astype(np.float32)
-                        per_anchor_input_amp[anchor].append(input_local)
+                        bucket["line2"][anchor].append(
+                            _extract_centered_1d(line2, center_tok, span)
+                        )
+                        bucket["ratio"][anchor].append(
+                            _extract_centered_1d(ratio, center_tok, span)
+                        )
+
+                        if input_wav is not None and input_times is not None:
+                            window_sec = float(span) / frame_rate_hz
+                            rel_grid = np.linspace(
+                                -window_sec,
+                                window_sec,
+                                2 * span + 1,
+                                dtype=np.float32,
+                            )
+                            input_local = np.interp(
+                                anchor_sec + rel_grid,
+                                input_times,
+                                input_wav,
+                                left=np.nan,
+                                right=np.nan,
+                            ).astype(np.float32)
+                            bucket["amp"][anchor].append(input_local)
             except Exception:
                 continue
 
-        out: Dict[str, Dict[str, Any]] = {}
-        for anchor in anchors:
-            if len(per_anchor_ratio[anchor]) == 0:
-                continue
-            ratio_stack = np.stack(per_anchor_ratio[anchor], axis=0)
-            if not np.isfinite(ratio_stack).any():
-                continue
+        out: Dict[int, Dict[str, Dict[str, Any]]] = {}
+        for layer_val, bucket in per_layer.items():
+            layer_out: Dict[str, Dict[str, Any]] = {}
+            for anchor in anchors:
+                if len(bucket["ratio"][anchor]) == 0:
+                    continue
+                ratio_stack = np.stack(bucket["ratio"][anchor], axis=0)
+                if not np.isfinite(ratio_stack).any():
+                    continue
 
-            out[anchor] = {
-                "avg_line1": np.nanmean(np.stack(per_anchor_line1[anchor], axis=0), axis=0),
-                "avg_line2": np.nanmean(np.stack(per_anchor_line2[anchor], axis=0), axis=0),
-                "avg_ratio": np.nanmean(ratio_stack, axis=0),
-                "num_samples": int(len(per_anchor_ratio[anchor])),
-                "avg_input_amp": (
-                    np.nanmean(np.stack(per_anchor_input_amp[anchor], axis=0), axis=0)
-                    if len(per_anchor_input_amp[anchor]) > 0
-                    else np.full((2 * span + 1,), np.nan, dtype=np.float32)
-                ),
-                "num_samples_input_amp": int(len(per_anchor_input_amp[anchor])),
-            }
+                layer_out[anchor] = {
+                    "avg_line1": np.nanmean(
+                        np.stack(bucket["line1"][anchor], axis=0), axis=0
+                    ),
+                    "avg_line2": np.nanmean(
+                        np.stack(bucket["line2"][anchor], axis=0), axis=0
+                    ),
+                    "avg_ratio": np.nanmean(ratio_stack, axis=0),
+                    "num_samples": int(len(bucket["ratio"][anchor])),
+                    "avg_input_amp": (
+                        np.nanmean(np.stack(bucket["amp"][anchor], axis=0), axis=0)
+                        if len(bucket["amp"][anchor]) > 0
+                        else np.full((2 * span + 1,), np.nan, dtype=np.float32)
+                    ),
+                    "num_samples_input_amp": int(len(bucket["amp"][anchor])),
+                }
+            if layer_out:
+                out[int(layer_val)] = layer_out
         return out
 
     parsed_roots: List[Path] = []
@@ -1909,7 +1955,9 @@ def plot_logit_lens_turn_taking_from_saved(
         missing: list[str] = []
         for sd in sample_dirs:
             has_timing = (sd / "input_timing.json").is_file()
-            has_ce = (sd / "in_out_ce.json").is_file()
+            has_ce = (sd / "in_out_ce.json").is_file() or any(
+                sd.glob("in_out_ce_*.json")
+            )
             if has_timing and has_ce:
                 valid_ids.add(sd.name)
             else:
@@ -1917,7 +1965,7 @@ def plot_logit_lens_turn_taking_from_saved(
                 if not has_timing:
                     missing_parts.append("input_timing.json")
                 if not has_ce:
-                    missing_parts.append("in_out_ce.json")
+                    missing_parts.append("in_out_ce_*.json")
                 missing.append(f"{sd.name} ({'+'.join(missing_parts)})")
 
         root_valid_ids[rp] = valid_ids
@@ -1962,7 +2010,7 @@ def plot_logit_lens_turn_taking_from_saved(
         used_labels.add(label)
         labeled_roots.append((label, rp))
 
-    per_root: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    per_root: Dict[str, Dict[int, Dict[str, Dict[str, Any]]]] = {}
     for label, rp in labeled_roots:
         root_data = _collect_per_root(rp, shared_ids)
         if root_data:
@@ -1976,128 +2024,136 @@ def plot_logit_lens_turn_taking_from_saved(
 
     rel_tok = np.arange(-span, span + 1, dtype=np.int32)
     save_root = parsed_roots[0]
-    for anchor in anchors:
-        datasets_for_anchor = [
-            (name, data[anchor])
-            for name, data in per_root.items()
-            if anchor in data
-        ]
-        if not datasets_for_anchor:
-            print(f"[plot-logit-turn] No valid samples for {anchor}; skipping")
-            continue
+    all_layers = sorted({lv for root_data in per_root.values() for lv in root_data.keys()})
+    for layer_val in all_layers:
+        for anchor in anchors:
+            datasets_for_anchor = [
+                (name, data[layer_val][anchor])
+                for name, data in per_root.items()
+                if layer_val in data and anchor in data[layer_val]
+            ]
+            if not datasets_for_anchor:
+                print(
+                    f"[plot-logit-turn] No valid samples for layer={layer_val}, anchor={anchor}; skipping"
+                )
+                continue
 
-        fig, (ax_top, ax_bot) = plt.subplots(
-            2,
-            1,
-            figsize=(11.0, 6.2),
-            dpi=180,
-            sharex=True,
-            gridspec_kw={"height_ratios": [1.9, 1.0]},
-        )
-        combined_ratio_values: list[np.ndarray] = []
-        combined_amp_values: list[np.ndarray] = []
-        merged_json: Dict[str, Any] = {
-            "anchor": anchor,
-            "window_tokens": int(span),
-            "relative_token_index": rel_tok.tolist(),
-            "datasets": {},
-        }
-        for ds_name, ds in datasets_for_anchor:
-            avg_line1 = ds["avg_line1"]
-            avg_line2 = ds["avg_line2"]
-            avg_ratio = ds["avg_ratio"]
-            n_samples = int(ds["num_samples"])
-            avg_input_amp = ds["avg_input_amp"]
-            n_input = int(ds["num_samples_input_amp"])
-
-            ax_top.plot(
-                rel_tok,
-                avg_ratio,
-                linewidth=1.6,
-                label=f"{ds_name} ratio (n={n_samples})",
+            fig, (ax_top, ax_bot) = plt.subplots(
+                2,
+                1,
+                figsize=(11.0, 6.2),
+                dpi=180,
+                sharex=True,
+                gridspec_kw={"height_ratios": [1.9, 1.0]},
             )
-
-            ax_bot.plot(
-                rel_tok,
-                avg_input_amp,
-                linewidth=1.2,
-                label=f"{ds_name} (n={n_input})",
-            )
-
-            finite_ratio = avg_ratio[np.isfinite(avg_ratio)]
-            if finite_ratio.size > 0:
-                combined_ratio_values.append(finite_ratio)
-            finite_amp = avg_input_amp[np.isfinite(avg_input_amp)]
-            if finite_amp.size > 0:
-                combined_amp_values.append(finite_amp)
-
-            merged_json["datasets"][ds_name] = {
-                "num_samples": n_samples,
-                "avg_line1_user_multimodal_ce": avg_line1.tolist(),
-                "avg_line2_model_multimodal_ce": avg_line2.tolist(),
-                "avg_ratio_line1_over_line2": (
-                    (avg_line1 / np.clip(avg_line2, 1e-6, None)).tolist()
-                ),
-                "num_samples_input_audio": n_input,
-                "avg_input_audio_abs_amplitude": avg_input_amp.tolist(),
+            combined_ratio_values: list[np.ndarray] = []
+            combined_amp_values: list[np.ndarray] = []
+            merged_json: Dict[str, Any] = {
+                "layer": int(layer_val),
+                "anchor": anchor,
+                "window_tokens": int(span),
+                "relative_token_index": rel_tok.tolist(),
+                "datasets": {},
             }
+            for ds_name, ds in datasets_for_anchor:
+                avg_line1 = ds["avg_line1"]
+                avg_line2 = ds["avg_line2"]
+                avg_ratio = ds["avg_ratio"]
+                n_samples = int(ds["num_samples"])
+                avg_input_amp = ds["avg_input_amp"]
+                n_input = int(ds["num_samples_input_amp"])
 
-        ax_top.axvline(0, color="#444444", linestyle="--", linewidth=0.9, alpha=0.8)
-        ax_top.set_ylabel("CE ratio")
-        ax_top.set_title(
-            f"Average Logit-Lens CE Ratio Around {anchor} (window=+/-{span})"
-        )
-        ax_top.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
-        ax_top.legend(loc="upper right", fontsize=8)
+                ax_top.plot(
+                    rel_tok,
+                    avg_ratio,
+                    linewidth=1.6,
+                    label=f"{ds_name} ratio (n={n_samples})",
+                )
 
-        ax_bot.axvline(0, color="#444444", linestyle="--", linewidth=0.9, alpha=0.8)
-        ax_bot.set_ylabel("Input abs amp")
-        ax_bot.set_xlabel(f"Relative token index to {anchor}")
-        ax_bot.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
-        ax_bot.legend(loc="upper right", fontsize=8)
+                ax_bot.plot(
+                    rel_tok,
+                    avg_input_amp,
+                    linewidth=1.2,
+                    label=f"{ds_name} (n={n_input})",
+                )
 
-        y_all = (
-            np.concatenate(combined_ratio_values)
-            if combined_ratio_values
-            else np.asarray([], dtype=np.float32)
-        )
-        if y_all.size > 0:
-            y_lo = float(np.percentile(y_all, 1.0))
-            y_hi = float(np.percentile(y_all, 99.0))
-            if y_hi <= y_lo:
-                y_mid = float(np.nanmean(y_all))
-                y_lo, y_hi = y_mid - 0.05, y_mid + 0.05
-            pad = max(0.01, 0.12 * (y_hi - y_lo))
-            ax_top.set_ylim(y_lo - pad, y_hi + pad)
+                finite_ratio = avg_ratio[np.isfinite(avg_ratio)]
+                if finite_ratio.size > 0:
+                    combined_ratio_values.append(finite_ratio)
+                finite_amp = avg_input_amp[np.isfinite(avg_input_amp)]
+                if finite_amp.size > 0:
+                    combined_amp_values.append(finite_amp)
 
-        a_all = (
-            np.concatenate(combined_amp_values)
-            if combined_amp_values
-            else np.asarray([], dtype=np.float32)
-        )
-        if a_all.size > 0:
-            a_lo = float(np.percentile(a_all, 1.0))
-            a_hi = float(np.percentile(a_all, 99.0))
-            if a_hi <= a_lo:
-                a_mid = float(np.nanmean(a_all))
-                a_lo, a_hi = max(0.0, a_mid - 0.05), a_mid + 0.05
-            pad = max(0.005, 0.10 * (a_hi - a_lo))
-            ax_bot.set_ylim(max(0.0, a_lo - pad), a_hi + pad)
+                merged_json["datasets"][ds_name] = {
+                    "num_samples": n_samples,
+                    "avg_line1_user_multimodal_ce": avg_line1.tolist(),
+                    "avg_line2_model_multimodal_ce": avg_line2.tolist(),
+                    "avg_ratio_line1_over_line2": (
+                        (avg_line1 / np.clip(avg_line2, 1e-6, None)).tolist()
+                    ),
+                    "num_samples_input_audio": n_input,
+                    "avg_input_audio_abs_amplitude": avg_input_amp.tolist(),
+                }
 
-        ax_bot.set_xlim(int(rel_tok[0]), int(rel_tok[-1]))
+            ax_top.axvline(0, color="#444444", linestyle="--", linewidth=0.9, alpha=0.8)
+            ax_top.set_ylabel("CE ratio")
+            ax_top.set_title(
+                f"Average Logit-Lens CE Ratio Around {anchor} (layer={layer_val}, window=+/-{span})"
+            )
+            ax_top.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
+            ax_top.legend(loc="upper right", fontsize=8)
 
-        suffix = "multi" if len(parsed_roots) > 1 else parsed_roots[0].name
-        out_png = save_root / f"logit_lens_turn_taking_{anchor}_{suffix}.png"
-        fig.tight_layout()
-        fig.savefig(out_png, bbox_inches="tight")
-        plt.close(fig)
+            ax_bot.axvline(0, color="#444444", linestyle="--", linewidth=0.9, alpha=0.8)
+            ax_bot.set_ylabel("Input abs amp")
+            ax_bot.set_xlabel(f"Relative token index to {anchor}")
+            ax_bot.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
+            ax_bot.legend(loc="upper right", fontsize=8)
 
-        out_json = save_root / f"logit_lens_turn_taking_{anchor}_{suffix}.json"
-        with out_json.open("w", encoding="utf-8") as f:
-            json.dump(merged_json, f, indent=2, ensure_ascii=False)
-        print(f"[plot-logit-turn] Saved {out_png}")
-        print(f"[plot-logit-turn] Saved {out_json}")
+            y_all = (
+                np.concatenate(combined_ratio_values)
+                if combined_ratio_values
+                else np.asarray([], dtype=np.float32)
+            )
+            if y_all.size > 0:
+                y_lo = float(np.percentile(y_all, 1.0))
+                y_hi = float(np.percentile(y_all, 99.0))
+                if y_hi <= y_lo:
+                    y_mid = float(np.nanmean(y_all))
+                    y_lo, y_hi = y_mid - 0.05, y_mid + 0.05
+                pad = max(0.01, 0.12 * (y_hi - y_lo))
+                ax_top.set_ylim(y_lo - pad, y_hi + pad)
 
+            a_all = (
+                np.concatenate(combined_amp_values)
+                if combined_amp_values
+                else np.asarray([], dtype=np.float32)
+            )
+            if a_all.size > 0:
+                a_lo = float(np.percentile(a_all, 1.0))
+                a_hi = float(np.percentile(a_all, 99.0))
+                if a_hi <= a_lo:
+                    a_mid = float(np.nanmean(a_all))
+                    a_lo, a_hi = max(0.0, a_mid - 0.05), a_mid + 0.05
+                pad = max(0.005, 0.10 * (a_hi - a_lo))
+                ax_bot.set_ylim(max(0.0, a_lo - pad), a_hi + pad)
+
+            ax_bot.set_xlim(int(rel_tok[0]), int(rel_tok[-1]))
+
+            suffix = "multi" if len(parsed_roots) > 1 else parsed_roots[0].name
+            out_png = save_root / (
+                f"logit_lens_turn_taking_layer_{layer_val}_{anchor}_{suffix}.png"
+            )
+            fig.tight_layout()
+            fig.savefig(out_png, bbox_inches="tight")
+            plt.close(fig)
+
+            out_json = save_root / (
+                f"logit_lens_turn_taking_layer_{layer_val}_{anchor}_{suffix}.json"
+            )
+            with out_json.open("w", encoding="utf-8") as f:
+                json.dump(merged_json, f, indent=2, ensure_ascii=False)
+            print(f"[plot-logit-turn] Saved {out_png}")
+            print(f"[plot-logit-turn] Saved {out_json}")
 
 # ---------------------------------------------------------------------------
 # CLI
