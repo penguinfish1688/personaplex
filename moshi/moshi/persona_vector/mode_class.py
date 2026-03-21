@@ -1345,27 +1345,27 @@ def plot_attention_heatmap_at_turn_taking(root_dir, span=20, layer=-1):
         )
 
         finite_vals = heat[np.isfinite(heat)]
-        imshow_kwargs: dict[str, Any] = {"cmap": "coolwarm"}
+        heat_display = heat.copy()
+        imshow_kwargs: dict[str, Any] = {
+            "cmap": "coolwarm",
+            "vmin": 2.0,
+            "vmax": 6.0,
+        }
         if finite_vals.size > 0:
-            lo = float(np.percentile(finite_vals, 5.0))
-            hi = float(np.percentile(finite_vals, 95.0))
-            if hi <= lo:
-                max_abs = float(np.max(np.abs(finite_vals)))
-                lo, hi = -max_abs, max_abs
+            p10 = float(np.percentile(finite_vals, 10.0))
+            p90 = float(np.percentile(finite_vals, 90.0))
+            if p90 <= p10:
+                p90 = p10 + 1e-6
 
-            # Use zero-centered norm only when range straddles 0.
-            if lo < 0.0 < hi:
-                imshow_kwargs["norm"] = TwoSlopeNorm(vmin=lo, vcenter=0.0, vmax=hi)
-            else:
-                if lo == hi:
-                    pad = max(1e-6, abs(lo) * 0.05)
-                    lo -= pad
-                    hi += pad
-                imshow_kwargs["vmin"] = lo
-                imshow_kwargs["vmax"] = hi
+            scale = 4.0 / (p90 - p10)
+            finite_mask = np.isfinite(heat_display)
+            heat_display[finite_mask] = (
+                (heat_display[finite_mask] - p10) * scale
+            ) + 2.0
+            heat_display[finite_mask] = np.clip(heat_display[finite_mask], 2.0, 6.0)
 
         img = ax_top.imshow(
-            heat,
+            heat_display,
             aspect="auto",
             interpolation="nearest",
             origin="lower",
@@ -1374,7 +1374,7 @@ def plot_attention_heatmap_at_turn_taking(root_dir, span=20, layer=-1):
         )
         cax = ax_top.inset_axes([1.01, 0.0, 0.018, 1.0])
         cbar = fig.colorbar(img, cax=cax)
-        cbar.set_label("Attention logit")
+        cbar.set_label("Attention logit (P10->2, P90->6)")
         ax_top.set_ylabel("Query offset (s)")
         ax_top.set_title(
             f"Average Attention Around {anchor} (layer={layer}, span={span}, n={len(per_anchor_heatmaps[anchor])})"
