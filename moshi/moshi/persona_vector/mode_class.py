@@ -1189,7 +1189,7 @@ def plot_attention_heatmap_at_turn_taking(root_dir, span=20, layer=-1):
       - bottom: average aligned user/model waveform over the same relative-time window
     """
     import matplotlib.pyplot as plt
-    from matplotlib.colors import TwoSlopeNorm
+    from matplotlib.colors import ListedColormap
     import numpy as np
 
     root = Path(root_dir)
@@ -1346,14 +1346,16 @@ def plot_attention_heatmap_at_turn_taking(root_dir, span=20, layer=-1):
 
         finite_vals = heat[np.isfinite(heat)]
         heat_display = heat.copy()
+        base_cmap = plt.get_cmap("coolwarm")
+        cmap_90_sat = ListedColormap(base_cmap(np.linspace(0.05, 0.95, 256)))
         imshow_kwargs: dict[str, Any] = {
-            "cmap": "coolwarm",
+            "cmap": cmap_90_sat,
             "vmin": 2.0,
             "vmax": 6.0,
         }
         if finite_vals.size > 0:
-            p10 = float(np.percentile(finite_vals, 5.0))
-            p90 = float(np.percentile(finite_vals, 95.0))
+            p10 = float(np.percentile(finite_vals, 10.0))
+            p90 = float(np.percentile(finite_vals, 90.0))
             if p90 <= p10:
                 p90 = p10 + 1e-6
 
