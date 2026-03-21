@@ -1657,7 +1657,11 @@ def plot_logit_lens_dataset(
     device: str = "cuda",
     ma_window: int = 5,
 ) -> None:
-    """Find ``root_dir/*/output_hidden(.pt)`` and plot logit-lens CE for each."""
+    """Find ``root_dir/*/output_hidden(.pt)`` and plot logit-lens CE for each.
+
+    If ``layer == -1``, generates plots/CE JSON for all available layers.
+    Otherwise only the specified layer is processed.
+    """
     root = Path(root_dir)
     if not root.is_dir():
         raise FileNotFoundError(f"Root directory not found: {root}")
@@ -1685,24 +1689,45 @@ def plot_logit_lens_dataset(
         f"[plot-logit-lens] Found {len(hidden_files)} output_hidden(.pt) files under {root}/*/"
     )
     ok = 0
+    total_jobs = 0
     for hp in hidden_files:
-        out_png = hp.with_name(f"logit_lens_ce_layer_{layer}.png")
-        out_json = hp.with_name("in_out_ce.json")
         print(f"\n--- {hp} ---")
         try:
-            plot_logit_lens_step_n(
-                str(hp),
-                str(out_png),
-                lm=lm,
-                layer=layer,
-                ma_window=ma_window,
-                ce_json_path=str(out_json),
-            )
-            ok += 1
+            payload = _load_hidden_payload(str(hp))
+            if layer == -1:
+                if "text_hidden_layers" in payload:
+                    hidden = payload["text_hidden_layers"]
+                    if hidden.ndim != 3:
+                        raise ValueError(
+                            f"Expected text_hidden_layers [T,L,D], got {tuple(hidden.shape)}"
+                        )
+                    layer_list = list(range(int(hidden.shape[1])))
+                elif "hidden_states" in payload:
+                    layer_list = [-1]
+                else:
+                    raise KeyError(
+                        "Payload has neither 'text_hidden_layers' nor 'hidden_states'."
+                    )
+            else:
+                layer_list = [layer]
+
+            total_jobs += len(layer_list)
+            for use_layer in layer_list:
+                out_png = hp.with_name(f"logit_lens_ce_layer_{use_layer}.png")
+                out_json = hp.with_name(f"in_out_ce_{use_layer}.json")
+                plot_logit_lens_step_n(
+                    str(hp),
+                    str(out_png),
+                    lm=lm,
+                    layer=use_layer,
+                    ma_window=ma_window,
+                    ce_json_path=str(out_json),
+                )
+                ok += 1
         except Exception as exc:
             print(f"  [SKIP] logit-lens plot failed: {exc}")
 
-    print(f"\n[plot-logit-lens] Done. Generated {ok}/{len(hidden_files)} plots.")
+    print(f"\n[plot-logit-lens] Done. Generated {ok}/{total_jobs} plots.")
 
 
 def plot_logit_lens_turn_taking_from_saved(
