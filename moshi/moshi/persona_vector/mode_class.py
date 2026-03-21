@@ -1352,8 +1352,8 @@ def plot_attention_heatmap_at_turn_taking(root_dir, span=20, layer=-1):
             "vmax": 6.0,
         }
         if finite_vals.size > 0:
-            p10 = float(np.percentile(finite_vals, 10.0))
-            p90 = float(np.percentile(finite_vals, 90.0))
+            p10 = float(np.percentile(finite_vals, 5.0))
+            p90 = float(np.percentile(finite_vals, 95.0))
             if p90 <= p10:
                 p90 = p10 + 1e-6
 
