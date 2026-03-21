@@ -1347,21 +1347,21 @@ def plot_attention_heatmap_at_turn_taking(root_dir, span=20, layer=-1):
         heat_display = heat.copy()
         imshow_kwargs: dict[str, Any] = {
             "cmap": "coolwarm",
-            "vmin": 1.0,
-            "vmax": 9.0,
+            "vmin": 5.0,
+            "vmax": 95.0,
         }
         if finite_vals.size > 0:
-            p10 = float(np.percentile(finite_vals, 10.0))
-            p90 = float(np.percentile(finite_vals, 90.0))
-            if p90 <= p10:
-                p90 = p10 + 1e-6
+            p5 = float(np.percentile(finite_vals, 5.0))
+            p95 = float(np.percentile(finite_vals, 95.0))
+            if p95 <= p5:
+                p95 = p5 + 1e-6
 
-            scale = 8.0 / (p90 - p10)
+            scale = 90.0 / (p95 - p5)
             finite_mask = np.isfinite(heat_display)
             heat_display[finite_mask] = (
-                (heat_display[finite_mask] - p10) * scale
-            ) + 1.0
-            heat_display[finite_mask] = np.clip(heat_display[finite_mask], 1.0, 9.0)
+                (heat_display[finite_mask] - p5) * scale
+            ) + 5.0
+            heat_display[finite_mask] = np.clip(heat_display[finite_mask], 5.0, 95.0)
 
         img = ax_top.imshow(
             heat_display,
@@ -1373,7 +1373,7 @@ def plot_attention_heatmap_at_turn_taking(root_dir, span=20, layer=-1):
         )
         cax = ax_top.inset_axes([1.01, 0.0, 0.018, 1.0])
         cbar = fig.colorbar(img, cax=cax)
-        cbar.set_label("Attention logit (P10->1, P90->9)")
+        cbar.set_label("Attention logit (P5->5, P95->95)")
         ax_top.set_ylabel("Query offset (s)")
         ax_top.set_title(
             f"Average Attention Around {anchor} (layer={layer}, span={span}, n={len(per_anchor_heatmaps[anchor])})"
