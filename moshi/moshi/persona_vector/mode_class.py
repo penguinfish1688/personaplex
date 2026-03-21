@@ -1429,6 +1429,7 @@ def plot_logit_lens_step_n(
     layer: int = -1,
     ma_window: int = 5,
     ce_json_path: Optional[str] = None,
+    save_plot: bool = True,
 ) -> None:
     """Plot step-n premature-decode CE losses and aligned waveforms.
 
@@ -1564,6 +1565,9 @@ def plot_logit_lens_step_n(
         ce_out.parent.mkdir(parents=True, exist_ok=True)
         with open(ce_out, "w", encoding="utf-8") as f:
             json.dump(ce_payload, f, indent=2, ensure_ascii=False)
+
+    if not save_plot:
+        return
 
     times = payload.get("times", None)
     if isinstance(times, torch.Tensor) and times.ndim == 1 and times.shape[0] == T:
@@ -1722,6 +1726,7 @@ def plot_logit_lens_dataset(
                     layer=use_layer,
                     ma_window=ma_window,
                     ce_json_path=str(out_json),
+                    save_plot=False,
                 )
                 ok += 1
         except Exception as exc:
