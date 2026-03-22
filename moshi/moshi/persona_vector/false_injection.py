@@ -27,11 +27,24 @@ import torch
 from openai import OpenAI
 
 from moshi.persona_vector.mode_class import extract_normal_vector
+from moshi.offline import run_batch_inference, _get_voice_prompt_dir
+from moshi.models import loaders
 
 
 TOKEN_RATE_HZ = 12.5
 MAIN_LAYER_MIN = 0
 MAIN_LAYER_MAX = 31
+
+
+SYSTEM_PROMPT = (
+  "You are an intelligent, articulate, and highly factual AI assistant. "
+  "When the user asks open-ended questions, provide detailed, natural, and comprehensive explanations, and talk for a long time."
+  "However, you also act as a strict fact-checker. If the user interrupts you or makes a factual claim "
+  "(e.g., 'A banana is a red fruit, right?'), you must prioritize truth over politeness. "
+  "If their claim is TRUE, confirm it and teach user more about the topic."
+  "If their claim is FALSE, you must immediately reject it by saying 'No' or 'False', and teach user the correct information."
+  "Never agree with incorrect information just to be polite."
+)
 
 
 def _is_valid_main_layer(layer: int) -> bool:
@@ -143,18 +156,155 @@ def generate_random_vector(
         layer_payload[str(tok_idx)] = None
 
     steering_path = input_wav.parent / "steering_vector.json"
+    steering_named_path = input_wav.parent / f"steering_vector_{int(layer)}_{prob}.json"
     existing = _load_existing_steering_payload(steering_path)
     existing[layer_key] = layer_payload
     _atomic_write_json(steering_path, existing)
+    _atomic_write_json(steering_named_path, existing)
 
     print(
-      f"[false_injection] {input_wav.parent.name}: wrote {steering_path.name} {layer_key} "
+      f"[false_injection] {input_wav.parent.name}: wrote {steering_path.name} and {steering_named_path.name} {layer_key} "
       f"(tokens={total_tokens}, injected={injected_count}, prob={prob})"
     )
     updated += 1
 
   print(
     f"[false_injection] Done. Updated random steering vectors for {updated} items at {root_dir}"
+  )
+
+
+def _extract_layer_vector_legacy(raw: dict[str, Any], layer: int) -> list[Optional[torch.Tensor]]:
+  candidate_keys = [
+    f"layer_{layer}",
+    f"layer{layer}",
+    str(layer),
+    layer,
+  ]
+  layer_payload = None
+  for key in candidate_keys:
+    if key in raw:
+      layer_payload = raw[key]
+      break
+  if layer_payload is None:
+    available = ", ".join([str(k) for k in raw.keys()])
+    raise KeyError(f"Layer {layer} not found in steering file. Available keys: {available}")
+  if not isinstance(layer_payload, dict):
+    raise ValueError(f"Expected dict for layer payload at layer {layer}, got {type(layer_payload)}")
+
+  token_entries: dict[int, Optional[torch.Tensor]] = {}
+  max_idx = 0
+  for token_key, token_vec in layer_payload.items():
+    try:
+      token_idx = int(token_key)
+    except (TypeError, ValueError) as exc:
+      raise ValueError(f"Token index must be an integer-like key, got '{token_key}'") from exc
+    if token_idx < 0:
+      raise ValueError(f"Token indices must be >= 0, got {token_idx}")
+    if token_vec is None:
+      token_entries[token_idx] = None
+    else:
+      token_entries[token_idx] = torch.as_tensor(token_vec, dtype=torch.float32).reshape(-1)
+    max_idx = max(max_idx, token_idx)
+
+  if len(token_entries) == 0:
+    raise ValueError("Layer payload has no usable steering vectors")
+
+  vectors: list[Optional[torch.Tensor]] = [None] * (max_idx + 1)
+  for token_idx, token_vec in token_entries.items():
+    vectors[token_idx] = token_vec
+  return vectors
+
+
+def inference_with_steering(root_dir: str, layer: int, prob: float) -> None:
+  if not _is_valid_main_layer(layer):
+    raise ValueError(f"layer must be in [{MAIN_LAYER_MIN}..{MAIN_LAYER_MAX}], got {layer}")
+
+  root = Path(root_dir)
+  input_paths = [p for p in root.glob("*/input.wav") if p.is_file()]
+  input_paths.sort(key=lambda p: int(p.parent.name) if p.parent.name.isdigit() else p.parent.name)
+  if not input_paths:
+    raise FileNotFoundError(f"No files matched pattern {root_dir}/*/input.wav")
+
+  # Strictly require per-run steering file for tracking and reproducibility.
+  for p in input_paths:
+    steering_named = p.parent / f"steering_vector_{int(layer)}_{prob}.json"
+    if not steering_named.exists():
+      raise FileNotFoundError(
+        f"Missing required steering file for inference: {steering_named}. "
+        "Run --generate-random-vector with matching --layer/--prob first."
+      )
+
+  voice_prompt_dir = _get_voice_prompt_dir(None, loaders.DEFAULT_REPO)
+  if voice_prompt_dir is None:
+    raise FileNotFoundError("Unable to resolve voice prompt directory.")
+  voice_prompt_path = os.path.join(voice_prompt_dir, "NATF0.pt")
+  if not os.path.exists(voice_prompt_path):
+    raise FileNotFoundError(f"Voice prompt not found: {voice_prompt_path}")
+
+  for path in input_paths:
+    entry_dir = path.parent
+    input_wav = str(path)
+    output_wav = str(entry_dir / f"output_{int(layer)}_{prob}.wav")
+    output_text = str(entry_dir / f"output_{int(layer)}_{prob}.json")
+    steering_named = entry_dir / f"steering_vector_{int(layer)}_{prob}.json"
+
+    with steering_named.open("r", encoding="utf-8") as f:
+      steering_payload = json.load(f)
+    if not isinstance(steering_payload, dict):
+      raise ValueError(f"Expected dict in {steering_named}, got {type(steering_payload)}")
+
+    steering_vectors = _extract_layer_vector_legacy(steering_payload, int(layer))
+
+    try:
+      with wave.open(input_wav, "rb") as wf:
+        duration_s = float(wf.getnframes()) / float(wf.getframerate())
+    except wave.Error:
+      import soundfile as sf
+
+      info = sf.info(input_wav)
+      duration_s = float(info.frames) / float(info.samplerate)
+    min_tokens = int(math.ceil(duration_s * TOKEN_RATE_HZ))
+    if len(steering_vectors) < min_tokens:
+      steering_vectors.extend([None] * (min_tokens - len(steering_vectors)))
+
+    non_null = sum(1 for v in steering_vectors if v is not None)
+    print(
+      f"[false_injection] {entry_dir.name}: using {steering_named.name}, "
+      f"len={len(steering_vectors)}, min_tokens={min_tokens}, non_null={non_null}"
+    )
+
+    with torch.no_grad():
+      run_batch_inference(
+        input_wavs=[input_wav],
+        output_wavs=[output_wav],
+        output_texts=[output_text],
+        text_prompts=[SYSTEM_PROMPT],
+        voice_prompt_path=voice_prompt_path,
+        tokenizer_path=None,
+        moshi_weight=None,
+        mimi_weight=None,
+        hf_repo=loaders.DEFAULT_REPO,
+        device="cuda",
+        seed=42,
+        temp_audio=0.8,
+        temp_text=0.7,
+        topk_audio=250,
+        topk_text=25,
+        greedy=False,
+        save_voice_prompt_embeddings=False,
+        cpu_offload=False,
+        return_hidden_layers=False,
+        save_hidden_payload=False,
+        output_hiddens=None,
+        steering_vectors=steering_vectors,
+        steering_layer=int(layer),
+      )
+    print(
+      f"[false_injection] {entry_dir.name}: wrote {Path(output_wav).name} and {Path(output_text).name}"
+    )
+
+  print(
+    f"[false_injection] Done. Wrote output_<layer>_<prob>.wav/json for {len(input_paths)} items at {root_dir}"
   )
 
 
@@ -308,6 +458,11 @@ def main() -> None:
     action="store_true",
     help="Evaluate root-dir/*/output.wav responses on 0-5 relatedness and save summary JSON.",
   )
+  mode_group.add_argument(
+    "--inference-with-steering",
+    action="store_true",
+    help="Run inference using steering_vector_<layer>_<prob>.json and write output_<layer>_<prob>.wav/json.",
+  )
 
   parser.add_argument("--layer", type=int, required=True, help="Injection layer (0..31)")
   parser.add_argument("--prob", type=float, required=True, help="Per-token injection probability in [0, 1]")
@@ -351,6 +506,14 @@ def main() -> None:
       classifier_dir=args.classifier_dir,
       classifier_path=args.classifier_path,
       seed=int(args.seed),
+    )
+    return
+
+  if args.inference_with_steering:
+    inference_with_steering(
+      root_dir=args.root_dir,
+      layer=int(args.layer),
+      prob=float(args.prob),
     )
     return
 
