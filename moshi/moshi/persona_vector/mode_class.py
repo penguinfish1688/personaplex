@@ -1426,7 +1426,11 @@ def plot_attention_heatmap_dataset(
 
     print(f"\n[plot-attn] Done. Generated {ok}/{len(hidden_files)} plots.")
 
-def plot_attention_by_subseqent_token_heatmap(root_dir: str, span: int = 50):
+def plot_attention_by_subseqent_token_heatmap(
+    root_dir: str,
+    span: int = 50,
+    window: int = 50,
+):
     """
     Plot attention heatmaps for each subsequence token.
 
@@ -1446,10 +1450,20 @@ def plot_attention_by_subseqent_token_heatmap(root_dir: str, span: int = 50):
         raise FileNotFoundError(f"Root directory not found: {root}")
     if span < 1:
         raise ValueError(f"span must be >= 1, got {span}")
+    if window < 1:
+        raise ValueError(f"window must be >= 1, got {window}")
 
     sample_dirs = sorted([p for p in root.iterdir() if p.is_dir()])
     if not sample_dirs:
         raise FileNotFoundError(f"No sample directories found under {root}")
+
+    def _jsonable_2d(arr: np.ndarray) -> List[List[Optional[float]]]:
+        out: List[List[Optional[float]]] = []
+        for row in arr:
+            out.append([
+                (float(v) if np.isfinite(v) else None) for v in row
+            ])
+        return out
 
     def _build_attn_prob_matrix(payload: Dict[str, Any], layer_idx: int) -> np.ndarray:
         attn_steps = payload.get("text_attention_weights", None)
@@ -1475,7 +1489,7 @@ def plot_attention_by_subseqent_token_heatmap(root_dir: str, span: int = 50):
                 mat[q, q - use_len + 1 : q + 1] = vec[-use_len:]
         return mat
 
-    # Collect per-sample matrices: [L, span+1]
+    # Collect per-sample anchored matrices for plotting: [L, span+1]
     sample_maps: List[np.ndarray] = []
     num_layers_ref: Optional[int] = None
 
@@ -1514,18 +1528,47 @@ def plot_attention_by_subseqent_token_heatmap(root_dir: str, span: int = 50):
                 continue
 
             T = len(attn_steps)
-            local = np.full((L, span + 1), np.nan, dtype=np.float32)
+            # Full conversation values for this sample: [L, T].
+            local_all_tokens = np.full((L, T), np.nan, dtype=np.float32)
             for l in range(L):
                 mat = _build_attn_prob_matrix(payload, l)  # [T, T]
-                for off in range(span + 1):
-                    t = anchor_tok + off
-                    if t < 0 or t >= T - 1:
+                for t in range(T):
+                    if t >= T - 1:
                         continue
-                    # Average of future queries (t+1..T-1) attending to key token t.
-                    vals = mat[t + 1 :, t]
+                    # Average of future queries in a bounded horizon:
+                    # (t+1 .. min(t+window, T-1)) attending to key token t.
+                    end_q = min(T - 1, t + window)
+                    if end_q < t + 1:
+                        continue
+                    vals = mat[t + 1 : end_q + 1, t]
                     finite = vals[np.isfinite(vals)]
                     if finite.size > 0:
-                        local[l, off] = float(np.mean(finite))
+                        local_all_tokens[l, t] = float(np.mean(finite))
+
+            # Keep plotting behavior anchored at interrupt_start.
+            local = np.full((L, span + 1), np.nan, dtype=np.float32)
+            for off in range(span + 1):
+                t = anchor_tok + off
+                if 0 <= t < T:
+                    local[:, off] = local_all_tokens[:, t]
+
+            per_sample_json = {
+                "anchor": "interrupt_start",
+                "span": int(span),
+                "future_query_window": int(window),
+                "frame_rate_hz": float(frame_rate_hz),
+                "anchor_seconds": float(timing["interrupt_start"]),
+                "anchor_token_index": int(anchor_tok),
+                "num_layers": int(L),
+                "num_steps": int(T),
+                "token_indices": list(range(T)),
+                "avg_future_attention_weight_by_layer_all_tokens": _jsonable_2d(local_all_tokens),
+                "token_offsets_from_interrupt_start": list(range(span + 1)),
+                "avg_future_attention_weight_by_layer_anchor_window": _jsonable_2d(local),
+            }
+            per_sample_out = sd / "attention_subseq_token.json"
+            with per_sample_out.open("w", encoding="utf-8") as f:
+                json.dump(per_sample_json, f, indent=2, ensure_ascii=False)
 
             sample_maps.append(local)
         except Exception:
