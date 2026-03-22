@@ -4,9 +4,10 @@ This script supports two workflows:
 1) Generate random steering vectors under ``root_dir/*/steering_vector.json``:
    - Normal vector is extracted from SVM classifier (same source as user_interrupt.py)
    - Vector is multiplied by ``alpha``
-   - For each token, inject with probability ``prob``
+   - Inject periodic false signals by expectation interval in seconds
+     (e.g. 20 means one signal every 20s; -1 disables false signals)
 2) Evaluate generated outputs (0-5 relatedness score) and save summary to:
-   ``root_dir/false_injection_{layer}_{prob}.json``
+   ``root_dir/false_injection_{layer}_{expectation}.json``
 """
 
 from __future__ import annotations
@@ -15,7 +16,6 @@ import argparse
 import json
 import math
 import os
-import random
 import re
 import tempfile
 import wave
@@ -102,19 +102,36 @@ def _discover_classifier_path(classifier_dir: str, layer: int) -> Path:
   return p
 
 
+def _format_expectation_tag(expectation: float) -> str:
+  if expectation == -1.0:
+    return "-1"
+  text = f"{float(expectation):.6f}".rstrip("0").rstrip(".")
+  return text or "0"
+
+
+def _build_injection_mask(total_tokens: int, expectation: float) -> list[bool]:
+  if expectation == -1.0:
+    return [False] * total_tokens
+  if expectation <= 0.0:
+    raise ValueError(f"expectation must be > 0 or -1, got {expectation}")
+
+  step_tokens = max(1, int(round(float(expectation) * TOKEN_RATE_HZ)))
+  # Inject at deterministic periodic positions: one signal every N seconds.
+  return [((tok_idx + 1) % step_tokens == 0) for tok_idx in range(total_tokens)]
+
+
 def generate_random_vector(
   root_dir: str,
   layer: int,
-  prob: float,
+  expectation: float,
   alpha: float,
   classifier_dir: Optional[str],
   classifier_path: Optional[str],
-  seed: int,
 ) -> None:
   if not _is_valid_main_layer(layer):
     raise ValueError(f"layer must be in [{MAIN_LAYER_MIN}..{MAIN_LAYER_MAX}], got {layer}")
-  if prob < 0.0 or prob > 1.0:
-    raise ValueError(f"prob must be in [0, 1], got {prob}")
+  if expectation != -1.0 and expectation <= 0.0:
+    raise ValueError(f"expectation must be > 0 or -1, got {expectation}")
 
   if classifier_path is None:
     if classifier_dir is None:
@@ -134,8 +151,8 @@ def generate_random_vector(
   if not input_paths:
     raise FileNotFoundError(f"No files matched pattern {root_dir}/*/input.wav")
 
-  rng = random.Random(int(seed))
   layer_key = f"layer_{int(layer)}"
+  expectation_tag = _format_expectation_tag(expectation)
 
   updated = 0
   for input_wav in input_paths:
@@ -146,17 +163,18 @@ def generate_random_vector(
         f"Computed non-positive token count for {input_wav}: duration={duration_s:.6f}s"
       )
 
+    inject_mask = _build_injection_mask(total_tokens=total_tokens, expectation=float(expectation))
     layer_payload: dict[str, Optional[list[float]]] = {}
     injected_count = 0
     for tok_idx in range(total_tokens):
-      if rng.random() < float(prob):
+      if inject_mask[tok_idx]:
         layer_payload[str(tok_idx)] = steering_vec
         injected_count += 1
       else:
         layer_payload[str(tok_idx)] = None
 
     steering_path = input_wav.parent / "steering_vector.json"
-    steering_named_path = input_wav.parent / f"steering_vector_{int(layer)}_{prob}.json"
+    steering_named_path = input_wav.parent / f"steering_vector_{int(layer)}_{expectation_tag}.json"
     existing = _load_existing_steering_payload(steering_path)
     existing[layer_key] = layer_payload
     _atomic_write_json(steering_path, existing)
@@ -164,7 +182,7 @@ def generate_random_vector(
 
     print(
       f"[false_injection] {input_wav.parent.name}: wrote {steering_path.name} and {steering_named_path.name} {layer_key} "
-      f"(tokens={total_tokens}, injected={injected_count}, prob={prob})"
+      f"(tokens={total_tokens}, injected={injected_count}, expectation={expectation_tag}s)"
     )
     updated += 1
 
@@ -215,7 +233,7 @@ def _extract_layer_vector_legacy(raw: dict[str, Any], layer: int) -> list[Option
   return vectors
 
 
-def inference_with_steering(root_dir: str, layer: int, prob: float) -> None:
+def inference_with_steering(root_dir: str, layer: int, expectation: float) -> None:
   if not _is_valid_main_layer(layer):
     raise ValueError(f"layer must be in [{MAIN_LAYER_MIN}..{MAIN_LAYER_MAX}], got {layer}")
 
@@ -225,13 +243,15 @@ def inference_with_steering(root_dir: str, layer: int, prob: float) -> None:
   if not input_paths:
     raise FileNotFoundError(f"No files matched pattern {root_dir}/*/input.wav")
 
+  expectation_tag = _format_expectation_tag(expectation)
+
   # Strictly require per-run steering file for tracking and reproducibility.
   for p in input_paths:
-    steering_named = p.parent / f"steering_vector_{int(layer)}_{prob}.json"
+    steering_named = p.parent / f"steering_vector_{int(layer)}_{expectation_tag}.json"
     if not steering_named.exists():
       raise FileNotFoundError(
         f"Missing required steering file for inference: {steering_named}. "
-        "Run --generate-random-vector with matching --layer/--prob first."
+        "Run --generate-random-vector with matching --layer/--expectation first."
       )
 
   voice_prompt_dir = _get_voice_prompt_dir(None, loaders.DEFAULT_REPO)
@@ -244,9 +264,9 @@ def inference_with_steering(root_dir: str, layer: int, prob: float) -> None:
   for path in input_paths:
     entry_dir = path.parent
     input_wav = str(path)
-    output_wav = str(entry_dir / f"output_{int(layer)}_{prob}.wav")
-    output_text = str(entry_dir / f"output_{int(layer)}_{prob}.json")
-    steering_named = entry_dir / f"steering_vector_{int(layer)}_{prob}.json"
+    output_wav = str(entry_dir / f"output_{int(layer)}_{expectation_tag}.wav")
+    output_text = str(entry_dir / f"output_{int(layer)}_{expectation_tag}.json")
+    steering_named = entry_dir / f"steering_vector_{int(layer)}_{expectation_tag}.json"
 
     with steering_named.open("r", encoding="utf-8") as f:
       steering_payload = json.load(f)
@@ -304,7 +324,7 @@ def inference_with_steering(root_dir: str, layer: int, prob: float) -> None:
     )
 
   print(
-    f"[false_injection] Done. Wrote output_<layer>_<prob>.wav/json for {len(input_paths)} items at {root_dir}"
+    f"[false_injection] Done. Wrote output_<layer>_<expectation>.wav/json for {len(input_paths)} items at {root_dir}"
   )
 
 
@@ -367,7 +387,7 @@ def _evaluate_single_text(client: OpenAI, question: str, answer: str, model: str
 def evaluate_results(
   root_dir: str,
   layer: int,
-  prob: float,
+  expectation: float,
   question: str,
   judge_model: str,
 ) -> Path:
@@ -375,10 +395,13 @@ def evaluate_results(
     raise ValueError("--question must be a non-empty string for --evaluate-results")
 
   root = Path(root_dir)
-  output_wavs = [p for p in root.glob("*/output.wav") if p.is_file()]
+  expectation_tag = _format_expectation_tag(expectation)
+  output_wavs = [p for p in root.glob(f"*/output_{int(layer)}_{expectation_tag}.wav") if p.is_file()]
   output_wavs.sort(key=lambda p: int(p.parent.name) if p.parent.name.isdigit() else p.parent.name)
   if not output_wavs:
-    raise FileNotFoundError(f"No files matched pattern {root_dir}/*/output.wav")
+    raise FileNotFoundError(
+      f"No files matched pattern {root_dir}/*/output_{int(layer)}_{expectation_tag}.wav"
+    )
 
   client = _build_openai_client()
 
@@ -386,7 +409,7 @@ def evaluate_results(
   scores: list[int] = []
   for output_wav in output_wavs:
     sample_dir = output_wav.parent
-    output_json = sample_dir / "output.json"
+    output_json = sample_dir / f"output_{int(layer)}_{expectation_tag}.json"
     answer_text = _load_output_text(output_json)
 
     if not answer_text:
@@ -426,7 +449,7 @@ def evaluate_results(
   output_payload: dict[str, Any] = {
     "question": question,
     "layer": int(layer),
-    "prob": float(prob),
+    "expectation": float(expectation),
     "judge_model": judge_model,
     "num_samples": len(results),
     "average_score": avg_score,
@@ -434,7 +457,7 @@ def evaluate_results(
     "results": results,
   }
 
-  out_path = root / f"false_injection_{int(layer)}_{prob}.json"
+  out_path = root / f"false_injection_{int(layer)}_{expectation_tag}.json"
   _atomic_write_json(out_path, output_payload)
   print(
     f"[false_injection] Done. Saved evaluation to {out_path} "
@@ -445,13 +468,18 @@ def evaluate_results(
 
 def main() -> None:
   parser = argparse.ArgumentParser("false_injection")
-  parser.add_argument("--root-dir", type=str, required=True, help="Root directory containing */input.wav and */output.wav")
+  parser.add_argument(
+    "--root-dir",
+    type=str,
+    required=True,
+    help="Root directory containing */input.wav and generated false-injection outputs.",
+  )
 
   mode_group = parser.add_mutually_exclusive_group(required=True)
   mode_group.add_argument(
     "--generate-random-vector",
     action="store_true",
-    help="Generate root-dir/*/steering_vector.json with random per-token false injection.",
+    help="Generate root-dir/*/steering_vector.json with expectation-based periodic false signals.",
   )
   mode_group.add_argument(
     "--evaluate-results",
@@ -461,13 +489,17 @@ def main() -> None:
   mode_group.add_argument(
     "--inference-with-steering",
     action="store_true",
-    help="Run inference using steering_vector_<layer>_<prob>.json and write output_<layer>_<prob>.wav/json.",
+    help="Run inference using steering_vector_<layer>_<expectation>.json and write output_<layer>_<expectation>.wav/json.",
   )
 
   parser.add_argument("--layer", type=int, required=True, help="Injection layer (0..31)")
-  parser.add_argument("--prob", type=float, required=True, help="Per-token injection probability in [0, 1]")
+  parser.add_argument(
+    "--expectation",
+    type=float,
+    required=True,
+    help="Expected interval seconds between false signals; -1 disables false signals.",
+  )
   parser.add_argument("--alpha", type=float, default=0.05, help="Multiplier for extracted SVM normal vector")
-  parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducible injection masks")
 
   parser.add_argument(
     "--classifier-dir",
@@ -501,11 +533,10 @@ def main() -> None:
     generate_random_vector(
       root_dir=args.root_dir,
       layer=int(args.layer),
-      prob=float(args.prob),
+      expectation=float(args.expectation),
       alpha=float(args.alpha),
       classifier_dir=args.classifier_dir,
       classifier_path=args.classifier_path,
-      seed=int(args.seed),
     )
     return
 
@@ -513,14 +544,14 @@ def main() -> None:
     inference_with_steering(
       root_dir=args.root_dir,
       layer=int(args.layer),
-      prob=float(args.prob),
+      expectation=float(args.expectation),
     )
     return
 
   evaluate_results(
     root_dir=args.root_dir,
     layer=int(args.layer),
-    prob=float(args.prob),
+    expectation=float(args.expectation),
     question=str(args.question),
     judge_model=str(args.judge_model),
   )
