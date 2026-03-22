@@ -2602,6 +2602,15 @@ def main() -> None:
             "for layers 0..31."
         ),
     )
+    group.add_argument(
+        "--plot-attention-by-subseqent-token-heatmap",
+        type=str,
+        metavar="ROOT_DIR",
+        help=(
+            "Plot layer-vs-token-offset heatmap of future-token attention to each token, "
+            "anchored at interrupt_start from ROOT_DIR/*/input_timing.json and output_hidden(.pt)."
+        ),
+    )
 
     # Shared inference options (used by --gen-*)
     ap.add_argument("--device", type=str, default="cuda")
@@ -2767,6 +2776,12 @@ def main() -> None:
 
     elif args.plot_logit_lens_heatmap:
         logit_lens_heatmap(args.plot_logit_lens_heatmap)
+
+    elif args.plot_attention_by_subseqent_token_heatmap:
+        plot_attention_by_subseqent_token_heatmap(
+            root_dir=args.plot_attention_by_subseqent_token_heatmap,
+            span=max(1, int(args.window)),
+        )
 
 
 if __name__ == "__main__":
