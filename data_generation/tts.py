@@ -162,51 +162,33 @@ def mode_class_dataset_tts(dataset_path: str, answer_time: float = 10.0) -> None
 
     print(f"\nDone. Generated audio for {len(input_files)} entries.")
 
-def user_interrupt_dataset_tts(dataset_path: str, initial_silence: float = 0.0, no_interrupt: bool = False) -> None:
-    """
-    take dataset path as arg for reference the dataset would be somethign like /home/penguinfish/personaplex/Full-Duplex-Bench/data/user_interrupt/interrupt_dataset
-    in each json you have
-    {
-    "initial_silence": 3.0,
-    "question_1": "Can you explain how the internet works from home routers to global data centers?",
-    "response_duration_1": 6.261823826770641,
-    "question_2": "goat is a building for people to live in, is this information correct?",
-    "question_2_starting_word": "goat",
-    "question_2_describing_word": "house",
-    "question_2_consistent": false,
-    "question_2_answer": false,
-    "response_duration_2": 15.0
-    }
-    you synthesize input.wav that contains these in time order with the following structure:
-    1) initial_silence seconds of silence (if >0, otherwise skip)
-    2) question_1
-    3) response_duration_1 seconds of silence
-    4) question_2
-    5) response_duration_2 seconds of silence
-    and save the results input.wav to the same dir as <root>/*/user_interrupt_text.json
+def user_interrupt_dataset_tts(
+    dataset_path: str,
+    initial_silence: float = 0.0,
+    no_interrupt: bool = False,
+    question_1_only: bool = False,
+) -> None:
+    """Generate input.wav for user interruption datasets.
 
-    
-    """
-    """
-    Update this function so that when no_interrupt is true only syntheize:
-   1) initial_silence seconds of silence (if >0, otherwise skip)
-    4) question_2
-    5) response_duration_2 seconds of silence
-    and save the results input.wav to the same dir as <root>/*/user_interrupt_text.json
-
-    save conversation_time.json under <dataset_path>/*/ with the following structure:
-    {
-        "Q1_start": initial_silence,
-        "Q1_end": initial_silence + duration of question_1 audio,
-        "Q2_start": Q1_end + response_duration_1,
-        "Q2_end": Q2_start + duration of question_2 audio
-    }
+    Modes:
+    - default: initial_silence + question_1 + response_duration_1 silence +
+      question_2 + response_duration_2 silence
+    - no_interrupt=True: question_2-only timeline
+      (initial_silence + question_2 + response_duration_2 silence)
+    - question_1_only=True: question_1-only timeline
+      (initial_silence + question_1 + response_duration_1 silence)
     """
     import scipy.io.wavfile as wavfile
 
+    if no_interrupt and question_1_only:
+        raise ValueError("no_interrupt and question_1_only are mutually exclusive")
+
     pattern_a = os.path.join(dataset_path, "*", "user_interrupts_text.json")
     pattern_b = os.path.join(dataset_path, "*", "user_interrupt_text.json")
-    input_files = sorted(set(glob.glob(pattern_a) + glob.glob(pattern_b)), key=lambda p: os.path.basename(os.path.dirname(p)))
+    input_files = sorted(
+        set(glob.glob(pattern_a) + glob.glob(pattern_b)),
+        key=lambda p: os.path.basename(os.path.dirname(p)),
+    )
 
     if not input_files:
         print(f"No user interrupt JSON files found under {dataset_path}/*/")
@@ -222,37 +204,54 @@ def user_interrupt_dataset_tts(dataset_path: str, initial_silence: float = 0.0, 
         with open(input_json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
+        q1 = data["question_1"]
         q2 = data["question_2"]
         entry_initial_silence = float(data.get("initial_silence", initial_silence))
-        response_duration_2 = float(data["response_duration_2"])
         response_duration_1 = float(data.get("response_duration_1", 0.0))
-
-        if not no_interrupt:
-            q1 = data["question_1"]
+        response_duration_2 = float(data["response_duration_2"])
 
         q1_wav = os.path.join(entry_dir, "_q1_tmp.wav")
         q2_wav = os.path.join(entry_dir, "_q2_tmp.wav")
         output_wav = os.path.join(entry_dir, "input.wav")
 
         print(f"\n--- Entry {entry_id} ---")
-        tts.synthesize(f"[S1]{q2}", q2_wav)
+        tmp_wavs: list[str] = []
 
-        tmp_wavs = [q2_wav]
-        if not no_interrupt:
+        if question_1_only:
             tts.synthesize(f"[S1]{q1}", q1_wav)
             tmp_wavs.append(q1_wav)
 
-        sr2, q2_audio = wavfile.read(q2_wav)
-        q2_audio = np.asarray(q2_audio)
-        q2_duration_sec = float(q2_audio.shape[0]) / float(sr2)
+            sr1, q1_audio = wavfile.read(q1_wav)
+            q1_audio = np.asarray(q1_audio)
+            q1_duration_sec = float(q1_audio.shape[0]) / float(sr1)
 
-        if no_interrupt:
-            # In no_interrupt mode, question 1 is omitted from the waveform timeline.
-            q1_duration_sec = 0.0
+            if q1_audio.ndim == 1:
+                shape_initial = (int(max(0.0, entry_initial_silence) * sr1),)
+                shape_end = (int(max(0.0, response_duration_1) * sr1),)
+            else:
+                channels = int(q1_audio.shape[-1])
+                shape_initial = (int(max(0.0, entry_initial_silence) * sr1), channels)
+                shape_end = (int(max(0.0, response_duration_1) * sr1), channels)
+
+            initial_pad = np.zeros(shape_initial, dtype=q1_audio.dtype)
+            end_pad = np.zeros(shape_end, dtype=q1_audio.dtype)
+            combined = np.concatenate([initial_pad, q1_audio, end_pad], axis=0)
+            wavfile.write(output_wav, sr1, combined)
+            print(f"Saved {output_wav} (question_1_only=True)")
+
             q1_start = float(max(0.0, entry_initial_silence))
-            q1_end = q1_start
-            q2_start = q1_end
-            q2_end = q2_start + q2_duration_sec
+            q1_end = q1_start + q1_duration_sec
+            q2_start = q1_end + float(max(0.0, response_duration_1))
+            q2_end = q2_start
+
+        elif no_interrupt:
+            # no_interrupt means question_2-only timeline.
+            tts.synthesize(f"[S1]{q2}", q2_wav)
+            tmp_wavs.append(q2_wav)
+
+            sr2, q2_audio = wavfile.read(q2_wav)
+            q2_audio = np.asarray(q2_audio)
+            q2_duration_sec = float(q2_audio.shape[0]) / float(sr2)
 
             if q2_audio.ndim == 1:
                 shape_initial = (int(max(0.0, entry_initial_silence) * sr2),)
@@ -266,8 +265,22 @@ def user_interrupt_dataset_tts(dataset_path: str, initial_silence: float = 0.0, 
             end_pad = np.zeros(shape_end, dtype=q2_audio.dtype)
             combined = np.concatenate([initial_pad, q2_audio, end_pad], axis=0)
             wavfile.write(output_wav, sr2, combined)
-            print(f"Saved {output_wav} (no_interrupt=True)")
+            print(f"Saved {output_wav} (no_interrupt=True => question_2 only)")
+
+            q1_start = float(max(0.0, entry_initial_silence))
+            q1_end = q1_start
+            q2_start = q1_end
+            q2_end = q2_start + q2_duration_sec
+
         else:
+            tts.synthesize(f"[S1]{q2}", q2_wav)
+            tts.synthesize(f"[S1]{q1}", q1_wav)
+            tmp_wavs.extend([q2_wav, q1_wav])
+
+            sr2, q2_audio = wavfile.read(q2_wav)
+            q2_audio = np.asarray(q2_audio)
+            q2_duration_sec = float(q2_audio.shape[0]) / float(sr2)
+
             sr1, q1_audio = wavfile.read(q1_wav)
             q1_audio = np.asarray(q1_audio)
             q1_duration_sec = float(q1_audio.shape[0]) / float(sr1)
@@ -275,7 +288,9 @@ def user_interrupt_dataset_tts(dataset_path: str, initial_silence: float = 0.0, 
                 raise ValueError(f"Sample rate mismatch for entry {entry_id}: q1={sr1}, q2={sr2}")
 
             if q1_audio.ndim != q2_audio.ndim:
-                raise ValueError(f"Channel mismatch for entry {entry_id}: q1 ndim={q1_audio.ndim}, q2 ndim={q2_audio.ndim}")
+                raise ValueError(
+                    f"Channel mismatch for entry {entry_id}: q1 ndim={q1_audio.ndim}, q2 ndim={q2_audio.ndim}"
+                )
             if q1_audio.ndim == 2 and q1_audio.shape[-1] != q2_audio.shape[-1]:
                 raise ValueError(
                     f"Channel count mismatch for entry {entry_id}: q1={q1_audio.shape[-1]}, q2={q2_audio.shape[-1]}"

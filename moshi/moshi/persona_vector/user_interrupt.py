@@ -489,7 +489,6 @@ def _compute_attention_mapped_steering_vector_single_layer(root_dir, classifier_
 
     print(f"[user_interrupt] Done. Updated attention-mapped steering vectors for {updated} items at {root_dir}")
 
-
 def compute_attention_mapped_steering_vector(
     root_dir: str,
     classifier_dir: str,
@@ -507,7 +506,6 @@ def compute_attention_mapped_steering_vector(
             decay_span=decay_span,
             alpha=alpha,
         )
-
 
 def compute_attention_mapped_steering_vector_average(
     root_dir: str,
@@ -663,7 +661,6 @@ def compute_attention_mapped_steering_vector_average(
         f"{updated} items at {root_dir}"
     )
 
-
 def get_rope_matrix(
     n: int,
     head_dim: int,
@@ -809,7 +806,6 @@ def _compute_attention_mapped_steering_vector(
 
     return v_opt.reshape(1, -1).to(device=original_device, dtype=W_q_weights.dtype)
 
-
 def _compute_attention_mapped_steering_vector_simple(
     H_s: torch.Tensor,        # [N_s, d_model] - Speaking mode hidden states
     H_l: torch.Tensor,        # [N_l, d_model] - Listening mode hidden states
@@ -889,7 +885,6 @@ def _compute_attention_mapped_steering_vector_simple(
     print(f"[Math Engine] final cos(v_opt, mu_s-mu_l): {cos_vopt_mu:.6f}")
 
     return v_opt.reshape(1, -1).to(device=original_device, dtype=torch.float32)
-
 
 def _calculate_steering_vector_single_layer(root_dir, classifier_path, decay_span, alpha):
     """At interrupt_start, we calculate the steering vector with length alpha, 
@@ -1031,7 +1026,6 @@ def _calculate_steering_vector_single_layer(root_dir, classifier_path, decay_spa
         updated += 1
 
     print(f"[user_interrupt] Done. Updated steering vectors for {updated} items at {root_dir}")
-
 
 def calculate_steering_vector(
     root_dir: str,
