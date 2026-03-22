@@ -1426,6 +1426,157 @@ def plot_attention_heatmap_dataset(
 
     print(f"\n[plot-attn] Done. Generated {ok}/{len(hidden_files)} plots.")
 
+def plot_attention_by_subseqent_token_heatmap(root_dir: str, span: int = 50):
+    """
+    Plot attention heatmaps for each subsequence token.
+
+    The plot
+    - X-axis: tokens. start from the token at interrupt_start as indicated in input_timing.json, to that token + span
+    - Y-axis: layers of transformer
+    For the value of each cell, let's say token t at layer l, it should be the average attention weight of all the tokens AFTER token t,
+    which is the average attention weight of t+1, t+2, ... to the end of the sequence, attending to token t at layer l. This way we can see 
+    how the attention to a specific token evolves as more tokens are generated after it.
+    
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    root = Path(root_dir)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Root directory not found: {root}")
+    if span < 1:
+        raise ValueError(f"span must be >= 1, got {span}")
+
+    sample_dirs = sorted([p for p in root.iterdir() if p.is_dir()])
+    if not sample_dirs:
+        raise FileNotFoundError(f"No sample directories found under {root}")
+
+    def _build_attn_prob_matrix(payload: Dict[str, Any], layer_idx: int) -> np.ndarray:
+        attn_steps = payload.get("text_attention_weights", None)
+        if not isinstance(attn_steps, list) or len(attn_steps) == 0:
+            raise KeyError("Missing non-empty text_attention_weights in payload")
+
+        T = len(attn_steps)
+        mat = np.full((T, T), np.nan, dtype=np.float32)
+        for q, entry in enumerate(attn_steps):
+            if entry is None:
+                continue
+            if not isinstance(entry, torch.Tensor) or entry.ndim != 3:
+                continue
+
+            # entry[layer_idx]: [H, K_q], mean over heads -> [K_q]
+            vec = entry[layer_idx].float().mean(dim=0).detach().cpu().numpy().astype(np.float32)
+            if vec.ndim != 1:
+                continue
+
+            # Align only generated-token keys (causal window) into columns [0..q]
+            use_len = min(vec.shape[0], q + 1)
+            if use_len > 0:
+                mat[q, q - use_len + 1 : q + 1] = vec[-use_len:]
+        return mat
+
+    # Collect per-sample matrices: [L, span+1]
+    sample_maps: List[np.ndarray] = []
+    num_layers_ref: Optional[int] = None
+
+    for sd in sample_dirs:
+        timing_path = sd / "input_timing.json"
+        hidden_path = sd / "output_hidden.pt"
+        if not hidden_path.exists():
+            hidden_path = sd / "output_hidden"
+        if not timing_path.is_file() or not hidden_path.is_file():
+            continue
+
+        try:
+            with timing_path.open("r", encoding="utf-8") as f:
+                timing = json.load(f)
+            if not isinstance(timing, dict) or "interrupt_start" not in timing:
+                continue
+
+            payload = _load_hidden_payload(str(hidden_path))
+            frame_rate_hz = float(payload.get("frame_rate", 12.5))
+            anchor_tok = int(round(float(timing["interrupt_start"]) * frame_rate_hz))
+            if anchor_tok < 0:
+                continue
+
+            attn_steps = payload.get("text_attention_weights", None)
+            if not isinstance(attn_steps, list) or len(attn_steps) == 0:
+                continue
+            first_attn = next((a for a in attn_steps if isinstance(a, torch.Tensor)), None)
+            if first_attn is None or first_attn.ndim != 3:
+                continue
+
+            L = int(first_attn.shape[0])
+            if num_layers_ref is None:
+                num_layers_ref = L
+            elif num_layers_ref != L:
+                # Keep a consistent layer dimension across samples.
+                continue
+
+            T = len(attn_steps)
+            local = np.full((L, span + 1), np.nan, dtype=np.float32)
+            for l in range(L):
+                mat = _build_attn_prob_matrix(payload, l)  # [T, T]
+                for off in range(span + 1):
+                    t = anchor_tok + off
+                    if t < 0 or t >= T - 1:
+                        continue
+                    # Average of future queries (t+1..T-1) attending to key token t.
+                    vals = mat[t + 1 :, t]
+                    finite = vals[np.isfinite(vals)]
+                    if finite.size > 0:
+                        local[l, off] = float(np.mean(finite))
+
+            sample_maps.append(local)
+        except Exception:
+            continue
+
+    if not sample_maps:
+        raise FileNotFoundError(
+            "No valid samples found with input_timing.json (interrupt_start) and output_hidden(.pt)."
+        )
+
+    heat = np.nanmean(np.stack(sample_maps, axis=0), axis=0)  # [L, span+1]
+    L = int(heat.shape[0])
+
+    finite = heat[np.isfinite(heat)]
+    if finite.size > 0:
+        vmin = float(np.percentile(finite, 5.0))
+        vmax = float(np.percentile(finite, 95.0))
+        if vmax <= vmin:
+            vmax = vmin + 1e-6
+    else:
+        vmin, vmax = 0.0, 1.0
+
+    x = np.arange(0, span + 1, dtype=np.int32)
+    fig, ax = plt.subplots(figsize=(11.0, 6.2), dpi=180)
+    img = ax.imshow(
+        heat,
+        aspect="auto",
+        interpolation="nearest",
+        origin="lower",
+        cmap="viridis",
+        vmin=vmin,
+        vmax=vmax,
+        extent=(float(x[0]), float(x[-1]), -0.5, float(L) - 0.5),
+    )
+    cbar = fig.colorbar(img, ax=ax)
+    cbar.set_label("Avg future attention weight to token t")
+
+    ax.set_title(
+        f"Attention to Subsequent Tokens (anchor=interrupt_start, span={span}, n={len(sample_maps)})"
+    )
+    ax.set_xlabel("Token offset from interrupt_start")
+    ax.set_ylabel("Layer")
+    ax.set_yticks(np.arange(0, L, 1))
+    ax.set_ylim(-0.5, float(L) - 0.5)
+
+    out_png = root / "attention_by_subsequent_token_heatmap.png"
+    fig.tight_layout()
+    fig.savefig(out_png, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot-attn-subseq] Saved {out_png}")
+
 def plot_logit_lens_step_n(
     hidden_path: str,
     output_path: str,
