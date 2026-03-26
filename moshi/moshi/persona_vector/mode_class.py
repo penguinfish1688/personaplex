@@ -1443,6 +1443,7 @@ def plot_attention_by_subseqent_token_heatmap(
     
     """
     import matplotlib.pyplot as plt
+    from matplotlib import ticker as mticker
     import numpy as np
 
     root = Path(root_dir)
@@ -1604,7 +1605,7 @@ def plot_attention_by_subseqent_token_heatmap(
         extent=(float(x[0]), float(x[-1]), -0.5, float(L) - 0.5),
     )
     cbar = fig.colorbar(img, ax=ax)
-    cbar.set_label("Avg future attention weight to token t")
+    cbar.set_label("Avg future attention weight to token t (vmin=P5, vmax=P95)")
 
     ax.set_title(
         f"Attention to Subsequent Tokens (anchor=interrupt_start, span={span}, n={len(sample_maps)})"
@@ -1726,6 +1727,7 @@ def plot_logit_lens_step_n(
             logits0[:-1],
             user_audio_target[1:].to(device=device, dtype=torch.long),
         )
+
         # Model-focus CE remains step-aligned with n on the same valid plotted range [0..T-2].
         model_audio_ce = _ce_from_probs(
             logits0[:-1],
