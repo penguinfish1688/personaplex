@@ -430,10 +430,71 @@ def trait_tts(trait: str, type: str = "extract"):
     print(f"\nCompleted! Audio files and JSON saved to: {output_dir}")
     return output_dir
 
+def kv_cache_dataset_tts(dataset_path: str) -> None:
+    """
+    Generate per-question TTS wav files for KV-cache datasets.
+
+    For each entry under ``dataset_path/*/`` containing either
+    ``user_interrupt_text.json`` or ``user_interrupts_text.json``, this
+    function synthesizes:
+    - ``input_question1.wav`` from ``question_1``
+    - ``input_question2.wav`` from ``question_2``
+    """
+    pattern_a = os.path.join(dataset_path, "*", "user_interrupt_text.json")
+    pattern_b = os.path.join(dataset_path, "*", "user_interrupts_text.json")
+    input_files = sorted(
+        set(glob.glob(pattern_a) + glob.glob(pattern_b)),
+        key=lambda p: os.path.basename(os.path.dirname(p)),
+    )
+
+    if not input_files:
+        print(f"No user interrupt JSON files found under {dataset_path}/*/")
+        return
+
+    tts = TTS()
+    print(f"Found {len(input_files)} entries in {dataset_path}")
+
+    generated_count = 0
+    skipped_count = 0
+
+    for input_json_path in input_files:
+        entry_dir = os.path.dirname(input_json_path)
+        entry_id = os.path.basename(entry_dir)
+        print(f"\n--- Entry {entry_id} ---")
+
+        with open(input_json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        q1 = data.get("question_1")
+        q2 = data.get("question_2")
+
+        if not q1 or not q2:
+            print(
+                f"Skipping entry {entry_id}: missing question_1 or question_2 in {os.path.basename(input_json_path)}"
+            )
+            skipped_count += 1
+            continue
+
+        q1_out = os.path.join(entry_dir, "input_question1.wav")
+        q2_out = os.path.join(entry_dir, "input_question2.wav")
+
+        tts.synthesize(f"[S1]{q1}", q1_out)
+        tts.synthesize(f"[S1]{q2}", q2_out)
+
+        generated_count += 1
+        print(f"Saved {q1_out}")
+        print(f"Saved {q2_out}")
+
+    print(
+        f"\nDone. Generated input_question1.wav/input_question2.wav for {generated_count} entries"
+        f" (skipped {skipped_count})."
+    )
+
 if __name__ == "__main__":
     # Examples:
     #   python tts.py --trait evil
     #   python tts.py --mode-class /path/to/mode_class --answer-time 10
+    #   python tts.py --kv-cache /path/to/kv_cache_dataset
     #   python tts.py --synthesize "[S1]Hello world" --output out.wav
     parser = argparse.ArgumentParser(description="Dia2 TTS - Text to Speech Synthesis")
 
@@ -445,6 +506,8 @@ if __name__ == "__main__":
                        help="Trait name for batch processing (e.g., 'evil', 'optimistic')")
     group.add_argument("--mode-class", type=str, dest="mode_class",
                        help="Path to mode-class dataset dir (e.g., Full-Duplex-Bench/data/mode_class)")
+    group.add_argument("--kv-cache", type=str, dest="kv_cache",
+                       help="Path to KV-cache dataset dir (contains */user_interrupt_text.json)")
 
     # Shared arguments
     parser.add_argument("--model", type=str, default="nari-labs/Dia2-2B",
@@ -479,3 +542,5 @@ if __name__ == "__main__":
         trait_tts(args.trait, args.type)
     elif args.mode_class:
         mode_class_dataset_tts(args.mode_class, answer_time=args.answer_time)
+    elif args.kv_cache:
+        kv_cache_dataset_tts(args.kv_cache)
