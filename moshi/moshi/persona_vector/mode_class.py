@@ -14,6 +14,7 @@ CLI (``python -m moshi.persona_vector.mode_class``):
     --gen-dataset-hidden <dataset_path>
     --gen-sentence-hidden <wav_path> --output <path>
     --train-mode-classifier <dataset_path> --output <dir> [--layer L]
+    --save-mean-hidden-diff <root_dir>
     --predict-mode <hidden.pt> --model <model.pt> --output <out.json>
     --plot-prediction <prediction.json> --hidden <hidden.pt> --output <out.png>
     --plot-attention-heatmap-dataset <root_dir> [--layer L]
@@ -603,6 +604,133 @@ def extract_normal_vector(mode_path):
         raise ValueError(f"Extracted empty normal vector from checkpoint: {mode_path}")
 
     return normal.numpy()
+
+
+def save_mean_hidden_diff(root_dir: str, output_path: Optional[str] = None) -> str:
+    """Compute per-layer speaking/listening mean-hidden difference.
+
+    Reads ``root_dir/*/input.json`` and matching hidden payload files:
+      - ``complete_sentence_hidden.pt`` with ``complete_modes`` labels
+      - ``incomplete_sentence_hidden.pt`` with ``incomplete_modes`` labels
+
+    For each layer ``l``, computes:
+      ``mean_speaking(l) - mean_listening(l)``
+
+    Saves JSON to ``root_dir/mean_hidden_diff.json`` by default with schema:
+      ``{"0": [...], "1": [...], ..., "31": [...]}``
+
+    Returns:
+        Path to the saved JSON file.
+    """
+    pattern = os.path.join(root_dir, "*", "input.json")
+    entries = sorted(
+        glob(pattern),
+        key=lambda p: int(os.path.basename(os.path.dirname(p))),
+    )
+    if not entries:
+        raise FileNotFoundError(f"No input.json found under {root_dir}/*/")
+
+    speaking_sum: Optional[torch.Tensor] = None  # [L, D]
+    listening_sum: Optional[torch.Tensor] = None  # [L, D]
+    speaking_count: int = 0
+    listening_count: int = 0
+
+    for entry_json in entries:
+        entry_dir = os.path.dirname(entry_json)
+        with open(entry_json, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+
+        sample_specs = [
+            ("complete_sentence_hidden.pt", "complete_modes"),
+            ("incomplete_sentence_hidden.pt", "incomplete_modes"),
+        ]
+
+        for hidden_name, mode_key in sample_specs:
+            hidden_path = os.path.join(entry_dir, hidden_name)
+            if not os.path.exists(hidden_path):
+                raise FileNotFoundError(
+                    f"Missing {hidden_path}. Run --gen-dataset-hidden first."
+                )
+            if mode_key not in meta:
+                raise KeyError(
+                    f"input.json under {entry_dir} is missing '{mode_key}'."
+                )
+
+            modes = meta[mode_key]
+            payload = _load_hidden_payload(hidden_path)
+            if "text_hidden_layers" not in payload:
+                raise KeyError(
+                    f"{hidden_path} has no 'text_hidden_layers'. "
+                    "This function expects multi-layer hidden payloads."
+                )
+
+            hidden = payload["text_hidden_layers"].float()  # [T, L, D]
+            if hidden.ndim != 3:
+                raise ValueError(
+                    f"Expected [T, L, D] in {hidden_path}, got {tuple(hidden.shape)}"
+                )
+
+            num_tokens = int(hidden.shape[0])
+            labels = _build_labels(
+                num_tokens,
+                modes["listening"],
+                modes["speaking"],
+            )
+
+            speaking_mask = labels == 1
+            listening_mask = labels == 0
+
+            if int(speaking_mask.sum()) > 0:
+                speak_chunk = hidden[speaking_mask].sum(dim=0).detach().cpu()  # [L, D]
+                if speaking_sum is None:
+                    speaking_sum = torch.zeros_like(speak_chunk)
+                if speaking_sum.shape != speak_chunk.shape:
+                    raise ValueError(
+                        f"Layer/dim mismatch in {hidden_path}: "
+                        f"expected {tuple(speaking_sum.shape)}, got {tuple(speak_chunk.shape)}"
+                    )
+                speaking_sum += speak_chunk
+                speaking_count += int(speaking_mask.sum())
+
+            if int(listening_mask.sum()) > 0:
+                listen_chunk = hidden[listening_mask].sum(dim=0).detach().cpu()  # [L, D]
+                if listening_sum is None:
+                    listening_sum = torch.zeros_like(listen_chunk)
+                if listening_sum.shape != listen_chunk.shape:
+                    raise ValueError(
+                        f"Layer/dim mismatch in {hidden_path}: "
+                        f"expected {tuple(listening_sum.shape)}, got {tuple(listen_chunk.shape)}"
+                    )
+                listening_sum += listen_chunk
+                listening_count += int(listening_mask.sum())
+
+    if speaking_sum is None or listening_sum is None:
+        raise RuntimeError("Insufficient labels: no speaking/listening tokens were collected.")
+    if speaking_count <= 0 or listening_count <= 0:
+        raise RuntimeError(
+            f"Invalid token counts: speaking={speaking_count}, listening={listening_count}."
+        )
+
+    speaking_mean = speaking_sum / float(speaking_count)  # [L, D]
+    listening_mean = listening_sum / float(listening_count)  # [L, D]
+    diff = speaking_mean - listening_mean  # [L, D]
+
+    out = output_path or os.path.join(root_dir, "mean_hidden_diff.json")
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+
+    diff_dict: Dict[str, List[float]] = {
+        str(layer_idx): diff[layer_idx].tolist()
+        for layer_idx in range(diff.shape[0])
+    }
+
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(diff_dict, f, indent=2, ensure_ascii=False)
+
+    print(
+        f"[mean-hidden-diff] Saved {diff.shape[0]} layers to {out} "
+        f"(speaking_tokens={speaking_count}, listening_tokens={listening_count})"
+    )
+    return out
 
 # ---------------------------------------------------------------------------
 # Plotting
@@ -2589,6 +2717,15 @@ def main() -> None:
         help="Train the mode classifier on a mode-class dataset.",
     )
     group.add_argument(
+        "--save-mean-hidden-diff",
+        type=str,
+        metavar="ROOT_DIR",
+        help=(
+            "Compute per-layer (mean speaking hidden - mean listening hidden) "
+            "from ROOT_DIR/*/input.json labels and save ROOT_DIR/mean_hidden_diff.json."
+        ),
+    )
+    group.add_argument(
         "--predict-mode",
         type=str,
         metavar="HIDDEN_PT",
@@ -2754,6 +2891,12 @@ def main() -> None:
             layer=args.layer,
             epochs=args.epochs,
             lr=args.lr,
+        )
+
+    elif args.save_mean_hidden_diff:
+        save_mean_hidden_diff(
+            root_dir=args.save_mean_hidden_diff,
+            output_path=args.output,
         )
 
     elif args.predict_mode:
