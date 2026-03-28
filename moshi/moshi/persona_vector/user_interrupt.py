@@ -1044,6 +1044,198 @@ def calculate_steering_vector(
             alpha=alpha,
         )
 
+
+def _load_mean_hidden_diff_vectors(mean_hidden_diff_path: Path) -> dict[int, torch.Tensor]:
+    """Load mean-hidden-diff vectors from JSON as {layer: tensor[D]}.
+
+    Expected JSON format:
+      {"0": [...], "1": [...], ..., "31": [...]}.
+    """
+    if not mean_hidden_diff_path.exists():
+        raise FileNotFoundError(
+            f"mean_hidden_diff.json not found: {mean_hidden_diff_path}"
+        )
+
+    with mean_hidden_diff_path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"Expected dict in {mean_hidden_diff_path}, got {type(payload).__name__}"
+        )
+
+    vectors: dict[int, torch.Tensor] = {}
+    for key, value in payload.items():
+        try:
+            layer = int(key)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid layer key '{key}' in {mean_hidden_diff_path}; expected integer-like keys"
+            ) from exc
+        if not _is_valid_main_layer(layer):
+            continue
+        if not isinstance(value, list):
+            raise ValueError(
+                f"Layer {layer} in {mean_hidden_diff_path} must be a list, got {type(value).__name__}"
+            )
+        vec = torch.as_tensor(value, dtype=torch.float32).reshape(-1)
+        if vec.numel() == 0:
+            raise ValueError(f"Layer {layer} vector is empty in {mean_hidden_diff_path}")
+        vectors[layer] = vec
+
+    if not vectors:
+        raise RuntimeError(
+            f"No valid layer vectors found in {mean_hidden_diff_path}. "
+            f"Expected layer keys in [{MAIN_LAYER_MIN}..{MAIN_LAYER_MAX}]."
+        )
+    return vectors
+
+
+def _calculate_steering_vector_mean_diff_single_layer(
+    root_dir: str,
+    mean_hidden_diff: torch.Tensor,
+    layer: int,
+    decay_span: int,
+    alpha: float,
+) -> None:
+    """Generate steering vectors for one layer from mean-hidden-diff source.
+
+    Source vector is normalized to unit norm then scaled to ``alpha``.
+    Everything else follows ``_calculate_steering_vector_single_layer`` behavior.
+    """
+    token_rate_hz = 12.5
+    root = Path(root_dir)
+    layer = int(layer)
+
+    if decay_span < 0:
+        raise ValueError(f"decay_span must be >= 0, got {decay_span}")
+    if not _is_valid_main_layer(layer):
+        raise ValueError(f"Invalid layer {layer}; expected [{MAIN_LAYER_MIN}..{MAIN_LAYER_MAX}]")
+
+    base = torch.as_tensor(mean_hidden_diff, dtype=torch.float32).reshape(-1)
+    if base.numel() == 0:
+        raise ValueError(f"Layer {layer} mean-hidden-diff vector is empty")
+    base_norm = torch.norm(base).item()
+    if base_norm <= 0.0:
+        raise ValueError(f"Layer {layer} mean-hidden-diff vector has zero norm")
+    # Normalize to unit length first, then shrink/scale to alpha.
+    base_vector = (base / base_norm) * float(alpha)
+    layer_key = f"layer_{layer}"
+
+    input_paths = [p for p in root.glob("*/input.wav") if p.is_file()]
+    input_paths.sort(key=lambda p: int(p.parent.name) if p.parent.name.isdigit() else p.parent.name)
+    if not input_paths:
+        raise FileNotFoundError(f"No files matched pattern {root_dir}/*/input.wav")
+
+    def _wav_duration_seconds(wav_path: Path) -> float:
+        try:
+            with wave.open(str(wav_path), "rb") as wf:
+                nframes = wf.getnframes()
+                framerate = wf.getframerate()
+            if framerate <= 0:
+                raise ValueError(f"Invalid sample rate in WAV: {wav_path}")
+            return float(nframes) / float(framerate)
+        except wave.Error:
+            # Some WAV encodings are not supported by stdlib wave; fall back to soundfile.
+            import soundfile as sf
+
+            info = sf.info(str(wav_path))
+            if info.samplerate <= 0:
+                raise ValueError(f"Invalid sample rate in WAV: {wav_path}")
+            return float(info.frames) / float(info.samplerate)
+
+    updated = 0
+    for input_wav in input_paths:
+        entry_dir = input_wav.parent
+        timing_path = entry_dir / "input_timing.json"
+        if not timing_path.exists():
+            raise FileNotFoundError(f"Missing timing file: {timing_path}")
+
+        with timing_path.open("r", encoding="utf-8") as f:
+            timing_payload = json.load(f)
+        if not isinstance(timing_payload, dict):
+            raise ValueError(f"Expected dict in {timing_path}, got {type(timing_payload)}")
+        if "interrupt_start" not in timing_payload:
+            raise KeyError(f"Missing 'interrupt_start' in {timing_path}")
+
+        interrupt_start = float(timing_payload["interrupt_start"])
+        duration_s = _wav_duration_seconds(input_wav)
+        total_tokens = int(math.ceil(duration_s * token_rate_hz))
+        if total_tokens <= 0:
+            raise ValueError(
+                f"Computed non-positive token count for {input_wav}: duration={duration_s:.6f}s"
+            )
+
+        start_idx = int(interrupt_start * token_rate_hz)
+        start_idx = max(0, min(start_idx, total_tokens - 1))
+
+        layer_payload: dict[str, Optional[list[float]]] = {
+            str(i): None for i in range(total_tokens)
+        }
+
+        layer_payload[str(start_idx)] = base_vector.tolist()
+
+        for k in range(1, int(decay_span) + 1):
+            token_idx = start_idx + k
+            if token_idx >= total_tokens:
+                break
+            decay_factor = 1.0 - (float(k) / float(decay_span)) if decay_span > 0 else 0.0
+            if decay_factor <= 0.0:
+                layer_payload[str(token_idx)] = None
+                continue
+            vec = (base_vector * float(decay_factor)).tolist()
+            layer_payload[str(token_idx)] = vec
+
+        steering_path = entry_dir / "steering_vector.json"
+        existing = _load_existing_steering_payload(steering_path)
+        existing[layer_key] = layer_payload
+        _atomic_write_json(steering_path, existing)
+
+        non_null = sum(1 for v in layer_payload.values() if v is not None)
+        print(
+            f"[user_interrupt] {entry_dir.name}: wrote {steering_path.name} {layer_key} "
+            f"(tokens={total_tokens}, start_idx={start_idx}, non_null={non_null})"
+        )
+        updated += 1
+
+    print(
+        f"[user_interrupt] Done. Updated mean-diff steering vectors for layer {layer} "
+        f"in {updated} items at {root_dir}"
+    )
+
+
+def calculate_steering_vector_mean_diff(
+    root_dir: str,
+    classifier_dir: str,
+    layers: list[int],
+    decay_span: int,
+    alpha: float,
+) -> None:
+    """Generate steering vectors from classifier_dir/mean_hidden_diff.json.
+
+    Diff vectors are normalized to unit norm and then scaled to ``alpha``.
+    """
+    mean_hidden_diff_path = Path(classifier_dir) / "mean_hidden_diff.json"
+    vectors = _load_mean_hidden_diff_vectors(mean_hidden_diff_path)
+    resolved_layers = _resolve_requested_layers(layers, list(vectors.keys()))
+
+    expected_dim: Optional[int] = None
+    for layer in resolved_layers:
+        vec = vectors[layer]
+        if expected_dim is None:
+            expected_dim = int(vec.numel())
+        elif int(vec.numel()) != int(expected_dim):
+            raise ValueError(
+                f"Vector dim mismatch in {mean_hidden_diff_path}: "
+                f"layer {layer} has {int(vec.numel())}, expected {expected_dim}"
+            )
+        _calculate_steering_vector_mean_diff_single_layer(
+            root_dir=root_dir,
+            mean_hidden_diff=vec,
+            layer=layer,
+            decay_span=decay_span,
+            alpha=alpha,
+        )
+
 def inference_with_steering(
         root_dir,
         inject_layers,
@@ -1439,6 +1631,14 @@ def main() -> None:
         help="Generate/Update root-dir/*/steering_vector.json from input_timing.json and classifier.",
     )
     mode_group.add_argument(
+        "--generate-steering-vectors-mean-diff",
+        action="store_true",
+        help=(
+            "Generate/Update root-dir/*/steering_vector.json from classifier-dir/mean_hidden_diff.json. "
+            "Each layer vector is normalized to length 1 and then scaled by --alpha."
+        ),
+    )
+    mode_group.add_argument(
         "--generate-steering-vectors-optimized",
         action="store_true",
         help="Generate/Update root-dir/*/steering_vector.json using attention-optimized steering vectors.",
@@ -1565,6 +1765,18 @@ def main() -> None:
         if args.classifier_dir is None:
             parser.error("--generate-steering-vectors requires --classifier-dir or --classifier-path")
         calculate_steering_vector(
+            root_dir=args.root_dir,
+            classifier_dir=args.classifier_dir,
+            layers=[int(x) for x in args.layer],
+            decay_span=args.decay_span,
+            alpha=args.alpha,
+        )
+        return
+
+    if args.generate_steering_vectors_mean_diff:
+        if args.classifier_dir is None:
+            parser.error("--generate-steering-vectors-mean-diff requires --classifier-dir")
+        calculate_steering_vector_mean_diff(
             root_dir=args.root_dir,
             classifier_dir=args.classifier_dir,
             layers=[int(x) for x in args.layer],
