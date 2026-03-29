@@ -294,10 +294,28 @@ def _extract_qk_weights_for_layer(lm: Any, layer: int) -> tuple[torch.Tensor, to
     return w_q, w_k, embed_dim
 
 
+def _apply_resume_index(input_paths: list[Path], resume: int, root_dir: str) -> list[Path]:
+    """Return dataset slice starting from the 0-based resume index."""
+    resume_idx = int(resume)
+    if resume_idx < 0:
+        raise ValueError(f"--resume must be >= 0 (0-based index), got {resume_idx}")
+    if resume_idx >= len(input_paths):
+        raise ValueError(
+            f"--resume={resume_idx} out of range for dataset size {len(input_paths)} under {root_dir}"
+        )
+    if resume_idx > 0:
+        print(
+            f"[user_interrupt] Resume enabled: skipping first {resume_idx} files, "
+            f"starting from index {resume_idx}"
+        )
+    return input_paths[resume_idx:]
+
+
 def inference(
     root_dir: str,
     save_hidden: bool = False,
     payload_target_layer: Optional[int] = None,
+    resume: int = 1,
 ) -> None:
     """
     Take root_dir as input there will be <root_dir>/*/input.wav file
@@ -309,6 +327,8 @@ def inference(
 
     if not input_paths:
         raise FileNotFoundError(f"No files matched pattern {root_dir}/*/input.wav")
+
+    input_paths = _apply_resume_index(input_paths, resume, root_dir)
 
     voice_prompt_dir = _get_voice_prompt_dir(None, loaders.DEFAULT_REPO)
     if voice_prompt_dir is None:
@@ -1242,6 +1262,7 @@ def inference_with_steering(
     offset=0,
         save_hidden=False,
         steer_attn_only: bool = False,
+        resume: int = 1,
     ) -> None:
     """
     In the root_dir/*/steering_vector.json, we have the steering vectors calculated from calculate_steering_vector() for each input.wav file.
@@ -1255,6 +1276,8 @@ def inference_with_steering(
 
     if not input_paths:
         raise FileNotFoundError(f"No files matched pattern {root_dir}/*/input.wav")
+
+    input_paths = _apply_resume_index(input_paths, resume, root_dir)
 
     voice_prompt_dir = _get_voice_prompt_dir(None, loaders.DEFAULT_REPO)
     if voice_prompt_dir is None:
@@ -1727,6 +1750,15 @@ def main() -> None:
         help="Shift steering injection target from token i to i+offset (can be negative).",
     )
     parser.add_argument(
+        "--resume",
+        type=int,
+        default=0,
+        help=(
+            "0-based dataset index to resume from for --inference and --inference-with-steering. "
+            "Example: --resume 10 skips first 10 files and starts at index 10 (the 11th file)."
+        ),
+    )
+    parser.add_argument(
         "--steer-attn-only",
         action="store_true",
         help=(
@@ -1823,6 +1855,7 @@ def main() -> None:
             offset=args.offset,
             save_hidden=args.save_hidden,
             steer_attn_only=bool(args.steer_attn_only),
+            resume=args.resume,
         )
         return
 
@@ -1837,6 +1870,7 @@ def main() -> None:
         args.root_dir,
         save_hidden=args.save_hidden,
         payload_target_layer=args.payload_target_layer,
+        resume=args.resume,
     )
 
 
