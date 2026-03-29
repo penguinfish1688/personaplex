@@ -1115,11 +1115,12 @@ def _calculate_steering_vector_mean_diff_single_layer(
     mean_hidden_diff: torch.Tensor,
     layer: int,
     decay_span: int,
-    alpha: float,
+    alpha: Optional[float],
 ) -> None:
     """Generate steering vectors for one layer from mean-hidden-diff source.
 
-    Source vector is normalized to unit norm then scaled to ``alpha``.
+    If ``alpha`` is provided, source vector is normalized to unit norm then scaled to
+    ``alpha``. If ``alpha`` is None, use raw mean diff directly (no normalization).
     Everything else follows ``_calculate_steering_vector_single_layer`` behavior.
     """
     token_rate_hz = 12.5
@@ -1135,10 +1136,15 @@ def _calculate_steering_vector_mean_diff_single_layer(
     if base.numel() == 0:
         raise ValueError(f"Layer {layer} mean-hidden-diff vector is empty")
     base_norm = torch.norm(base).item()
-    if base_norm <= 0.0:
-        raise ValueError(f"Layer {layer} mean-hidden-diff vector has zero norm")
-    # Normalize to unit length first, then shrink/scale to alpha.
-    base_vector = (base / base_norm) * float(alpha)
+    if alpha is None:
+        if base_norm <= 0.0:
+            raise ValueError(f"Layer {layer} mean-hidden-diff vector has zero norm")
+        base_vector = base
+    else:
+        if base_norm <= 0.0:
+            raise ValueError(f"Layer {layer} mean-hidden-diff vector has zero norm")
+        # Normalize to unit length first, then shrink/scale to alpha.
+        base_vector = (base / base_norm) * float(alpha)
     layer_key = f"layer_{layer}"
 
     input_paths = [p for p in root.glob("*/input.wav") if p.is_file()]
@@ -1228,11 +1234,12 @@ def calculate_steering_vector_mean_diff(
     classifier_dir: str,
     layers: list[int],
     decay_span: int,
-    alpha: float,
+    alpha: Optional[float],
 ) -> None:
     """Generate steering vectors from classifier_dir/mean_hidden_diff.json.
 
-    Diff vectors are normalized to unit norm and then scaled to ``alpha``.
+    If ``alpha`` is provided, diff vectors are normalized to unit norm and then
+    scaled to ``alpha``. If ``alpha`` is omitted, raw mean diff is used.
     """
     mean_hidden_diff_path = Path(classifier_dir) / "mean_hidden_diff.json"
     vectors = _load_mean_hidden_diff_vectors(mean_hidden_diff_path)
@@ -1724,8 +1731,12 @@ def main() -> None:
     parser.add_argument(
         "--alpha",
         type=float,
-        default=0.05,
-        help="Steering strength multiplier for steering vector generation.",
+        default=None,
+        help=(
+            "Steering strength multiplier. For --generate-steering-vectors-mean-diff: "
+            "if omitted, use raw mean diff (no normalization/scaling). For other "
+            "steering generation modes, defaults to 0.05 when omitted."
+        ),
     )
     parser.add_argument(
         "--scale",
@@ -1790,7 +1801,7 @@ def main() -> None:
                 root_dir=args.root_dir,
                 classifier_path=str(args.classifier_path),
                 decay_span=args.decay_span,
-                alpha=args.alpha,
+                alpha=0.05 if args.alpha is None else float(args.alpha),
             )
             return
 
@@ -1801,7 +1812,7 @@ def main() -> None:
             classifier_dir=args.classifier_dir,
             layers=[int(x) for x in args.layer],
             decay_span=args.decay_span,
-            alpha=args.alpha,
+            alpha=0.05 if args.alpha is None else float(args.alpha),
         )
         return
 
@@ -1813,7 +1824,7 @@ def main() -> None:
             classifier_dir=args.classifier_dir,
             layers=[int(x) for x in args.layer],
             decay_span=args.decay_span,
-            alpha=args.alpha,
+            alpha=None if args.alpha is None else float(args.alpha),
         )
         return
 
@@ -1825,7 +1836,7 @@ def main() -> None:
             classifier_dir=args.classifier_dir,
             layers=[int(x) for x in args.layer],
             decay_span=args.decay_span,
-            alpha=args.alpha,
+            alpha=0.05 if args.alpha is None else float(args.alpha),
         )
         return
 
@@ -1842,7 +1853,7 @@ def main() -> None:
             classifier_dir=args.classifier_dir,
             target_layer=int(args.layer[0]),
             decay_span=args.decay_span,
-            alpha=args.alpha,
+            alpha=0.05 if args.alpha is None else float(args.alpha),
         )
         return
 
