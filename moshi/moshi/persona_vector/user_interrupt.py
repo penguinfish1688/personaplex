@@ -1120,7 +1120,8 @@ def _calculate_steering_vector_mean_diff_single_layer(
     """Generate steering vectors for one layer from mean-hidden-diff source.
 
     If ``alpha`` is provided, source vector is normalized to unit norm then scaled to
-    ``alpha``. If ``alpha`` is None, use raw mean diff directly (no normalization).
+    ``alpha``. If ``alpha`` is None, use negative raw mean diff directly
+    (listen-speak, no normalization).
     Everything else follows ``_calculate_steering_vector_single_layer`` behavior.
     """
     token_rate_hz = 12.5
@@ -1139,7 +1140,8 @@ def _calculate_steering_vector_mean_diff_single_layer(
     if alpha is None:
         if base_norm <= 0.0:
             raise ValueError(f"Layer {layer} mean-hidden-diff vector has zero norm")
-        base_vector = base
+        # Raw mean-diff mode uses listen-speak direction.
+        base_vector = -base
     else:
         if base_norm <= 0.0:
             raise ValueError(f"Layer {layer} mean-hidden-diff vector has zero norm")
@@ -1239,7 +1241,8 @@ def calculate_steering_vector_mean_diff(
     """Generate steering vectors from classifier_dir/mean_hidden_diff.json.
 
     If ``alpha`` is provided, diff vectors are normalized to unit norm and then
-    scaled to ``alpha``. If ``alpha`` is omitted, raw mean diff is used.
+    scaled to ``alpha``. If ``alpha`` is omitted, negative raw mean diff
+    (listen-speak) is used.
     """
     mean_hidden_diff_path = Path(classifier_dir) / "mean_hidden_diff.json"
     vectors = _load_mean_hidden_diff_vectors(mean_hidden_diff_path)
