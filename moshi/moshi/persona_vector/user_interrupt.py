@@ -14,6 +14,7 @@ from huggingface_hub import hf_hub_download
 
 from moshi.offline import run_batch_inference, _get_voice_prompt_dir
 from moshi.models import loaders
+from moshi.models.lm import SILENCE_TOKENS
 from moshi.persona_vector.mode_class import extract_normal_vector
 
 
@@ -1578,6 +1579,120 @@ def inference_with_steering(
     else:
         print(f"[user_interrupt] Done. Wrote output.wav/output.json for {len(input_paths)} items.")
 
+def inference_force_pad(
+    root_dir: str,
+    num_pad: int,
+    save_hidden: bool = False,
+    payload_target_layer: Optional[int] = None,
+    resume: int = 0,
+) -> None:
+    """Run inference while force-overriding AR feedback tokens around interruption.
+
+    For each ``root_dir/*`` item, read ``input_timing.json`` and use
+    ``interrupt_start`` to compute token step index at 12.5 Hz. Starting at that
+    step, for ``num_pad`` steps we replace the model's previous-step feedback
+    tokens with:
+    - text: PAD token (model text padding token id)
+    - audio: silence tokens (Moshi fixed silence codebook ids)
+    """
+    if int(num_pad) <= 0:
+        raise ValueError(f"num_pad must be > 0, got {num_pad}")
+
+    token_rate_hz = 12.5
+    root = Path(root_dir)
+    input_paths = [p for p in root.glob("*/input.wav") if p.is_file()]
+    input_paths.sort(key=lambda p: int(p.parent.name) if p.parent.name.isdigit() else p.parent.name)
+
+    if not input_paths:
+        raise FileNotFoundError(f"No files matched pattern {root_dir}/*/input.wav")
+
+    input_paths = _apply_resume_index(input_paths, resume, root_dir)
+
+    force_pad_start_steps: list[Optional[int]] = []
+    for input_wav in input_paths:
+        entry_dir = input_wav.parent
+        timing_path = entry_dir / "input_timing.json"
+        if not timing_path.exists():
+            raise FileNotFoundError(f"Missing timing file: {timing_path}")
+        with timing_path.open("r", encoding="utf-8") as f:
+            timing_payload = json.load(f)
+        if not isinstance(timing_payload, dict):
+            raise ValueError(f"Expected dict in {timing_path}, got {type(timing_payload)}")
+        if "interrupt_start" not in timing_payload:
+            raise KeyError(f"Missing 'interrupt_start' in {timing_path}")
+
+        interrupt_start = float(timing_payload["interrupt_start"])
+        force_start_idx = max(0, int(interrupt_start * token_rate_hz))
+        force_pad_start_steps.append(force_start_idx)
+
+    voice_prompt_dir = _get_voice_prompt_dir(None, loaders.DEFAULT_REPO)
+    if voice_prompt_dir is None:
+        raise FileNotFoundError("Unable to resolve voice prompt directory.")
+
+    voice_prompt_path = os.path.join(voice_prompt_dir, "NATF0.pt")
+    if not os.path.exists(voice_prompt_path):
+        raise FileNotFoundError(f"Voice prompt not found: {voice_prompt_path}")
+
+    input_wavs = [str(path) for path in input_paths]
+    output_wavs = [str(path.with_name("output.wav")) for path in input_paths]
+    output_texts = [str(path.with_name("output.json")) for path in input_paths]
+    output_hiddens = [str(path.with_name("output_hidden.pt")) for path in input_paths]
+
+    SYSTEM_PROMPT = (
+        "You are an intelligent, articulate, and highly factual AI assistant. "
+        "When the user asks open-ended questions, provide detailed, natural, and comprehensive explanations, and talk for a long time."
+        "However, you also act as a strict fact-checker. If the user interrupts you or makes a factual claim "
+        "(e.g., 'A banana is a red fruit, right?'), you must prioritize truth over politeness. "
+        "If their claim is TRUE, confirm it and teach user more about the topic."
+        "If their claim is FALSE, you must immediately reject it by saying 'No' or 'False', and teach user the correct information."
+        "Never agree with incorrect information just to be polite."
+    )
+    prompts = [SYSTEM_PROMPT] * len(input_paths)
+
+    print(
+        "[user_interrupt] Force-pad mode: "
+        f"num_pad={int(num_pad)}, text_pad_token=3, silence_tokens={SILENCE_TOKENS.tolist()}"
+    )
+    print(f"[user_interrupt] Processing {len(input_paths)} files from {root_dir}")
+
+    with torch.no_grad():
+        run_batch_inference(
+            input_wavs=input_wavs,
+            output_wavs=output_wavs,
+            output_texts=output_texts,
+            text_prompts=prompts,
+            voice_prompt_path=voice_prompt_path,
+            tokenizer_path=None,
+            moshi_weight=None,
+            mimi_weight=None,
+            hf_repo=loaders.DEFAULT_REPO,
+            device="cuda",
+            seed=42,
+            temp_audio=0.8,
+            temp_text=0.7,
+            topk_audio=250,
+            topk_text=25,
+            greedy=False,
+            save_voice_prompt_embeddings=False,
+            cpu_offload=False,
+            return_hidden_layers=False,
+            save_hidden_payload=bool(save_hidden),
+            output_hiddens=output_hiddens if save_hidden else None,
+            payload_target_layer=payload_target_layer,
+            force_pad_start_steps=force_pad_start_steps,
+            force_pad_num_steps=int(num_pad),
+        )
+
+    if save_hidden:
+        print(
+            f"[user_interrupt] Done. Wrote {len(output_wavs)} output.wav files and "
+            f"{len(output_hiddens)} output_hidden.pt files."
+        )
+    else:
+        print(f"[user_interrupt] Done. Wrote {len(output_wavs)} output.wav files.")
+
+
+
 
 def scale_steering_vectors(root_dir: str, scale: float) -> None:
     """Normalize then scale steering vectors under root_dir/*/steering_vector.json.
@@ -1691,6 +1806,11 @@ def main() -> None:
         help="Run inference using steering vectors loaded from root-dir/*/steering_vector.json.",
     )
     mode_group.add_argument(
+        "--inference-force-pad",
+        action="store_true",
+        help="Run inference without steering, but replace AR feedback with PAD/silence around interrupt_start.",
+    )
+    mode_group.add_argument(
         "--scale-steering-vectors",
         action="store_true",
         help="Scale all vectors in root-dir/*/steering_vector.json by --scale (None stays None).",
@@ -1795,6 +1915,12 @@ def main() -> None:
             "If not set, defaults to steering_layer (if provided) else last layer."
         ),
     )
+    parser.add_argument(
+        "--num-pad",
+        type=int,
+        default=0,
+        help="Number of token steps to force PAD/silence after interrupt_start when using --inference-force-pad.",
+    )
 
     args = parser.parse_args()
 
@@ -1877,6 +2003,18 @@ def main() -> None:
         scale_steering_vectors(
             root_dir=args.root_dir,
             scale=float(args.scale),
+        )
+        return
+
+    if args.inference_force_pad:
+        if int(args.num_pad) <= 0:
+            parser.error("--inference-force-pad requires --num-pad > 0")
+        inference_force_pad(
+            root_dir=args.root_dir,
+            num_pad=int(args.num_pad),
+            save_hidden=args.save_hidden,
+            payload_target_layer=args.payload_target_layer,
+            resume=args.resume,
         )
         return
 

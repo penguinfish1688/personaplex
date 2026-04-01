@@ -60,7 +60,7 @@ from .models import loaders, LMGen, MimiModel
 from .models.lm import load_audio as lm_load_audio
 from .models.lm import _iterate_audio as lm_iterate_audio
 from .models.lm import encode_from_sphn as lm_encode_from_sphn
-from .models.lm import HiddenLayerOutputs
+from .models.lm import HiddenLayerOutputs, SILENCE_TOKENS
 
 def log(level: str, msg: str):
     print(make_log(level, msg))
@@ -841,6 +841,8 @@ def run_batch_inference(
     steer_attn_only: bool = False,
     payload_target_layer: Optional[int] = None,
     embed_stat: bool = False,
+    force_pad_start_steps: Optional[List[Optional[int]]] = None,
+    force_pad_num_steps: int = 0,
 ) -> Optional[List[List[HiddenLayerOutputs]]]:
     """Run batch offline inference using multiple input WAVs and text prompts.
     
@@ -869,6 +871,13 @@ def run_batch_inference(
     if len(input_wavs) == 0:
         log("warning", "Empty input lists provided")
         return [] if return_hidden_layers else None
+
+    if force_pad_start_steps is not None and len(force_pad_start_steps) != len(input_wavs):
+        raise ValueError(
+            "force_pad_start_steps must have the same length as input_wavs when provided"
+        )
+    if int(force_pad_num_steps) < 0:
+        raise ValueError(f"force_pad_num_steps must be >= 0, got {force_pad_num_steps}")
 
     has_single_steer = steering_vectors is not None
     has_multi_steer = steering_vectors_by_layer is not None and len(steering_vectors_by_layer) > 0
@@ -905,6 +914,13 @@ def run_batch_inference(
     lm = loaders.get_moshi_lm(moshi_weight, device=device, cpu_offload=cpu_offload)
     lm.eval()
     log("info", "moshi loaded")
+    text_pad_token_id = int(lm.text_padding_token_id)
+    if force_pad_start_steps is not None and int(force_pad_num_steps) > 0:
+        log(
+            "info",
+            f"force-pad enabled: text_pad_token_id={text_pad_token_id}, "
+            f"audio_silence_tokens={SILENCE_TOKENS.tolist()}, span={int(force_pad_num_steps)}",
+        )
 
     # 4) Construct LMGen (shared across all instances)
     frame_size = int(mimi.sample_rate / mimi.frame_rate)
@@ -1026,6 +1042,15 @@ def run_batch_inference(
         text_attention_layers_per_token: list[Optional[torch.Tensor]] = []
         need_step_input_tokens = save_hidden_payload or embed_stat
         steer_idx = 0
+        force_start = None
+        if force_pad_start_steps is not None:
+            force_start = force_pad_start_steps[i]
+            if force_start is not None:
+                force_start = int(force_start)
+                if force_start < 0:
+                    force_start = None
+        force_span = int(force_pad_num_steps)
+        step_idx = 0
         for user_encoded in lm_encode_from_sphn(
             mimi,
             lm_iterate_audio(
@@ -1037,6 +1062,28 @@ def run_batch_inference(
             # Store hidden layers for each step
             for c in range(steps):
                 step_in = user_encoded[:, :, c : c + 1]
+                current_step_idx = step_idx
+                step_idx += 1
+                force_this_step = (
+                    force_start is not None
+                    and force_span > 0
+                    and current_step_idx >= force_start
+                    and current_step_idx < (force_start + force_span)
+                )
+                forced_moshi_tokens: Optional[torch.Tensor] = None
+                forced_text_token: Optional[torch.Tensor] = None
+                if force_this_step:
+                    forced_moshi_tokens = torch.as_tensor(
+                        SILENCE_TOKENS,
+                        device=step_in.device,
+                        dtype=step_in.dtype,
+                    ).reshape(1, -1, 1)
+                    forced_text_token = torch.full(
+                        (step_in.shape[0],),
+                        text_pad_token_id,
+                        dtype=step_in.dtype,
+                        device=step_in.device,
+                    )
                 step_steering_vector: Optional[torch.Tensor] = None
                 step_steering_vectors_by_layer: Optional[dict[int, torch.Tensor]] = None
                 if has_single_steer:
@@ -1060,6 +1107,11 @@ def run_batch_inference(
                     steer_idx += 1
                 
                 if capture_hidden:
+                    step_kwargs: dict[str, Any] = {}
+                    if forced_moshi_tokens is not None:
+                        step_kwargs["moshi_tokens"] = forced_moshi_tokens
+                    if forced_text_token is not None:
+                        step_kwargs["text_token"] = forced_text_token
                     result = lm_gen.step(
                         step_in,
                         return_embeddings=save_hidden_payload,
@@ -1070,6 +1122,7 @@ def run_batch_inference(
                         steering_layer=steering_layer,
                         steering_vectors_by_layer=step_steering_vectors_by_layer,
                         steer_attn_only=steer_attn_only,
+                        **step_kwargs,
                     )
                     if save_hidden_payload:
                         tokens, step_embeddings, hidden_layers, step_input_tokens = cast(
@@ -1088,6 +1141,11 @@ def run_batch_inference(
                         )
                     assert isinstance(hidden_layers, HiddenLayerOutputs), "Hidden layers were requested but not captured."
                 else:
+                    step_kwargs: dict[str, Any] = {}
+                    if forced_moshi_tokens is not None:
+                        step_kwargs["moshi_tokens"] = forced_moshi_tokens
+                    if forced_text_token is not None:
+                        step_kwargs["text_token"] = forced_text_token
                     result = lm_gen.step(
                         step_in,
                         return_step_input_tokens=need_step_input_tokens,
@@ -1095,6 +1153,7 @@ def run_batch_inference(
                         steering_layer=steering_layer,
                         steering_vectors_by_layer=step_steering_vectors_by_layer,
                         steer_attn_only=steer_attn_only,
+                        **step_kwargs,
                     )
                     if need_step_input_tokens:
                         tokens, step_input_tokens = cast(
