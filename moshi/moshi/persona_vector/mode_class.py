@@ -2498,7 +2498,7 @@ def logit_lens_heatmap(root_dir) -> None:
     for each layer 0-31 (raise error if not all 32 layers found).
 
     There should be four plot two for question_start and two for interrupt_start
-    for each CE type (user_interrupt_ce and user_question_ce). 
+    for each CE type (user_interrupt_ce and user_question_ce).
     One heatmap is for listening mode CE and the other is for speaking mode CE (i'm not sure which is which (line1 or line2)) remember to show in the plot
     For each plot, the y axis should be the layer number (0-31) and the x axis should be the relative token index (-span to +span).
 
@@ -2506,6 +2506,8 @@ def logit_lens_heatmap(root_dir) -> None:
     decide the scale based on the 5th and 95th percentile to be 95% saturated of blue and 95% staturated for red
     the percentlie is calcuted from  10th to 20th layers as endpoints layers has some outliers.
 
+    Note: input JSON stores CE/NLL values, but this plot visualizes log-likelihood
+    by negating those values before rendering.
     """
     import matplotlib.pyplot as plt
     import numpy as np
@@ -2647,7 +2649,9 @@ def logit_lens_heatmap(root_dir) -> None:
     generated = 0
     for anchor in anchors:
         for which in ("line1", "line2"):
-            mat = _build_heat(which=which, anchor=anchor)
+            # Saved JSON is CE/NLL; visualize log-likelihood by negating it.
+            mat_nll = _build_heat(which=which, anchor=anchor)
+            mat = -mat_nll
             vmin, vmax = _get_scale_bounds(mat)
 
             fig, ax = plt.subplots(figsize=(11.0, 6.5), dpi=180)
@@ -2662,12 +2666,12 @@ def logit_lens_heatmap(root_dir) -> None:
                 extent=(float(rel_tok[0]), float(rel_tok[-1]), -0.5, 31.5),
             )
             cbar = fig.colorbar(img, ax=ax)
-            cbar.set_label("CE value (P5/P95 from layers 10-20)")
+            cbar.set_label("Log-likelihood value (negated from CE/NLL, P5/P95 from layers 10-20)")
 
             line_desc = (
-                "line1 = user multimodal CE (likely listening-focus)"
+                "line1 = user multimodal log-likelihood (from negated CE; likely listening-focus)"
                 if which == "line1"
-                else "line2 = model multimodal CE (likely speaking-focus)"
+                else "line2 = model multimodal log-likelihood (from negated CE; likely speaking-focus)"
             )
             ax.set_title(f"Logit-Lens Heatmap | {anchor} | {which}\n{line_desc}")
             ax.set_xlabel("Relative token index")
