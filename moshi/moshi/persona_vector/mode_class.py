@@ -122,9 +122,15 @@ def _build_labels(
 def _derive_output_paths(hidden_path: str) -> tuple[str, str]:
     """Derive output wav / text paths from a hidden payload path.
 
-    ``complete_sentence_hidden.pt`` → ``complete_sentence_output.wav``,
-    ``complete_sentence_output.json``.
+    ``output_hidden.pt`` → ``output.wav``, ``output.json``.
+
+    For legacy names, falls back to ``<prefix>_output.wav/json`` where
+    ``prefix`` is the hidden filename without ``_hidden.pt``.
     """
+    if hidden_path.endswith("output_hidden.pt"):
+        root = hidden_path[: -len("output_hidden.pt")]
+        return root + "output.wav", root + "output.json"
+
     base = hidden_path.replace("_hidden.pt", "")
     return base + "_output.wav", base + "_output.json"
 
@@ -243,10 +249,8 @@ class HiddenExtractor:
     def class_mode_dataset(self, dataset_path: str) -> None:
         """Generate hidden payloads for every entry in a mode-class dataset.
 
-        Expects ``dataset_path/<id>/complete_sentence.wav`` and
-        ``dataset_path/<id>/incomplete_sentence.wav`` to exist (produced by
-        TTS).  Outputs ``complete_sentence_hidden.pt`` and
-        ``incomplete_sentence_hidden.pt`` next to each WAV.
+        Expects ``dataset_path/<id>/input.wav`` to exist (produced by TTS).
+        Outputs ``output_hidden.pt`` next to the WAV.
 
         Already-existing hidden files are skipped.
         """
@@ -265,19 +269,18 @@ class HiddenExtractor:
 
         for entry_json in entries:
             entry_dir = os.path.dirname(entry_json)
-            for prefix in ("complete_sentence", "incomplete_sentence"):
-                wav = os.path.join(entry_dir, f"{prefix}.wav")
-                hidden = os.path.join(entry_dir, f"{prefix}_hidden.pt")
-                if not os.path.exists(wav):
-                    raise FileNotFoundError(
-                        f"Expected WAV not found: {wav}. "
-                        "Run TTS (--mode-class) first."
-                    )
-                if os.path.exists(hidden):
-                    print(f"[SKIP] {hidden} already exists")
-                    continue
-                input_wavs.append(wav)
-                output_hiddens.append(hidden)
+            wav = os.path.join(entry_dir, "input.wav")
+            hidden = os.path.join(entry_dir, "output_hidden.pt")
+            if not os.path.exists(wav):
+                raise FileNotFoundError(
+                    f"Expected WAV not found: {wav}. "
+                    "Run TTS (--mode-class) first."
+                )
+            if os.path.exists(hidden):
+                print(f"[SKIP] {hidden} already exists")
+                continue
+            input_wavs.append(wav)
+            output_hiddens.append(hidden)
 
         if not input_wavs:
             print(
@@ -323,12 +326,8 @@ class HiddenModeClassifier:
 
         For each entry under ``dataset_path/<id>/``:
 
-        * ``complete_sentence_hidden.pt`` is labeled using the
-          ``complete_modes.listening`` / ``complete_modes.speaking`` ranges
-          from ``input.json``.
-        * ``incomplete_sentence_hidden.pt`` is labeled using the
-          ``incomplete_modes.listening`` / ``incomplete_modes.speaking``
-          ranges from ``input.json``.
+                * ``output_hidden.pt`` is labeled using
+                    ``modes.listening`` / ``modes.speaking`` ranges from ``input.json``.
 
         Saves the trained model to
         ``output_dir/hidden_mode_classifier_layer_{layer}.pt``.
@@ -353,55 +352,29 @@ class HiddenModeClassifier:
             with open(entry_json, "r", encoding="utf-8") as f:
                 meta = json.load(f)
 
-            # ---- complete_sentence_hidden --------------------------------
-            cs_path = os.path.join(entry_dir, "complete_sentence_hidden.pt")
-            if not os.path.exists(cs_path):
+            # ---- output_hidden -------------------------------------------
+            output_hidden_path = os.path.join(entry_dir, "output_hidden.pt")
+            if not os.path.exists(output_hidden_path):
                 raise FileNotFoundError(
-                    f"Missing {cs_path}. "
+                    f"Missing {output_hidden_path}. "
                     "Run --gen-dataset-hidden first."
                 )
 
-            if "complete_modes" not in meta:
+            if "modes" not in meta:
                 raise KeyError(
                     f"input.json for entry {entry_id} is missing "
-                    "'complete_modes' label ranges."
+                    "'modes' label ranges."
                 )
-            cs_modes = meta["complete_modes"]
+            modes = meta["modes"]
 
-            cs_payload = _load_hidden_payload(cs_path)
-            cs_hidden = _extract_layer(cs_payload, layer)  # [T, D]
-            T_cs = cs_hidden.shape[0]
-            cs_labels = _build_labels(
-                T_cs, cs_modes["listening"], cs_modes["speaking"]
+            output_payload = _load_hidden_payload(output_hidden_path)
+            output_hidden = _extract_layer(output_payload, layer)  # [T, D]
+            T_output = output_hidden.shape[0]
+            output_labels = _build_labels(
+                T_output, modes["listening"], modes["speaking"]
             )
-            all_hiddens.append(cs_hidden)
-            all_labels.append(cs_labels)
-
-            # ---- incomplete_sentence_hidden ------------------------------
-            is_path = os.path.join(
-                entry_dir, "incomplete_sentence_hidden.pt"
-            )
-            if not os.path.exists(is_path):
-                raise FileNotFoundError(
-                    f"Missing {is_path}. "
-                    "Run --gen-dataset-hidden first."
-                )
-
-            if "incomplete_modes" not in meta:
-                raise KeyError(
-                    f"input.json for entry {entry_id} is missing "
-                    "'incomplete_modes' label ranges."
-                )
-            is_modes = meta["incomplete_modes"]
-
-            is_payload = _load_hidden_payload(is_path)
-            is_hidden = _extract_layer(is_payload, layer)  # [T, D]
-            T_is = is_hidden.shape[0]
-            is_labels = _build_labels(
-                T_is, is_modes["listening"], is_modes["speaking"]
-            )
-            all_hiddens.append(is_hidden)
-            all_labels.append(is_labels)
+            all_hiddens.append(output_hidden)
+            all_labels.append(output_labels)
 
         # Aggregate all tokens
         X = torch.cat(all_hiddens, dim=0)  # [N, D]
@@ -610,8 +583,7 @@ def save_mean_hidden_diff(root_dir: str, output_path: Optional[str] = None) -> s
     """Compute per-layer speaking/listening mean-hidden difference.
 
     Reads ``root_dir/*/input.json`` and matching hidden payload files:
-      - ``complete_sentence_hidden.pt`` with ``complete_modes`` labels
-      - ``incomplete_sentence_hidden.pt`` with ``incomplete_modes`` labels
+            - ``output_hidden.pt`` with ``modes`` labels
 
     For each layer ``l``, computes:
       ``mean_speaking(l) - mean_listening(l)``
@@ -640,10 +612,7 @@ def save_mean_hidden_diff(root_dir: str, output_path: Optional[str] = None) -> s
         with open(entry_json, "r", encoding="utf-8") as f:
             meta = json.load(f)
 
-        sample_specs = [
-            ("complete_sentence_hidden.pt", "complete_modes"),
-            ("incomplete_sentence_hidden.pt", "incomplete_modes"),
-        ]
+        sample_specs = [("output_hidden.pt", "modes")]
 
         for hidden_name, mode_key in sample_specs:
             hidden_path = os.path.join(entry_dir, hidden_name)
@@ -755,8 +724,8 @@ def plot_prediction(
     * **X-axis**: token index.  Each tick is labeled with the decoded
       token name from the hidden payload (``token_names``).
     * **User transcript lane**: if a sibling ``input.json`` exists next
-      to *hidden_path*, its ``complete_sentence`` / ``incomplete_sentence``
-      is shown as a text band below the plot.
+            to *hidden_path*, its ``input`` field is shown as a text band below
+            the plot.
 
     Args:
         prediction_path: JSON file produced by ``HiddenModeClassifier.predict``.
@@ -796,13 +765,13 @@ def plot_prediction(
     token_names = token_names[:num_tokens]
 
     # ---- user transcript from sibling transcript JSON -------------------------
-    # For mode_class files like complete_sentence_hidden.pt -> complete_sentence.json
+    # For mode_class files like output_hidden.pt -> output.json
     # For other datasets like output_hidden.pt -> try output.json, fall back to input.json
     # Expected format: {"text": "...", "chunks": [{"text": "word", "timestamp": [start, end]}, ...]}
     hidden_p = Path(hidden_path)
-    stem = hidden_p.stem  # e.g. "complete_sentence_hidden"
-    # Strip "_hidden" suffix to get the sentence prefix
-    transcript_prefix = stem.replace("_hidden", "")  # "complete_sentence"
+    stem = hidden_p.stem  # e.g. "output_hidden"
+    # Strip "_hidden" suffix to get the transcript prefix
+    transcript_prefix = stem.replace("_hidden", "")  # "output"
 
     # Candidate transcript files: derived name first, then input.json as fallback
     candidates = [hidden_p.parent / f"{transcript_prefix}.json"]
@@ -1102,7 +1071,7 @@ def plot_prediction_dataset(
     print(f"[plot-dataset] Found {len(hidden_files)} hidden files under {root}")
 
     for hp in hidden_files:
-        stem = hp.stem  # e.g. "complete_sentence_hidden"
+        stem = hp.stem  # e.g. "output_hidden"
         pred_json = hp.with_name(f"{stem}_prediction.json")
         plot_png = hp.with_name(f"{stem}_mode_prediction.png")
 
@@ -1979,7 +1948,6 @@ def plot_logit_lens_step_n(
     fig.savefig(out_p, bbox_inches="tight")
     plt.close(fig)
     print(f"[plot] Saved logit-lens CE plot to {output_path}")
-
 
 def plot_logit_lens_dataset(
     root_dir: str,
