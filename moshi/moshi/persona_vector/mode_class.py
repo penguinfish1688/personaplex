@@ -119,6 +119,38 @@ def _build_labels(
     return labels
 
 
+def _build_mode_masks(
+    num_tokens: int,
+    listening_ranges: List[List[int]],
+    speaking_ranges: List[List[int]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build explicit listening/speaking boolean masks from ranges.
+
+    Unlike ``_build_labels``, tokens outside both sets are left unlabeled and
+    excluded from downstream aggregation.
+    """
+    listening_mask = torch.zeros(num_tokens, dtype=torch.bool)
+    speaking_mask = torch.zeros(num_tokens, dtype=torch.bool)
+
+    for start, end in listening_ranges:
+        if start < 0 or end >= num_tokens:
+            raise ValueError(
+                f"Listening range [{start}, {end}] out of bounds "
+                f"for {num_tokens} tokens."
+            )
+        listening_mask[start : end + 1] = True
+
+    for start, end in speaking_ranges:
+        if start < 0 or end >= num_tokens:
+            raise ValueError(
+                f"Speaking range [{start}, {end}] out of bounds "
+                f"for {num_tokens} tokens."
+            )
+        speaking_mask[start : end + 1] = True
+
+    return listening_mask, speaking_mask
+
+
 def _derive_output_paths(hidden_path: str) -> tuple[str, str]:
     """Derive output wav / text paths from a hidden payload path.
 
@@ -640,14 +672,11 @@ def save_mean_hidden_diff(root_dir: str, output_path: Optional[str] = None) -> s
                 )
 
             num_tokens = int(hidden.shape[0])
-            labels = _build_labels(
+            listening_mask, speaking_mask = _build_mode_masks(
                 num_tokens,
                 modes["listening"],
                 modes["speaking"],
             )
-
-            speaking_mask = labels == 1
-            listening_mask = labels == 0
 
             if int(speaking_mask.sum()) > 0:
                 speak_chunk = hidden[speaking_mask].sum(dim=0).detach().cpu()  # [L, D]
