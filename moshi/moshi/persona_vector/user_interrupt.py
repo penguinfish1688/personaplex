@@ -1120,9 +1120,8 @@ def _calculate_steering_vector_mean_diff_single_layer(
 ) -> None:
     """Generate steering vectors for one layer from mean-hidden-diff source.
 
-    If ``alpha`` is provided, source vector is normalized to unit norm then scaled to
-    ``alpha``. If ``alpha`` is None, use negative raw mean diff directly
-    (listen-speak, no normalization).
+    If ``alpha`` is provided, source vector is scaled directly as ``alpha * base``
+    (no normalization). If ``alpha`` is None, use raw mean diff directly.
     Everything else follows ``_calculate_steering_vector_single_layer`` behavior.
     """
     token_rate_hz = 12.5
@@ -1138,16 +1137,17 @@ def _calculate_steering_vector_mean_diff_single_layer(
     if base.numel() == 0:
         raise ValueError(f"Layer {layer} mean-hidden-diff vector is empty")
     base_norm = torch.norm(base).item()
+    print(f"[user_interrupt] layer {layer} mean-diff base norm ||base||={base_norm:.6f}")
     if alpha is None:
         if base_norm <= 0.0:
             raise ValueError(f"Layer {layer} mean-hidden-diff vector has zero norm")
-        # Raw mean-diff mode uses listen-speak direction.
-        base_vector = -base
+        # Raw mean-diff mode uses base vector directly.
+        base_vector = base
     else:
         if base_norm <= 0.0:
             raise ValueError(f"Layer {layer} mean-hidden-diff vector has zero norm")
-        # Normalize to unit length first, then shrink/scale to alpha.
-        base_vector = (base / base_norm) * float(alpha)
+        # Scale base vector directly by alpha (no normalization).
+        base_vector = base * float(alpha)
     layer_key = f"layer_{layer}"
 
     input_paths = [p for p in root.glob("*/input.wav") if p.is_file()]
@@ -1241,9 +1241,8 @@ def calculate_steering_vector_mean_diff(
 ) -> None:
     """Generate steering vectors from classifier_dir/mean_hidden_diff.json.
 
-    If ``alpha`` is provided, diff vectors are normalized to unit norm and then
-    scaled to ``alpha``. If ``alpha`` is omitted, negative raw mean diff
-    (listen-speak) is used.
+    If ``alpha`` is provided, diff vectors are directly scaled as ``alpha * base``
+    (no normalization). If ``alpha`` is omitted, raw mean diff is used.
     """
     mean_hidden_diff_path = Path(classifier_dir) / "mean_hidden_diff.json"
     vectors = _load_mean_hidden_diff_vectors(mean_hidden_diff_path)
@@ -1783,7 +1782,7 @@ def main() -> None:
         action="store_true",
         help=(
             "Generate/Update root-dir/*/steering_vector.json from classifier-dir/mean_hidden_diff.json. "
-            "Each layer vector is normalized to length 1 and then scaled by --alpha."
+            "Each layer vector is directly scaled by --alpha (no normalization)."
         ),
     )
     mode_group.add_argument(
@@ -1857,7 +1856,7 @@ def main() -> None:
         default=None,
         help=(
             "Steering strength multiplier. For --generate-steering-vectors-mean-diff: "
-            "if omitted, use raw mean diff (no normalization/scaling). For other "
+            "if provided, use alpha * mean_diff (no normalization); if omitted, use raw mean diff. For other "
             "steering generation modes, defaults to 0.05 when omitted."
         ),
     )
