@@ -1,16 +1,24 @@
-"""Plot anchored average absolute amplitude for input/output WAV files.
+"""Plot anchored or per-sample absolute amplitude for input/output WAV files.
 
 Given a dataset root directory containing entries like ``root/*`` with:
 - ``input.wav``
 - ``output.wav``
 - ``input_timing.json``
 
-This script builds two plots (one per anchor timing), where each plot contains:
+Anchored mode builds two plots (one per anchor timing), where each plot contains:
 - x-axis: relative time in seconds (anchor at x=0)
 - y-axis: mean absolute amplitude across all samples
 - two curves: input.wav and output.wav
 
 Default anchor keys are ``question_start`` and ``interrupt_start``.
+
+Amplitude mode (``--plot-wav-amp <rootdir>``) recursively finds sample directories
+containing ``input.wav``, ``output.wav``, and ``input_timing.json``, then writes one
+plot per sample directory with:
+- x-axis: time in seconds
+- y-axis: absolute amplitude
+- two curves: input.wav and output.wav
+- vertical lines for each numeric timing event in ``input_timing.json``
 """
 
 from __future__ import annotations
@@ -101,6 +109,91 @@ def _collect_entry_dirs(root_dir: Path) -> list[Path]:
 	return valid
 
 
+def _collect_sample_dirs_recursive(root_dir: Path) -> list[Path]:
+	"""Recursively find sample directories with required files."""
+	seen: set[Path] = set()
+	for in_wav in root_dir.rglob("input.wav"):
+		d = in_wav.parent
+		if (d / "output.wav").is_file() and (d / "input_timing.json").is_file():
+			seen.add(d)
+	return sorted(seen)
+
+
+def _extract_timing_events(obj: object, prefix: str = "") -> list[tuple[str, float]]:
+	"""Collect numeric timing values from nested JSON as (label, time_s)."""
+	events: list[tuple[str, float]] = []
+	if isinstance(obj, dict):
+		for k, v in obj.items():
+			name = f"{prefix}.{k}" if prefix else str(k)
+			events.extend(_extract_timing_events(v, name))
+	elif isinstance(obj, list):
+		for i, v in enumerate(obj):
+			name = f"{prefix}[{i}]" if prefix else f"[{i}]"
+			events.extend(_extract_timing_events(v, name))
+	elif isinstance(obj, (int, float)):
+		events.append((prefix if prefix else "event", float(obj)))
+	return events
+
+
+def plot_wav_amp(root_dir: str, max_hz: float) -> None:
+	"""Write one per-sample abs-amplitude plot with event markers from timing JSON."""
+	root = Path(root_dir)
+	if not root.is_dir():
+		raise FileNotFoundError(f"Root directory not found: {root}")
+
+	sample_dirs = _collect_sample_dirs_recursive(root)
+	if not sample_dirs:
+		raise FileNotFoundError(
+			f"No valid entries found under {root}. Need **/input.wav, **/output.wav, **/input_timing.json"
+		)
+
+	for d in sample_dirs:
+		in_audio, in_sr = _load_wav_mono(d / "input.wav")
+		out_audio, out_sr = _load_wav_mono(d / "output.wav")
+
+		in_abs = np.abs(in_audio)
+		out_abs = np.abs(out_audio)
+
+		in_stride = max(1, int(round(in_sr / max_hz)))
+		out_stride = max(1, int(round(out_sr / max_hz)))
+
+		in_t = np.arange(in_abs.shape[0], dtype=np.float32) / float(in_sr)
+		out_t = np.arange(out_abs.shape[0], dtype=np.float32) / float(out_sr)
+
+		in_t = in_t[::in_stride]
+		in_abs = in_abs[::in_stride]
+		out_t = out_t[::out_stride]
+		out_abs = out_abs[::out_stride]
+
+		timing_path = d / "input_timing.json"
+		with timing_path.open("r", encoding="utf-8") as f:
+			timing = json.load(f)
+		events = [(name, t) for name, t in _extract_timing_events(timing) if np.isfinite(t)]
+		events.sort(key=lambda x: x[1])
+
+		plt.figure(figsize=(12, 5))
+		plt.plot(in_t, in_abs, label="input.wav", linewidth=1.2, alpha=0.9)
+		plt.plot(out_t, out_abs, label="output.wav", linewidth=1.2, alpha=0.9)
+
+		for idx, (name, ts) in enumerate(events):
+			line_label = "timing events" if idx == 0 else "_nolegend_"
+			plt.axvline(ts, color="black", linestyle="--", linewidth=0.9, alpha=0.35, label=line_label)
+			plt.text(ts, 1.0, name, rotation=90, va="top", ha="right", fontsize=7, alpha=0.6)
+
+		plt.xlabel("Time (s)")
+		plt.ylabel("Absolute amplitude")
+		rel = d.relative_to(root)
+		plt.title(f"|Amplitude| over time: {rel}")
+		plt.legend(loc="upper right")
+		plt.grid(True, alpha=0.25)
+		plt.tight_layout()
+
+		out_png = d / "plot_wav_amp.png"
+		plt.savefig(out_png, dpi=160)
+		plt.close()
+		print(f"[plot_wav_amp] Wrote {out_png}")
+
+
 def plot_wav(
 	root_dir: str,
 	anchors: list[str],
@@ -179,7 +272,13 @@ def plot_wav(
 
 def main() -> None:
 	ap = argparse.ArgumentParser("plot_wav")
-	ap.add_argument("--root-dir", type=str, required=True, help="Dataset root containing */input.wav and */output.wav")
+	ap.add_argument("--root-dir", type=str, default=None, help="Dataset root containing */input.wav and */output.wav")
+	ap.add_argument(
+		"--plot-wav-amp",
+		type=str,
+		default=None,
+		help="Root dir to recursively plot per-sample abs amplitude for input.wav/output.wav with timing markers.",
+	)
 	ap.add_argument(
 		"--anchors",
 		type=str,
@@ -206,8 +305,17 @@ def main() -> None:
 	if float(args.max_hz) <= 0.0:
 		raise ValueError(f"--max-hz must be > 0, got {args.max_hz}")
 
+	if args.plot_wav_amp is not None:
+		if args.root_dir is not None:
+			raise ValueError("Use either --root-dir (anchored mode) or --plot-wav-amp (per-sample mode), not both.")
+		plot_wav_amp(root_dir=str(args.plot_wav_amp), max_hz=float(args.max_hz))
+		return
+
+	if args.root_dir is None:
+		raise ValueError("Missing required argument: --root-dir (or use --plot-wav-amp).")
+
 	plot_wav(
-		root_dir=args.root_dir,
+		root_dir=str(args.root_dir),
 		anchors=[str(x) for x in args.anchors],
 		window_s=float(args.window_s),
 		max_hz=float(args.max_hz),
