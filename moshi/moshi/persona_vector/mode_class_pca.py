@@ -16,7 +16,7 @@ Output:
 """
 
 from __future__ import annotations
-
+from tqdm import tqdm
 import argparse
 import json
 from pathlib import Path
@@ -119,7 +119,7 @@ def plot_mode_class_pca(root_dir: str, output: str | None, max_points_per_class:
 	listen_by_layer: dict[int, list[np.ndarray]] = {}
 	n_layers_ref: int | None = None
 
-	for sd in sample_dirs:
+	for sd in tqdm(sample_dirs, desc="Processing sample dirs"):
 		hidden_path = _find_hidden_path(sd)
 		if hidden_path is None:
 			continue
@@ -156,7 +156,7 @@ def plot_mode_class_pca(root_dir: str, output: str | None, max_points_per_class:
 	fig, ax = plt.subplots(figsize=(12.5, 7.0), dpi=180)
 
 	plotted_any = False
-	for layer in range(int(n_layers_ref)):
+	for layer in tqdm(range(int(n_layers_ref)), desc="Processing layers"):
 		listen_chunks = listen_by_layer.get(layer, [])
 		speak_chunks = speak_by_layer.get(layer, [])
 		if not listen_chunks or not speak_chunks:
