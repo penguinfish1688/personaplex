@@ -12,9 +12,9 @@ combined listening+speaking vectors. It then plots token dots with:
 - color: speaking=red, listening=green
 
 Output:
-- ``<rootdir>/mode_class_pca.png`` (PC1)
-- ``<rootdir>/mode_class_pca2.png`` (PC2)
-	If ``--output`` is provided, second figure is ``<stem>2<suffix>``.
+- ``<rootdir>/mode_class_pca.png``
+	- left: PC1
+	- right: PC2
 """
 
 from __future__ import annotations
@@ -117,7 +117,7 @@ def _pca_projection(x_nd: np.ndarray, component: int) -> np.ndarray:
 	return proj.astype(np.float32)
 
 
-def plot_mode_class_pca(root_dir: str, output: str | None, max_points_per_class: int) -> tuple[Path, Path]:
+def plot_mode_class_pca(root_dir: str, output: str | None, max_points_per_class: int) -> Path:
 	root = Path(root_dir)
 	sample_dirs = _collect_sample_dirs(root)
 
@@ -160,8 +160,7 @@ def plot_mode_class_pca(root_dir: str, output: str | None, max_points_per_class:
 		raise RuntimeError("No usable hidden payloads found for PCA plotting")
 
 	rng = np.random.default_rng(42)
-	fig1, ax1 = plt.subplots(figsize=(12.5, 7.0), dpi=180)
-	fig2, ax2 = plt.subplots(figsize=(12.5, 7.0), dpi=180)
+	fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18.0, 7.0), dpi=180, sharey=True)
 
 	plotted_any = False
 	for layer in tqdm(range(int(n_layers_ref)), desc="Processing layers"):
@@ -205,31 +204,23 @@ def plot_mode_class_pca(root_dir: str, output: str | None, max_points_per_class:
 		raise RuntimeError("No layers had both listening and speaking labeled vectors")
 
 	for ax, xlabel, title in (
-		(ax1, "PCA Dimension (PC1 projection)", "Mode-Class PCA Distribution by Layer (PC1)"),
-		(ax2, "PCA Dimension (PC2 projection)", "Mode-Class PCA Distribution by Layer (PC2)"),
+		(ax1, "PCA Dimension (PC1 projection)", "State-Class PCA Distribution by Layer (PC1)"),
+		(ax2, "PCA Dimension (PC2 projection)", "State-Class PCA Distribution by Layer (PC2)"),
 	):
 		ax.set_xlabel(xlabel)
 		ax.set_ylabel("Layer")
 		ax.set_title(title)
 		ax.grid(True, linestyle=":", linewidth=0.7, alpha=0.5)
-		ax.legend(loc="upper right")
+		ax.legend(loc="upper right", markerscale=2.8)
 		ax.set_ylim(-0.75, float(n_layers_ref) - 0.25)
+		ax.set_xlim(-5.0, 5.0)
 
-	out_path_pc1 = Path(output) if output is not None else (root / "mode_class_pca.png")
-	if output is not None:
-		out_path_pc2 = out_path_pc1.with_name(f"{out_path_pc1.stem}2{out_path_pc1.suffix}")
-	else:
-		out_path_pc2 = root / "mode_class_pca2.png"
-
-	out_path_pc1.parent.mkdir(parents=True, exist_ok=True)
-	out_path_pc2.parent.mkdir(parents=True, exist_ok=True)
-	fig1.tight_layout()
-	fig2.tight_layout()
-	fig1.savefig(out_path_pc1, bbox_inches="tight")
-	fig2.savefig(out_path_pc2, bbox_inches="tight")
-	plt.close(fig1)
-	plt.close(fig2)
-	return out_path_pc1, out_path_pc2
+	out_path = Path(output) if output is not None else (root / "mode_class_pca.png")
+	out_path.parent.mkdir(parents=True, exist_ok=True)
+	fig.tight_layout()
+	fig.savefig(out_path, bbox_inches="tight")
+	plt.close(fig)
+	return out_path
 
 
 def main() -> None:
@@ -244,13 +235,12 @@ def main() -> None:
 	)
 	args = ap.parse_args()
 
-	out_pc1, out_pc2 = plot_mode_class_pca(
+	out_path = plot_mode_class_pca(
 		root_dir=str(args.root_dir),
 		output=None if args.output is None else str(args.output),
 		max_points_per_class=int(args.max_points_per_class),
 	)
-	print(f"[mode_class_pca] Wrote {out_pc1}")
-	print(f"[mode_class_pca] Wrote {out_pc2}")
+	print(f"[mode_class_pca] Wrote {out_path}")
 
 
 if __name__ == "__main__":
