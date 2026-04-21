@@ -7,12 +7,14 @@ Given a dataset root with entries like ``root/*`` containing:
 
 This script gathers labeled vectors and, for each layer, computes PCA over
 combined listening+speaking vectors. It then plots token dots with:
-- x-axis: PCA value (PC1 projection)
+- x-axis: PCA value (PC1 / PC2 projection)
 - y-axis: layer index
 - color: speaking=red, listening=green
 
 Output:
-- ``<rootdir>/mode_class_pca.png`` (or ``--output`` path)
+- ``<rootdir>/mode_class_pca.png`` (PC1)
+- ``<rootdir>/mode_class_pca2.png`` (PC2)
+	If ``--output`` is provided, second figure is ``<stem>2<suffix>``.
 """
 
 from __future__ import annotations
@@ -96,8 +98,8 @@ def _load_hidden_tld(path: Path) -> torch.Tensor:
 	raise KeyError(f"Missing hidden fields in {path}. Need text_hidden_layers or hidden_states")
 
 
-def _pca_pc1_projection(x_nd: np.ndarray) -> np.ndarray:
-	"""Return 1D PC1 projections using SVD on centered data."""
+def _pca_projection(x_nd: np.ndarray, component: int) -> np.ndarray:
+	"""Return 1D projection on PCA component index (0=PC1, 1=PC2, ...)."""
 	if x_nd.ndim != 2:
 		raise ValueError(f"Expected 2D array [N,D], got shape={x_nd.shape}")
 	if x_nd.shape[0] < 2:
@@ -105,12 +107,17 @@ def _pca_pc1_projection(x_nd: np.ndarray) -> np.ndarray:
 	x = x_nd.astype(np.float64, copy=False)
 	x = x - x.mean(axis=0, keepdims=True)
 	_, _, vt = np.linalg.svd(x, full_matrices=False)
-	pc1 = vt[0]
-	proj = x @ pc1
+	comp = int(component)
+	if comp < 0:
+		raise ValueError(f"component must be >= 0, got {comp}")
+	if comp >= vt.shape[0]:
+		return np.zeros((x.shape[0],), dtype=np.float32)
+	pc = vt[comp]
+	proj = x @ pc
 	return proj.astype(np.float32)
 
 
-def plot_mode_class_pca(root_dir: str, output: str | None, max_points_per_class: int) -> Path:
+def plot_mode_class_pca(root_dir: str, output: str | None, max_points_per_class: int) -> tuple[Path, Path]:
 	root = Path(root_dir)
 	sample_dirs = _collect_sample_dirs(root)
 
@@ -153,7 +160,8 @@ def plot_mode_class_pca(root_dir: str, output: str | None, max_points_per_class:
 		raise RuntimeError("No usable hidden payloads found for PCA plotting")
 
 	rng = np.random.default_rng(42)
-	fig, ax = plt.subplots(figsize=(12.5, 7.0), dpi=180)
+	fig1, ax1 = plt.subplots(figsize=(12.5, 7.0), dpi=180)
+	fig2, ax2 = plt.subplots(figsize=(12.5, 7.0), dpi=180)
 
 	plotted_any = False
 	for layer in tqdm(range(int(n_layers_ref)), desc="Processing layers"):
@@ -175,35 +183,53 @@ def plot_mode_class_pca(root_dir: str, output: str | None, max_points_per_class:
 				x_speak = x_speak[idx]
 
 		x_all = np.concatenate([x_listen, x_speak], axis=0)
-		proj_all = _pca_pc1_projection(x_all)
+		proj_all_pc1 = _pca_projection(x_all, component=0)
+		proj_all_pc2 = _pca_projection(x_all, component=1)
 		n_l = x_listen.shape[0]
-		proj_l = proj_all[:n_l]
-		proj_s = proj_all[n_l:]
+		proj_l_pc1 = proj_all_pc1[:n_l]
+		proj_s_pc1 = proj_all_pc1[n_l:]
+		proj_l_pc2 = proj_all_pc2[:n_l]
+		proj_s_pc2 = proj_all_pc2[n_l:]
 
 		# Small vertical jitter to reduce overplotting while preserving layer bands.
-		y_l = np.full_like(proj_l, fill_value=float(layer), dtype=np.float32) + rng.normal(0.0, 0.06, size=proj_l.shape[0])
-		y_s = np.full_like(proj_s, fill_value=float(layer), dtype=np.float32) + rng.normal(0.0, 0.06, size=proj_s.shape[0])
+		y_l = np.full((proj_l_pc1.shape[0],), fill_value=float(layer), dtype=np.float32) + rng.normal(0.0, 0.06, size=proj_l_pc1.shape[0])
+		y_s = np.full((proj_s_pc1.shape[0],), fill_value=float(layer), dtype=np.float32) + rng.normal(0.0, 0.06, size=proj_s_pc1.shape[0])
 
-		ax.scatter(proj_l, y_l, s=6, c="#2ca02c", alpha=0.35, linewidths=0.0, label="listening" if layer == 0 else "_nolegend_")
-		ax.scatter(proj_s, y_s, s=6, c="#d62728", alpha=0.35, linewidths=0.0, label="speaking" if layer == 0 else "_nolegend_")
+		ax1.scatter(proj_l_pc1, y_l, s=6, c="#2ca02c", alpha=0.35, linewidths=0.0, label="listening" if layer == 0 else "_nolegend_")
+		ax1.scatter(proj_s_pc1, y_s, s=6, c="#d62728", alpha=0.35, linewidths=0.0, label="speaking" if layer == 0 else "_nolegend_")
+		ax2.scatter(proj_l_pc2, y_l, s=6, c="#2ca02c", alpha=0.35, linewidths=0.0, label="listening" if layer == 0 else "_nolegend_")
+		ax2.scatter(proj_s_pc2, y_s, s=6, c="#d62728", alpha=0.35, linewidths=0.0, label="speaking" if layer == 0 else "_nolegend_")
 		plotted_any = True
 
 	if not plotted_any:
 		raise RuntimeError("No layers had both listening and speaking labeled vectors")
 
-	ax.set_xlabel("PCA Dimension (PC1 projection)")
-	ax.set_ylabel("Layer")
-	ax.set_title("Mode-Class PCA Distribution by Layer")
-	ax.grid(True, linestyle=":", linewidth=0.7, alpha=0.5)
-	ax.legend(loc="upper right")
-	ax.set_ylim(-0.75, float(n_layers_ref) - 0.25)
+	for ax, xlabel, title in (
+		(ax1, "PCA Dimension (PC1 projection)", "Mode-Class PCA Distribution by Layer (PC1)"),
+		(ax2, "PCA Dimension (PC2 projection)", "Mode-Class PCA Distribution by Layer (PC2)"),
+	):
+		ax.set_xlabel(xlabel)
+		ax.set_ylabel("Layer")
+		ax.set_title(title)
+		ax.grid(True, linestyle=":", linewidth=0.7, alpha=0.5)
+		ax.legend(loc="upper right")
+		ax.set_ylim(-0.75, float(n_layers_ref) - 0.25)
 
-	out_path = Path(output) if output is not None else (root / "mode_class_pca.png")
-	out_path.parent.mkdir(parents=True, exist_ok=True)
-	fig.tight_layout()
-	fig.savefig(out_path, bbox_inches="tight")
-	plt.close(fig)
-	return out_path
+	out_path_pc1 = Path(output) if output is not None else (root / "mode_class_pca.png")
+	if output is not None:
+		out_path_pc2 = out_path_pc1.with_name(f"{out_path_pc1.stem}2{out_path_pc1.suffix}")
+	else:
+		out_path_pc2 = root / "mode_class_pca2.png"
+
+	out_path_pc1.parent.mkdir(parents=True, exist_ok=True)
+	out_path_pc2.parent.mkdir(parents=True, exist_ok=True)
+	fig1.tight_layout()
+	fig2.tight_layout()
+	fig1.savefig(out_path_pc1, bbox_inches="tight")
+	fig2.savefig(out_path_pc2, bbox_inches="tight")
+	plt.close(fig1)
+	plt.close(fig2)
+	return out_path_pc1, out_path_pc2
 
 
 def main() -> None:
@@ -218,12 +244,13 @@ def main() -> None:
 	)
 	args = ap.parse_args()
 
-	out = plot_mode_class_pca(
+	out_pc1, out_pc2 = plot_mode_class_pca(
 		root_dir=str(args.root_dir),
 		output=None if args.output is None else str(args.output),
 		max_points_per_class=int(args.max_points_per_class),
 	)
-	print(f"[mode_class_pca] Wrote {out}")
+	print(f"[mode_class_pca] Wrote {out_pc1}")
+	print(f"[mode_class_pca] Wrote {out_pc2}")
 
 
 if __name__ == "__main__":
