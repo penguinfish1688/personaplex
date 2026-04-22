@@ -1756,6 +1756,7 @@ def plot_logit_lens_step_n(
     ma_window: int = 5,
     ce_json_path: Optional[str] = None,
     save_plot: bool = True,
+    input_audio_only: bool = False,
 ) -> None:
     """Plot step-n premature-decode CE losses and aligned waveforms.
 
@@ -1869,7 +1870,10 @@ def plot_logit_lens_step_n(
             model_text_target[:-1].to(device=device, dtype=torch.long),
         )
 
-        ce_user = 0.5 * (user_audio_ce + user_text_ce)
+        if input_audio_only:
+            ce_user = user_audio_ce
+        else:
+            ce_user = 0.5 * (user_audio_ce + user_text_ce)
         ce_model = 0.5 * (model_audio_ce + model_text_ce)
 
     ce_user_s = ce_user.detach().cpu().float()
@@ -1883,6 +1887,11 @@ def plot_logit_lens_step_n(
             "ratio_line1_over_line2": ratio.tolist(),
             "line1_shift": "n_to_n_plus_1",
             "line2_shift": "n_to_n",
+            "line1_mode": (
+                "input_audio_only_cb0"
+                if input_audio_only
+                else "avg(input_audio_cb0,input_text)"
+            ),
             "moving_average_window": 1,
             "smoothing": "none",
             "layer": int(layer),
@@ -1986,6 +1995,7 @@ def plot_logit_lens_dataset(
     moshi_weight: Optional[str] = None,
     device: str = "cuda",
     ma_window: int = 5,
+    input_audio_only: bool = False,
 ) -> None:
     """Find ``root_dir/*/output_hidden(.pt)`` and plot logit-lens CE for each.
 
@@ -2053,6 +2063,7 @@ def plot_logit_lens_dataset(
                     ma_window=ma_window,
                     ce_json_path=str(out_json),
                     save_plot=False,
+                    input_audio_only=input_audio_only,
                 )
                 ok += 1
         except Exception as exc:
@@ -2874,6 +2885,14 @@ def main() -> None:
         default=5,
         help="Half-window size for hidden smoothing (default: 5).",
     )
+    ap.add_argument(
+        "--input-audio-only",
+        action="store_true",
+        help=(
+            "For --plot-logit-lens-dataset, compute line1/input CE using only "
+            "input audio token CE (cb0) instead of averaging with input text CE."
+        ),
+    )
 
     args = ap.parse_args()
 
@@ -2975,6 +2994,7 @@ def main() -> None:
             moshi_weight=args.moshi_weight,
             device=args.device,
             ma_window=args.window,
+            input_audio_only=args.input_audio_only,
         )
 
     elif args.plot_attention_heatmap_turn_taking:
