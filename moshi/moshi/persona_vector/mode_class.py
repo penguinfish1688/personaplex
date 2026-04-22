@@ -2494,8 +2494,10 @@ def logit_lens_heatmap(root_dir) -> None:
     and logit_lens_turn_taking_layer_{layer}_question_start_user_question_ce.json
     for each layer 0-31 (raise error if not all 32 layers found).
 
-    There should be four plot two for question_start and two for interrupt_start
-    for each CE type (user_interrupt_ce and user_question_ce).
+    Supports four anchors from input_timing.json:
+    question_start, question_end, interrupt_start, interrupt_end.
+    Generates plots only for anchors that exist in data; missing anchors are
+    skipped.
     One heatmap is for listening mode CE and the other is for speaking mode CE (i'm not sure which is which (line1 or line2)) remember to show in the plot
     For each plot, the y axis should be the layer number (0-31) and the x axis should be the relative token index (-span to +span).
 
@@ -2514,7 +2516,12 @@ def logit_lens_heatmap(root_dir) -> None:
     if not root.is_dir():
         raise FileNotFoundError(f"Root directory not found: {root}")
 
-    anchors = ["question_start", "interrupt_start"]
+    preferred_anchors = [
+        "question_start",
+        "question_end",
+        "interrupt_start",
+        "interrupt_end",
+    ]
     layers = list(range(32))
     frame_rate_hz = 12.5
     span = 35
@@ -2538,11 +2545,13 @@ def logit_lens_heatmap(root_dir) -> None:
 
     # line1/line2 windows gathered by anchor and layer.
     bucket: Dict[str, Dict[str, Dict[int, List[np.ndarray]]]] = {
-        "line1": {a: {lv: [] for lv in layers} for a in anchors},
-        "line2": {a: {lv: [] for lv in layers} for a in anchors},
+        "line1": {a: {lv: [] for lv in layers} for a in preferred_anchors},
+        "line2": {a: {lv: [] for lv in layers} for a in preferred_anchors},
     }
 
     used_samples = 0
+    missing_anchor_samples = 0
+    missing_ce_samples = 0
     for sd in sample_dirs:
         timing_path = sd / "input_timing.json"
         if not timing_path.is_file():
@@ -2554,13 +2563,15 @@ def logit_lens_heatmap(root_dir) -> None:
             if not isinstance(timing, dict):
                 continue
 
-            # Require both anchors for a consistent 4-plot output.
-            if any(a not in timing for a in anchors):
+            sample_anchors = [a for a in preferred_anchors if a in timing]
+            if not sample_anchors:
+                missing_anchor_samples += 1
                 continue
 
             # Must have all 32 per-layer CE JSONs in this sample directory.
             ce_paths = {lv: sd / f"in_out_ce_{lv}.json" for lv in layers}
             if any(not p.is_file() for p in ce_paths.values()):
+                missing_ce_samples += 1
                 continue
 
             per_layer_line1: Dict[int, np.ndarray] = {}
@@ -2584,7 +2595,7 @@ def logit_lens_heatmap(root_dir) -> None:
             if not ok:
                 continue
 
-            for anchor in anchors:
+            for anchor in sample_anchors:
                 center_tok = int(round(float(timing[anchor]) * frame_rate_hz))
                 if center_tok < 0:
                     continue
@@ -2602,7 +2613,23 @@ def logit_lens_heatmap(root_dir) -> None:
 
     if used_samples == 0:
         raise FileNotFoundError(
-            "No valid samples found. Need root_dir/*/ with input_timing.json and in_out_ce_0..31.json."
+            "No valid samples found. Need root_dir/*/ with input_timing.json "
+            "(question_start/question_end/interrupt_start/interrupt_end) and "
+            "in_out_ce_0..31.json. "
+            f"Skipped due to missing anchors: {missing_anchor_samples}, "
+            f"missing CE layer files: {missing_ce_samples}."
+        )
+
+    anchors = [
+        a
+        for a in preferred_anchors
+        if any(len(bucket["line1"][a][lv]) > 0 for lv in layers)
+    ]
+    if not anchors:
+        raise FileNotFoundError(
+            "No usable anchor data found after loading samples. "
+            "Ensure input_timing.json contains at least one of: "
+            "question_start, question_end, interrupt_start, interrupt_end."
         )
 
     # Ensure all 32 layers were gathered for each anchor/line pair.
