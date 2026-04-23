@@ -1,0 +1,65 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+%files
+    # Copy your local code into the image
+    moshi/ /app/moshi/
+
+%post
+    # 1. System Dependencies
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential pkg-config libopus-dev libportaudio2 \
+        portaudio19-dev libsndfile1 openssh-client wget curl \
+        ca-certificates git vim sox libsox-dev libstdc++-12-dev \
+        ffmpeg python3.10 python3.10-dev python3.10-venv \
+        libssl-dev libreadline-dev libsqlite3-dev zlib1g-dev \
+        libffi-dev libbz2-dev liblzma-dev \
+    && rm -rf /var/lib/apt/lists/*
+    
+    # 2. Global Tool Installation
+    export PYENV_ROOT=/opt/pyenv
+    git clone https://github.com/pyenv/pyenv.git $PYENV_ROOT
+    
+    export UV_INSTALL_DIR=/opt/uv
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="/opt/uv:$PATH"
+
+    # 3. Find the correct directory (handling nested copies)
+    if [ -f /app/moshi/pyproject.toml ]; then
+        APP_MOSHI_DIR=/app/moshi
+    elif [ -f /app/moshi/moshi/pyproject.toml ]; then
+        APP_MOSHI_DIR=/app/moshi/moshi
+    fi
+
+    cd "$APP_MOSHI_DIR"
+    
+    # 4. Create venv and install Torch with EXPLICIT CUDA 12.4 index
+    /opt/uv/uv venv /app/moshi/.venv --python 3.12
+    
+    # Install dependencies and specific Torch version
+    /opt/uv/uv pip install --no-cache-dir --python /app/moshi/.venv/bin/python \
+        --index-url https://download.pytorch.org/whl/cu124 \
+        torch torchvision torchaudio
+        
+    /opt/uv/uv pip install --no-cache-dir --python /app/moshi/.venv/bin/python \
+        accelerate soundfile pip protobuf sentencepiece \
+        tiktoken transformers -e "$APP_MOSHI_DIR"
+
+    # 5. Final Prep
+    mkdir -p /app/ssl
+    mkdir -p /global_cache
+    chmod 777 /global_cache
+
+%environment
+    export PYENV_ROOT=/opt/pyenv
+    export PATH="/opt/pyenv/bin:/app/moshi/.venv/bin:$PATH"
+    export PYTHONPATH="/app/moshi:/app/moshi/moshi:$PYTHONPATH"
+    
+    # Redirect all home-based caches to /tmp (Scratch)
+    export HF_HOME=/tmp/.cache/huggingface
+    export XDG_CACHE_HOME=/tmp/.cache
+    export PYTHONUSERBASE=/tmp/.local
+    export NO_TORCH_COMPILE=1
+
+%runscript
+    exec /app/moshi/.venv/bin/python -m moshi.server --ssl /app/ssl "$@"
