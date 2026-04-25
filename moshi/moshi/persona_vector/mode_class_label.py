@@ -141,6 +141,7 @@ def _compute_prob_lines_for_layer(
 	payload: Dict[str, Any],
 	lm: Any,
 	layer: int,
+	use_all_codebook: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
 	required = ["text_hidden_layers", "input_token_ids", "output_token_ids"]
 	for key in required:
@@ -213,15 +214,16 @@ def _compute_prob_lines_for_layer(
 			probs = torch.softmax(logits_2d, dim=-1)
 			return probs.gather(1, target_1d.unsqueeze(1)).squeeze(1)
 
-		def _audio_prob_all_codebooks(audio_targets_tk: torch.Tensor) -> torch.Tensor:
+		def _audio_prob_for_codebooks(audio_targets_tk: torch.Tensor) -> torch.Tensor:
 			steps = int(audio_targets_tk.shape[0])
 			if steps <= 0:
 				return torch.empty((0,), device=device, dtype=torch.float32)
 			x_steps = x[:-1]
 			prev_token = text_tokens[:-1].to(device=device, dtype=torch.long)[:, None, None]
 			cb_probs: List[torch.Tensor] = []
+			num_selected_codebooks = num_audio_codebooks if use_all_codebook else 1
 			with lm.depformer.streaming(steps):
-				for cb_idx in range(num_audio_codebooks):
+				for cb_idx in range(num_selected_codebooks):
 					logits = lm.forward_depformer(cb_idx, prev_token, x_steps)
 					logits = logits[:, 0, 0, :].float()
 					target = audio_targets_tk[:, cb_idx].to(device=device, dtype=torch.long)
@@ -229,8 +231,8 @@ def _compute_prob_lines_for_layer(
 					prev_token = target[:, None, None]
 			return torch.stack(cb_probs, dim=0).mean(dim=0)
 
-		user_audio_prob = _audio_prob_all_codebooks(user_audio_targets[1:])
-		model_audio_prob = _audio_prob_all_codebooks(model_audio_targets[:-1])
+		user_audio_prob = _audio_prob_for_codebooks(user_audio_targets[1:])
+		model_audio_prob = _audio_prob_for_codebooks(model_audio_targets[:-1])
 		model_text_prob = _prob(
 			text_logits[:-1],
 			model_text_target[:-1].to(device=device, dtype=torch.long),
@@ -266,11 +268,26 @@ def _saved_logit_lens_prob_lines(data: Dict[str, Any]) -> Tuple[np.ndarray, np.n
 	return line1[:n], line2[:n]
 
 
+def _saved_codebook_mode_matches(data: Dict[str, Any], use_all_codebook: bool) -> bool:
+	expected = "all" if use_all_codebook else "first"
+	mode = data.get("audio_codebook_mode")
+	if mode is not None:
+		return mode == expected
+	if use_all_codebook:
+		return int(data.get("audio_codebooks_used", data.get("audio_codebooks", 1))) > 1
+	if data.get("metric") == "probability" and int(
+		data.get("audio_codebooks_used", data.get("audio_codebooks", 1))
+	) > 1:
+		return False
+	return True
+
+
 def _load_or_compute_prob_for_layers(
 	sample_dir: Path,
 	payload: Dict[str, Any],
 	layer_ids: Sequence[int],
 	lm: Any,
+	use_all_codebook: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
 	prob_listen_layers: List[np.ndarray] = []
 	prob_speak_layers: List[np.ndarray] = []
@@ -283,9 +300,22 @@ def _load_or_compute_prob_for_layers(
 			if not isinstance(ce_data, dict):
 				raise TypeError(f"Invalid logit-lens json format: {ce_json}")
 
-			prob_listen, prob_speak = _saved_logit_lens_prob_lines(ce_data)
+			if _saved_codebook_mode_matches(ce_data, use_all_codebook):
+				prob_listen, prob_speak = _saved_logit_lens_prob_lines(ce_data)
+			else:
+				prob_listen, prob_speak = _compute_prob_lines_for_layer(
+					payload,
+					lm,
+					int(layer),
+					use_all_codebook=use_all_codebook,
+				)
 		else:
-			prob_listen, prob_speak = _compute_prob_lines_for_layer(payload, lm, int(layer))
+			prob_listen, prob_speak = _compute_prob_lines_for_layer(
+				payload,
+				lm,
+				int(layer),
+				use_all_codebook=use_all_codebook,
+			)
 
 		prob_listen_layers.append(prob_listen.astype(np.float32, copy=False))
 		prob_speak_layers.append(prob_speak.astype(np.float32, copy=False))
@@ -306,6 +336,7 @@ def generate_input_jsons(
 	hf_repo: str = loaders.DEFAULT_REPO,
 	moshi_weight: Optional[str] = None,
 	device: str = "cuda",
+	use_all_codebook: bool = False,
 ) -> None:
 	root = Path(root_dir)
 	sample_dirs = _discover_sample_dirs(root)
@@ -324,7 +355,8 @@ def generate_input_jsons(
 	print(
 		"[mode_class_label] Generating input.json using probability thresholds "
 		f"(theta_listen={theta_listen}, theta_speak={theta_speak}, "
-		f"layers={layer_start}..{layer_end})"
+		f"layers={layer_start}..{layer_end}, "
+		f"audio_codebook_mode={'all' if use_all_codebook else 'first'})"
 	)
 
 	ok = 0
@@ -334,10 +366,11 @@ def generate_input_jsons(
 			payload = _load_hidden_payload(str(hidden_path))
 			prob_listen, prob_speak = _load_or_compute_prob_for_layers(
 				sample_dir,
-				payload,
-				layer_ids,
-				lm,
-			)  # [L, Tm1], [L, Tm1]
+					payload,
+					layer_ids,
+					lm,
+					use_all_codebook=use_all_codebook,
+				)  # [L, Tm1], [L, Tm1]
 
 			# From paper formalization:
 			# T_speak:   prob_speak >= theta_speak AND prob_listen < theta_listen for all middle layers
@@ -520,6 +553,11 @@ def main() -> None:
 	gen.add_argument("--hf-repo", type=str, default=loaders.DEFAULT_REPO)
 	gen.add_argument("--moshi-weight", type=str, default=None)
 	gen.add_argument("--device", type=str, default="cuda")
+	gen.add_argument(
+		"--use-all-codebook",
+		action="store_true",
+		help="Average audio probability across all inferred depformer codebooks instead of using only codebook 0.",
+	)
 
 	vis = sub.add_parser(
 		"visualize-token-dist",
@@ -536,10 +574,11 @@ def main() -> None:
 			theta_speak=args.theta_speak,
 			layer_start=args.layer_start,
 			layer_end=args.layer_end,
-			hf_repo=args.hf_repo,
-			moshi_weight=args.moshi_weight,
-			device=args.device,
-		)
+				hf_repo=args.hf_repo,
+				moshi_weight=args.moshi_weight,
+				device=args.device,
+				use_all_codebook=args.use_all_codebook,
+			)
 	elif args.cmd == "visualize-token-dist":
 		visualize_token_distribution(root_dir=args.root_dir)
 	else:

@@ -1756,14 +1756,16 @@ def plot_logit_lens_step_n(
     ma_window: int = 5,
     ce_json_path: Optional[str] = None,
     save_plot: bool = True,
+    use_all_codebook: bool = False,
 ) -> None:
     """Plot step-n premature-decode probabilities and aligned waveforms.
 
     Top subplot:
       - User audio probability (shifted): logits from step n vs user audio
-        targets at step n+1, averaged across all audio codebooks.
+        targets at step n+1, using codebook 0 by default or averaging across
+        all audio codebooks when ``use_all_codebook`` is set.
       - Model probability: average of model text probability and model audio
-        probability, with model audio averaged across all audio codebooks.
+        probability, with the same audio codebook selection.
 
     Bottom subplot:
       - input.wav and output.wav amplitudes over physical time.
@@ -1862,7 +1864,7 @@ def plot_logit_lens_step_n(
             probs = torch.softmax(logits_2d, dim=-1)
             return probs.gather(1, target_1d.unsqueeze(1)).squeeze(1)
 
-        def _audio_prob_all_codebooks(audio_targets_tk: torch.Tensor) -> torch.Tensor:
+        def _audio_prob_for_codebooks(audio_targets_tk: torch.Tensor) -> torch.Tensor:
             steps = int(audio_targets_tk.shape[0])
             if steps <= 0:
                 return torch.empty((0,), device=device, dtype=torch.float32)
@@ -1870,8 +1872,9 @@ def plot_logit_lens_step_n(
             x_steps = x[:-1]
             prev_token = text_tokens[:-1].to(device=device, dtype=torch.long)[:, None, None]
             cb_probs: list[torch.Tensor] = []
+            num_selected_codebooks = num_audio_codebooks if use_all_codebook else 1
             with lm.depformer.streaming(steps):
-                for cb_idx in range(num_audio_codebooks):
+                for cb_idx in range(num_selected_codebooks):
                     logits = lm.forward_depformer(cb_idx, prev_token, x_steps)
                     logits = logits[:, 0, 0, :].float()
                     target = audio_targets_tk[:, cb_idx].to(device=device, dtype=torch.long)
@@ -1880,12 +1883,12 @@ def plot_logit_lens_step_n(
             return torch.stack(cb_probs, dim=0).mean(dim=0)
 
         # User-focus probability is shifted by +1 target step: compare probs(n)
-        # with user audio targets at n+1, averaged across all codebooks.
-        user_audio_prob = _audio_prob_all_codebooks(user_audio_targets[1:])
+        # with user audio targets at n+1.
+        user_audio_prob = _audio_prob_for_codebooks(user_audio_targets[1:])
 
         # Model-focus probability remains step-aligned with n on the same valid
         # plotted range [0..T-2].
-        model_audio_prob = _audio_prob_all_codebooks(model_audio_targets[:-1])
+        model_audio_prob = _audio_prob_for_codebooks(model_audio_targets[:-1])
 
         model_text_prob = _prob_from_logits(
             text_logits[:-1],
@@ -1906,10 +1909,21 @@ def plot_logit_lens_step_n(
             "ratio_line1_over_line2": ratio.tolist(),
             "line1_shift": "n_to_n_plus_1",
             "line2_shift": "n_to_n",
-            "line1_mode": "avg(user_audio_all_codebooks)",
-            "line2_mode": "avg(model_text,avg(model_audio_all_codebooks))",
+            "line1_mode": (
+                "avg(user_audio_all_codebooks)"
+                if use_all_codebook
+                else "user_audio_cb0"
+            ),
+            "line2_mode": (
+                "avg(model_text,avg(model_audio_all_codebooks))"
+                if use_all_codebook
+                else "avg(model_text,model_audio_cb0)"
+            ),
             "metric": "probability",
-            "audio_codebooks": int(num_audio_codebooks),
+            "audio_codebook_mode": "all" if use_all_codebook else "first",
+            "audio_codebooks": int(num_audio_codebooks if use_all_codebook else 1),
+            "audio_codebooks_available": int(num_audio_codebooks),
+            "audio_codebooks_used": int(num_audio_codebooks if use_all_codebook else 1),
             "moving_average_window": 1,
             "smoothing": "none",
             "layer": int(layer),
@@ -2013,6 +2027,7 @@ def plot_logit_lens_dataset(
     moshi_weight: Optional[str] = None,
     device: str = "cuda",
     ma_window: int = 5,
+    use_all_codebook: bool = False,
 ) -> None:
     """Find ``root_dir/*/output_hidden(.pt)`` and save logit-lens probabilities.
 
@@ -2080,6 +2095,7 @@ def plot_logit_lens_dataset(
                     ma_window=ma_window,
                     ce_json_path=str(out_json),
                     save_plot=False,
+                    use_all_codebook=use_all_codebook,
                 )
                 ok += 1
         except Exception as exc:
@@ -2911,6 +2927,14 @@ def main() -> None:
         default=5,
         help="Half-window size for hidden smoothing (default: 5).",
     )
+    ap.add_argument(
+        "--use-all-codebook",
+        action="store_true",
+        help=(
+            "For logit-lens probability, average audio probability across all "
+            "inferred depformer codebooks instead of using only codebook 0."
+        ),
+    )
     args = ap.parse_args()
 
     # ---- dispatch -----------------------------------------------------------
@@ -3011,6 +3035,7 @@ def main() -> None:
             moshi_weight=args.moshi_weight,
             device=args.device,
             ma_window=args.window,
+            use_all_codebook=args.use_all_codebook,
         )
 
     elif args.plot_attention_heatmap_turn_taking:
