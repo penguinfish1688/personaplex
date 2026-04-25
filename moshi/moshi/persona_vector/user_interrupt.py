@@ -316,7 +316,7 @@ def inference(
     root_dir: str,
     save_hidden: bool = False,
     payload_target_layer: Optional[int] = None,
-    resume: int = 1,
+    resume: int = 0,
 ) -> None:
     """
     Take root_dir as input there will be <root_dir>/*/input.wav file
@@ -1272,7 +1272,7 @@ def inference_with_steering(
     offset=0,
         save_hidden=False,
         steer_attn_only: bool = False,
-        resume: int = 1,
+        resume: int = 0,
     ) -> None:
     """
     In the root_dir/*/steering_vector.json, we have the steering vectors calculated from calculate_steering_vector() for each input.wav file.
@@ -2027,4 +2027,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
