@@ -161,14 +161,25 @@ def _compute_prob_lines_for_layer(
 		raise ValueError("Need at least 2 token steps for shifted listen probability.")
 	if layer < 0 or layer >= num_layers:
 		raise ValueError(f"Layer {layer} out of range [0, {num_layers - 1}]")
-	num_audio_codebooks = int(getattr(lm, "num_audio_codebooks", getattr(lm, "n_q", 8)))
+	output_audio_width = int(output_token_ids.shape[1]) - 1
+	user_audio_width = int(input_token_ids.shape[1]) - 1 - output_audio_width
+	num_audio_codebooks = min(
+		int(getattr(lm, "dep_q", output_audio_width)),
+		output_audio_width,
+		user_audio_width,
+	)
 	if num_audio_codebooks <= 0:
-		raise ValueError(f"Invalid num_audio_codebooks={num_audio_codebooks}")
-	user_audio_start = 1 + num_audio_codebooks
-	if input_token_ids.shape[1] < 1 + (2 * num_audio_codebooks):
 		raise ValueError(
-			f"input_token_ids width < {1 + (2 * num_audio_codebooks)}; "
-			f"expected {num_audio_codebooks} model/user audio codebooks"
+			"Unable to infer audio codebook layout from token IDs: "
+			f"input_width={input_token_ids.shape[1]}, output_width={output_token_ids.shape[1]}, "
+			f"lm_dep_q={getattr(lm, 'dep_q', None)}"
+		)
+	user_audio_start = 1 + output_audio_width
+	if input_token_ids.shape[1] < user_audio_start + num_audio_codebooks:
+		raise ValueError(
+			f"input_token_ids width < {user_audio_start + num_audio_codebooks}; "
+			f"expected {num_audio_codebooks} user audio codebooks after "
+			f"{output_audio_width} model audio codebooks"
 		)
 	if output_token_ids.shape[1] < 1 + num_audio_codebooks:
 		raise ValueError(
