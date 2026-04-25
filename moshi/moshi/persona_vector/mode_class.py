@@ -2561,7 +2561,8 @@ def logit_lens_heatmap(root_dir) -> None:
     the percentlie is calcuted from  10th to 20th layers as endpoints layers has some outliers.
 
     Note: current input JSON stores probability values; legacy CE/NLL files are
-    converted to probability with exp(-CE). This heatmap visualizes log(prob).
+    converted to probability with exp(-CE). This saves both log(prob) and raw
+    probability heatmaps.
     """
     import matplotlib.pyplot as plt
     import numpy as np
@@ -2697,11 +2698,13 @@ def logit_lens_heatmap(root_dir) -> None:
                     "Need all 32 layers (0..31)."
                 )
 
-    def _build_heat(which: str, anchor: str) -> np.ndarray:
+    def _build_heat(which: str, anchor: str, *, use_log: bool) -> np.ndarray:
         rows: List[np.ndarray] = []
         for lv in layers:
             stack = np.stack(bucket[which][anchor][lv], axis=0)
-            rows.append(np.nanmean(np.log(np.clip(stack, 1e-12, None)), axis=0))
+            if use_log:
+                stack = np.log(np.clip(stack, 1e-12, None))
+            rows.append(np.nanmean(stack, axis=0))
         return np.stack(rows, axis=0).astype(np.float32)
 
     def _get_scale_bounds(mat: np.ndarray) -> tuple[float, float]:
@@ -2728,40 +2731,45 @@ def logit_lens_heatmap(root_dir) -> None:
     generated = 0
     for anchor in anchors:
         for which in ("line1", "line2"):
-            mat = _build_heat(which=which, anchor=anchor)
-            vmin, vmax = _get_scale_bounds(mat)
+            for use_log in (True, False):
+                mat = _build_heat(which=which, anchor=anchor, use_log=use_log)
+                vmin, vmax = _get_scale_bounds(mat)
 
-            fig, ax = plt.subplots(figsize=(11.0, 6.5), dpi=180)
-            img = ax.imshow(
-                mat,
-                aspect="auto",
-                interpolation="nearest",
-                origin="lower",
-                cmap=cmap,
-                vmin=vmin,
-                vmax=vmax,
-                extent=(float(rel_tok[0]), float(rel_tok[-1]), -0.5, 31.5),
-            )
-            cbar = fig.colorbar(img, ax=ax)
-            cbar.set_label("Log probability value (P5/P95 from layers 10-20)")
+                fig, ax = plt.subplots(figsize=(11.0, 6.5), dpi=180)
+                img = ax.imshow(
+                    mat,
+                    aspect="auto",
+                    interpolation="nearest",
+                    origin="lower",
+                    cmap=cmap,
+                    vmin=vmin,
+                    vmax=vmax,
+                    extent=(float(rel_tok[0]), float(rel_tok[-1]), -0.5, 31.5),
+                )
+                cbar = fig.colorbar(img, ax=ax)
+                scale_name = "Log probability" if use_log else "Probability"
+                cbar.set_label(f"{scale_name} value (P5/P95 from layers 10-20)")
 
-            line_desc = (
-                "line1 = user audio log probability (listening-focus)"
-                if which == "line1"
-                else "line2 = model text/audio log probability (speaking-focus)"
-            )
-            ax.set_title(f"Logit-Lens Heatmap | {anchor} | {which}\n{line_desc}")
-            ax.set_xlabel("Relative token index")
-            ax.set_ylabel("Layer")
-            ax.set_yticks(np.arange(0, 32, 1))
-            ax.set_ylim(-0.5, 31.5)
+                line_desc = (
+                    f"line1 = user audio {scale_name.lower()} (listening-focus)"
+                    if which == "line1"
+                    else f"line2 = model text/audio {scale_name.lower()} (speaking-focus)"
+                )
+                ax.set_title(f"Logit-Lens Heatmap | {anchor} | {which}\n{line_desc}")
+                ax.set_xlabel("Relative token index")
+                ax.set_ylabel("Layer")
+                ax.set_yticks(np.arange(0, 32, 1))
+                ax.set_ylim(-0.5, 31.5)
 
-            out_png = root / f"logit_lens_heatmap_{anchor}_{which}.png"
-            fig.tight_layout()
-            fig.savefig(out_png, bbox_inches="tight")
-            plt.close(fig)
-            print(f"[plot-logit-heatmap] Saved {out_png}")
-            generated += 1
+                if use_log:
+                    out_png = root / f"logit_lens_heatmap_{anchor}_{which}.png"
+                else:
+                    out_png = root / f"logit_lens_heatmap_no_log_{anchor}_{which}.png"
+                fig.tight_layout()
+                fig.savefig(out_png, bbox_inches="tight")
+                plt.close(fig)
+                print(f"[plot-logit-heatmap] Saved {out_png}")
+                generated += 1
 
     print(
         f"[plot-logit-heatmap] Done. Generated {generated} heatmaps from {used_samples} samples."
