@@ -5,7 +5,7 @@ with inference outputs (at minimum: ``output_hidden.pt`` and audio files).
 
 Step 1: Generate ``input.json``
   - Classify token indices into T_listen / T_speak using thresholds over a
-	middle-layer range.
+	middle-layer range of logit-lens probabilities.
   - Writes:
 	  {
 		"input": <text>,
@@ -23,7 +23,7 @@ Step 2: Visualize classification and audio activity
 
 Usage examples:
   python -m moshi.persona_vector.mode_class_label generate-input \
-	  --root-dir /path/to/root --theta-listen -2.0 --theta-speak -2.0 \
+	  --root-dir /path/to/root --theta-listen 0.01 --theta-speak 0.01 \
 	  --layer-start 10 --layer-end 20
 
   python -m moshi.persona_vector.mode_class_label visualize-token-dist \
@@ -40,7 +40,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 
 from moshi.models import loaders
@@ -138,7 +137,7 @@ def _validate_layer_range(layer_start: int, layer_end: int, num_layers: int) -> 
 	return list(range(layer_start, layer_end + 1))
 
 
-def _compute_ll_lines_for_layer(
+def _compute_prob_lines_for_layer(
 	payload: Dict[str, Any],
 	lm: Any,
 	layer: int,
@@ -159,19 +158,28 @@ def _compute_ll_lines_for_layer(
 
 	t_total, num_layers, _ = hidden.shape
 	if t_total < 2:
-		raise ValueError("Need at least 2 token steps for shifted listen LL.")
+		raise ValueError("Need at least 2 token steps for shifted listen probability.")
 	if layer < 0 or layer >= num_layers:
 		raise ValueError(f"Layer {layer} out of range [0, {num_layers - 1}]")
-	if input_token_ids.shape[1] < 10:
-		raise ValueError("input_token_ids width < 10; expected user audio cb0 at index 9")
-	if output_token_ids.shape[1] < 2:
-		raise ValueError("output_token_ids width < 2; expected model audio cb0 at index 1")
+	num_audio_codebooks = int(getattr(lm, "num_audio_codebooks", getattr(lm, "n_q", 8)))
+	if num_audio_codebooks <= 0:
+		raise ValueError(f"Invalid num_audio_codebooks={num_audio_codebooks}")
+	user_audio_start = 1 + num_audio_codebooks
+	if input_token_ids.shape[1] < 1 + (2 * num_audio_codebooks):
+		raise ValueError(
+			f"input_token_ids width < {1 + (2 * num_audio_codebooks)}; "
+			f"expected {num_audio_codebooks} model/user audio codebooks"
+		)
+	if output_token_ids.shape[1] < 1 + num_audio_codebooks:
+		raise ValueError(
+			f"output_token_ids width < {1 + num_audio_codebooks}; "
+			f"expected {num_audio_codebooks} model audio codebooks"
+		)
 
 	h_l = hidden[:, layer, :]  # [T, D]
 	text_tokens = output_token_ids[:, 0]  # [T]
-	user_audio_target = input_token_ids[:, 9]  # [T]
-	model_audio_target = output_token_ids[:, 1]  # [T]
-	user_text_target = input_token_ids[:, 0]  # [T]
+	user_audio_targets = input_token_ids[:, user_audio_start : user_audio_start + num_audio_codebooks]  # [T,K_audio]
+	model_audio_targets = output_token_ids[:, 1 : 1 + num_audio_codebooks]  # [T,K_audio]
 	model_text_target = output_token_ids[:, 0]  # [T]
 
 	device = lm.device
@@ -183,53 +191,72 @@ def _compute_ll_lines_for_layer(
 			x = lm.out_norm(x)
 
 		text_logits = lm.text_linear(x)[:, 0, :].float()  # [T, V_text]
-		dep_in = text_tokens.to(device=device, dtype=torch.long)[:, None, None]  # [T,1,1]
-		with lm.depformer.streaming(t_total):
-			logits0 = lm.forward_depformer(0, dep_in, x)  # [T,1,1,V_audio]
-		logits0 = logits0[:, 0, 0, :].float()  # [T, V_audio]
 
-		def _ce(logits_2d: torch.Tensor, target_1d: torch.Tensor) -> torch.Tensor:
+		def _prob(logits_2d: torch.Tensor, target_1d: torch.Tensor) -> torch.Tensor:
 			probs = torch.softmax(logits_2d, dim=-1)
-			return F.nll_loss(
-				torch.log(probs.clamp_min(1e-12)),
-				target_1d,
-				reduction="none",
-			)
+			return probs.gather(1, target_1d.unsqueeze(1)).squeeze(1)
 
-		user_audio_ce = _ce(
-			logits0[:-1],
-			user_audio_target[1:].to(device=device, dtype=torch.long),
-		)
-		model_audio_ce = _ce(
-			logits0[:-1],
-			model_audio_target[:-1].to(device=device, dtype=torch.long),
-		)
-		user_text_ce = _ce(
-			text_logits[:-1],
-			user_text_target[1:].to(device=device, dtype=torch.long),
-		)
-		model_text_ce = _ce(
+		def _audio_prob_all_codebooks(audio_targets_tk: torch.Tensor) -> torch.Tensor:
+			steps = int(audio_targets_tk.shape[0])
+			if steps <= 0:
+				return torch.empty((0,), device=device, dtype=torch.float32)
+			x_steps = x[:-1]
+			prev_token = text_tokens[:-1].to(device=device, dtype=torch.long)[:, None, None]
+			cb_probs: List[torch.Tensor] = []
+			with lm.depformer.streaming(steps):
+				for cb_idx in range(num_audio_codebooks):
+					logits = lm.forward_depformer(cb_idx, prev_token, x_steps)
+					logits = logits[:, 0, 0, :].float()
+					target = audio_targets_tk[:, cb_idx].to(device=device, dtype=torch.long)
+					cb_probs.append(_prob(logits, target))
+					prev_token = target[:, None, None]
+			return torch.stack(cb_probs, dim=0).mean(dim=0)
+
+		user_audio_prob = _audio_prob_all_codebooks(user_audio_targets[1:])
+		model_audio_prob = _audio_prob_all_codebooks(model_audio_targets[:-1])
+		model_text_prob = _prob(
 			text_logits[:-1],
 			model_text_target[:-1].to(device=device, dtype=torch.long),
 		)
 
-		ce_user = 0.5 * (user_audio_ce + user_text_ce)  # line1 in mode_class.py
-		ce_model = 0.5 * (model_audio_ce + model_text_ce)  # line2 in mode_class.py
+		prob_listen = user_audio_prob  # line1 in mode_class.py
+		prob_speak = 0.5 * (model_audio_prob + model_text_prob)  # line2 in mode_class.py
 
-	# LL is defined as negative CE/NLL.
-	ll_listen = (-ce_user.detach().cpu().float()).numpy()
-	ll_speak = (-ce_model.detach().cpu().float()).numpy()
-	return ll_listen, ll_speak
+	return (
+		prob_listen.detach().cpu().float().numpy(),
+		prob_speak.detach().cpu().float().numpy(),
+	)
 
 
-def _load_or_compute_ll_for_layers(
+def _saved_logit_lens_prob_lines(data: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
+	if "line1_user_prob" in data or "line2_model_prob" in data:
+		line1 = np.asarray(data.get("line1_user_prob", []), dtype=np.float32)
+		line2 = np.asarray(data.get("line2_model_prob", []), dtype=np.float32)
+	else:
+		line1_ce = np.asarray(
+			data.get("line1_user_multimodal_ce", []),
+			dtype=np.float32,
+		)
+		line2_ce = np.asarray(
+			data.get("line2_model_multimodal_ce", []),
+			dtype=np.float32,
+		)
+		line1 = np.exp(-line1_ce).astype(np.float32, copy=False)
+		line2 = np.exp(-line2_ce).astype(np.float32, copy=False)
+	if line1.ndim != 1 or line2.ndim != 1 or line1.size == 0 or line2.size == 0:
+		raise ValueError("Malformed probability arrays in saved logit-lens json")
+	n = min(line1.shape[0], line2.shape[0])
+	return line1[:n], line2[:n]
+
+
+def _load_or_compute_prob_for_layers(
 	sample_dir: Path,
 	payload: Dict[str, Any],
 	layer_ids: Sequence[int],
 	lm: Any,
 ) -> Tuple[np.ndarray, np.ndarray]:
-	ll_listen_layers: List[np.ndarray] = []
-	ll_speak_layers: List[np.ndarray] = []
+	prob_listen_layers: List[np.ndarray] = []
+	prob_speak_layers: List[np.ndarray] = []
 
 	for layer in layer_ids:
 		ce_json = sample_dir / f"in_out_ce_{layer}.json"
@@ -237,31 +264,19 @@ def _load_or_compute_ll_for_layers(
 			with ce_json.open("r", encoding="utf-8") as f:
 				ce_data = json.load(f)
 			if not isinstance(ce_data, dict):
-				raise TypeError(f"Invalid CE json format: {ce_json}")
+				raise TypeError(f"Invalid logit-lens json format: {ce_json}")
 
-			l1_ce = np.asarray(
-				ce_data.get("line1_user_multimodal_ce", []),
-				dtype=np.float32,
-			)
-			l2_ce = np.asarray(
-				ce_data.get("line2_model_multimodal_ce", []),
-				dtype=np.float32,
-			)
-			if l1_ce.ndim != 1 or l2_ce.ndim != 1 or l1_ce.size == 0 or l2_ce.size == 0:
-				raise ValueError(f"Malformed CE arrays in {ce_json}")
-			n = min(l1_ce.shape[0], l2_ce.shape[0])
-			ll_listen = -l1_ce[:n]
-			ll_speak = -l2_ce[:n]
+			prob_listen, prob_speak = _saved_logit_lens_prob_lines(ce_data)
 		else:
-			ll_listen, ll_speak = _compute_ll_lines_for_layer(payload, lm, int(layer))
+			prob_listen, prob_speak = _compute_prob_lines_for_layer(payload, lm, int(layer))
 
-		ll_listen_layers.append(ll_listen.astype(np.float32, copy=False))
-		ll_speak_layers.append(ll_speak.astype(np.float32, copy=False))
+		prob_listen_layers.append(prob_listen.astype(np.float32, copy=False))
+		prob_speak_layers.append(prob_speak.astype(np.float32, copy=False))
 
-	min_len = min(arr.shape[0] for arr in ll_listen_layers + ll_speak_layers)
-	ll_listen_stack = np.stack([a[:min_len] for a in ll_listen_layers], axis=0)
-	ll_speak_stack = np.stack([a[:min_len] for a in ll_speak_layers], axis=0)
-	return ll_listen_stack, ll_speak_stack
+	min_len = min(arr.shape[0] for arr in prob_listen_layers + prob_speak_layers)
+	prob_listen_stack = np.stack([a[:min_len] for a in prob_listen_layers], axis=0)
+	prob_speak_stack = np.stack([a[:min_len] for a in prob_speak_layers], axis=0)
+	return prob_listen_stack, prob_speak_stack
 
 
 def generate_input_jsons(
@@ -290,7 +305,7 @@ def generate_input_jsons(
 	lm.eval()
 
 	print(
-		"[mode_class_label] Generating input.json using LL thresholds "
+		"[mode_class_label] Generating input.json using probability thresholds "
 		f"(theta_listen={theta_listen}, theta_speak={theta_speak}, "
 		f"layers={layer_start}..{layer_end})"
 	)
@@ -300,7 +315,7 @@ def generate_input_jsons(
 		try:
 			hidden_path = _discover_hidden_path(sample_dir)
 			payload = _load_hidden_payload(str(hidden_path))
-			ll_listen, ll_speak = _load_or_compute_ll_for_layers(
+			prob_listen, prob_speak = _load_or_compute_prob_for_layers(
 				sample_dir,
 				payload,
 				layer_ids,
@@ -308,13 +323,13 @@ def generate_input_jsons(
 			)  # [L, Tm1], [L, Tm1]
 
 			# From paper formalization:
-			# T_speak:   LL_speak >= theta_speak AND LL_listen < theta_listen for all middle layers
-			# T_listen:  LL_listen >= theta_listen AND LL_speak < theta_speak for all middle layers
-			speak_mask = np.all(ll_speak >= theta_speak, axis=0) & np.all(
-				ll_listen < theta_listen, axis=0
+			# T_speak:   prob_speak >= theta_speak AND prob_listen < theta_listen for all middle layers
+			# T_listen:  prob_listen >= theta_listen AND prob_speak < theta_speak for all middle layers
+			speak_mask = np.all(prob_speak >= theta_speak, axis=0) & np.all(
+				prob_listen < theta_listen, axis=0
 			)
-			listen_mask = np.all(ll_listen >= theta_listen, axis=0) & np.all(
-				ll_speak < theta_speak, axis=0
+			listen_mask = np.all(prob_listen >= theta_listen, axis=0) & np.all(
+				prob_speak < theta_speak, axis=0
 			)
 
 			out = {
@@ -472,7 +487,7 @@ def visualize_token_distribution(root_dir: str) -> None:
 def main() -> None:
 	ap = argparse.ArgumentParser(
 		prog="mode_class_label",
-		description="Generate input.json labels from LL thresholds and visualize token/audio distribution.",
+		description="Generate input.json labels from probability thresholds and visualize token/audio distribution.",
 	)
 	sub = ap.add_subparsers(dest="cmd", required=True)
 

@@ -1756,21 +1756,20 @@ def plot_logit_lens_step_n(
     ma_window: int = 5,
     ce_json_path: Optional[str] = None,
     save_plot: bool = True,
-    input_audio_only: bool = False,
 ) -> None:
-    """Plot step-n premature-decode CE losses and aligned waveforms.
+    """Plot step-n premature-decode probabilities and aligned waveforms.
 
     Top subplot:
-            - User Multi-modal CE (shifted): logits from step n vs user targets at step n+1
-                i.e. (CE_audio_user_shift + CE_text_user_shift) / 2
-    - Model Multi-modal CE: (CE_audio_model + CE_text_model) / 2
+      - User audio probability (shifted): logits from step n vs user audio
+        targets at step n+1, averaged across all audio codebooks.
+      - Model probability: average of model text probability and model audio
+        probability, with model audio averaged across all audio codebooks.
 
     Bottom subplot:
       - input.wav and output.wav amplitudes over physical time.
     """
     import matplotlib.pyplot as plt
     import numpy as np
-    import torch.nn.functional as F
 
     payload = _load_hidden_payload(hidden_path)
     frame_rate_hz = float(payload.get("frame_rate", 12.5))
@@ -1795,7 +1794,7 @@ def plot_logit_lens_step_n(
 
     T, num_layers, d_hidden = hidden.shape
     if T < 2:
-        raise ValueError("Need at least 2 token steps to compute user n+1 shifted CE.")
+        raise ValueError("Need at least 2 token steps to compute user n+1 shifted probability.")
     if input_token_ids.shape[0] != T or output_token_ids.shape[0] != T:
         raise ValueError(
             "Token-length mismatch across hidden/token-id tensors: "
@@ -1809,20 +1808,27 @@ def plot_logit_lens_step_n(
     # Expected token layout:
     # input_token_ids: [text(0), model_audio(1..8), user_audio(9..16)]
     # output_token_ids: [text(0), model_audio(1..8)]
-    if input_token_ids.shape[1] < 10:
+    num_audio_codebooks = int(getattr(lm, "num_audio_codebooks", getattr(lm, "n_q", 8)))
+    if num_audio_codebooks <= 0:
+        raise ValueError(f"Invalid num_audio_codebooks={num_audio_codebooks}")
+    user_audio_start = 1 + num_audio_codebooks
+    if input_token_ids.shape[1] < 1 + (2 * num_audio_codebooks):
         raise ValueError(
-            f"input_token_ids width too small ({input_token_ids.shape[1]}), expected >=10 for user audio cb0 at index 9."
+            f"input_token_ids width too small ({input_token_ids.shape[1]}), "
+            f"expected >= {1 + (2 * num_audio_codebooks)} for {num_audio_codebooks} model/user audio codebooks."
         )
-    if output_token_ids.shape[1] < 2:
+    if output_token_ids.shape[1] < 1 + num_audio_codebooks:
         raise ValueError(
-            f"output_token_ids width too small ({output_token_ids.shape[1]}), expected >=2 for model audio cb0 at index 1."
+            f"output_token_ids width too small ({output_token_ids.shape[1]}), "
+            f"expected >= {1 + num_audio_codebooks} for {num_audio_codebooks} model audio codebooks."
         )
 
     h_l = hidden[:, actual_layer, :]  # [T, D]
     text_tokens = output_token_ids[:, 0]  # [T], used to condition depformer audio decode.
-    user_audio_target = input_token_ids[:, 9]  # first user-audio codebook
-    model_audio_target = output_token_ids[:, 1]  # first model-audio codebook
-    user_text_target = input_token_ids[:, 0]
+    user_audio_targets = input_token_ids[
+        :, user_audio_start : user_audio_start + num_audio_codebooks
+    ]  # [T, K_audio]
+    model_audio_targets = output_token_ids[:, 1 : 1 + num_audio_codebooks]  # [T, K_audio]
     model_text_target = output_token_ids[:, 0]
 
     device = lm.device
@@ -1835,67 +1841,62 @@ def plot_logit_lens_step_n(
         # Premature text logits directly from the text decode head.
         text_logits = lm.text_linear(x)[:, 0, :].float()  # [T, text_card(+pad)]
 
-        dep_in = text_tokens.to(device=device, dtype=torch.long)[:, None, None]  # [T,1,1]
-        # First audio codebook decode head logits.
-        with lm.depformer.streaming(T):
-            logits0 = lm.forward_depformer(0, dep_in, x)  # [T, 1, 1, card]
-        logits0 = logits0[:, 0, 0, :].float()  # [T, card]
-
-        def _ce_from_probs(logits_2d: torch.Tensor, target_1d: torch.Tensor) -> torch.Tensor:
+        def _prob_from_logits(logits_2d: torch.Tensor, target_1d: torch.Tensor) -> torch.Tensor:
             probs = torch.softmax(logits_2d, dim=-1)
-            return F.nll_loss(
-                torch.log(probs.clamp_min(1e-12)),
-                target_1d,
-                reduction="none",
-            )
+            return probs.gather(1, target_1d.unsqueeze(1)).squeeze(1)
 
-        # User-focus CE is shifted by +1 target step: compare probs(n) with user_target(n+1).
-        user_audio_ce = _ce_from_probs(
-            logits0[:-1],
-            user_audio_target[1:].to(device=device, dtype=torch.long),
-        )
+        def _audio_prob_all_codebooks(audio_targets_tk: torch.Tensor) -> torch.Tensor:
+            steps = int(audio_targets_tk.shape[0])
+            if steps <= 0:
+                return torch.empty((0,), device=device, dtype=torch.float32)
 
-        # Model-focus CE remains step-aligned with n on the same valid plotted range [0..T-2].
-        model_audio_ce = _ce_from_probs(
-            logits0[:-1],
-            model_audio_target[:-1].to(device=device, dtype=torch.long),
-        )
+            x_steps = x[:-1]
+            prev_token = text_tokens[:-1].to(device=device, dtype=torch.long)[:, None, None]
+            cb_probs: list[torch.Tensor] = []
+            with lm.depformer.streaming(steps):
+                for cb_idx in range(num_audio_codebooks):
+                    logits = lm.forward_depformer(cb_idx, prev_token, x_steps)
+                    logits = logits[:, 0, 0, :].float()
+                    target = audio_targets_tk[:, cb_idx].to(device=device, dtype=torch.long)
+                    cb_probs.append(_prob_from_logits(logits, target))
+                    prev_token = target[:, None, None]
+            return torch.stack(cb_probs, dim=0).mean(dim=0)
 
-        user_text_ce = _ce_from_probs(
-            text_logits[:-1],
-            user_text_target[1:].to(device=device, dtype=torch.long),
-        )
-        model_text_ce = _ce_from_probs(
+        # User-focus probability is shifted by +1 target step: compare probs(n)
+        # with user audio targets at n+1, averaged across all codebooks.
+        user_audio_prob = _audio_prob_all_codebooks(user_audio_targets[1:])
+
+        # Model-focus probability remains step-aligned with n on the same valid
+        # plotted range [0..T-2].
+        model_audio_prob = _audio_prob_all_codebooks(model_audio_targets[:-1])
+
+        model_text_prob = _prob_from_logits(
             text_logits[:-1],
             model_text_target[:-1].to(device=device, dtype=torch.long),
         )
 
-        if input_audio_only:
-            ce_user = user_audio_ce
-        else:
-            ce_user = 0.5 * (user_audio_ce + user_text_ce)
-        ce_model = 0.5 * (model_audio_ce + model_text_ce)
+        user_prob = user_audio_prob
+        model_prob = 0.5 * (model_audio_prob + model_text_prob)
 
-    ce_user_s = ce_user.detach().cpu().float()
-    ce_model_s = ce_model.detach().cpu().float()
-    ratio = ce_user_s / ce_model_s.clamp_min(1e-6)
+    user_prob_s = user_prob.detach().cpu().float()
+    model_prob_s = model_prob.detach().cpu().float()
+    ratio = user_prob_s / model_prob_s.clamp_min(1e-12)
 
     if ce_json_path is not None:
         ce_payload = {
-            "line1_user_multimodal_ce": ce_user_s.tolist(),
-            "line2_model_multimodal_ce": ce_model_s.tolist(),
+            "line1_user_prob": user_prob_s.tolist(),
+            "line2_model_prob": model_prob_s.tolist(),
             "ratio_line1_over_line2": ratio.tolist(),
             "line1_shift": "n_to_n_plus_1",
             "line2_shift": "n_to_n",
-            "line1_mode": (
-                "input_audio_only_cb0"
-                if input_audio_only
-                else "avg(input_audio_cb0,input_text)"
-            ),
+            "line1_mode": "avg(user_audio_all_codebooks)",
+            "line2_mode": "avg(model_text,avg(model_audio_all_codebooks))",
+            "metric": "probability",
+            "audio_codebooks": int(num_audio_codebooks),
             "moving_average_window": 1,
             "smoothing": "none",
             "layer": int(layer),
-            "num_points": int(ce_user_s.shape[0]),
+            "num_points": int(user_prob_s.shape[0]),
         }
         ce_out = Path(ce_json_path)
         ce_out.parent.mkdir(parents=True, exist_ok=True)
@@ -1939,11 +1940,11 @@ def plot_logit_lens_step_n(
         ratio_np,
         color="#1f77b4",
         linewidth=1.2,
-        label="CE ratio: line1/line2 (raw)",
+        label="Probability ratio: line1/line2 (raw)",
     )
-    ax_top.set_ylabel("CE ratio")
+    ax_top.set_ylabel("Probability ratio")
     ax_top.set_title(
-        f"Logit Lens CE Ratio line1/line2 (layer={layer}, tokens={T})"
+        f"Logit Lens Probability Ratio line1/line2 (layer={layer}, tokens={T})"
     )
     y_all = ratio_np[np.isfinite(ratio_np)]
     if y_all.size > 0:
@@ -1985,7 +1986,7 @@ def plot_logit_lens_step_n(
     fig.tight_layout()
     fig.savefig(out_p, bbox_inches="tight")
     plt.close(fig)
-    print(f"[plot] Saved logit-lens CE plot to {output_path}")
+    print(f"[plot] Saved logit-lens probability plot to {output_path}")
 
 def plot_logit_lens_dataset(
     root_dir: str,
@@ -1995,11 +1996,10 @@ def plot_logit_lens_dataset(
     moshi_weight: Optional[str] = None,
     device: str = "cuda",
     ma_window: int = 5,
-    input_audio_only: bool = False,
 ) -> None:
-    """Find ``root_dir/*/output_hidden(.pt)`` and plot logit-lens CE for each.
+    """Find ``root_dir/*/output_hidden(.pt)`` and save logit-lens probabilities.
 
-    If ``layer == -1``, generates plots/CE JSON for all available layers.
+    If ``layer == -1``, generates probability JSON for all available layers.
     Otherwise only the specified layer is processed.
     """
     root = Path(root_dir)
@@ -2063,7 +2063,6 @@ def plot_logit_lens_dataset(
                     ma_window=ma_window,
                     ce_json_path=str(out_json),
                     save_plot=False,
-                    input_audio_only=input_audio_only,
                 )
                 ok += 1
         except Exception as exc:
@@ -2072,12 +2071,37 @@ def plot_logit_lens_dataset(
     print(f"\n[plot-logit-lens] Done. Generated {ok}/{total_jobs} plots.")
 
 
+def _saved_logit_lens_prob_lines(data: Dict[str, Any]) -> tuple["np.ndarray", "np.ndarray"]:
+    """Return saved line1/line2 probabilities, converting legacy CE/NLL files."""
+    import numpy as np
+
+    if "line1_user_prob" in data or "line2_model_prob" in data:
+        line1 = np.asarray(data.get("line1_user_prob", []), dtype=np.float32)
+        line2 = np.asarray(data.get("line2_model_prob", []), dtype=np.float32)
+    else:
+        line1_ce = np.asarray(
+            data.get("line1_user_multimodal_ce", []), dtype=np.float32
+        )
+        line2_ce = np.asarray(
+            data.get("line2_model_multimodal_ce", []), dtype=np.float32
+        )
+        line1 = np.exp(-line1_ce).astype(np.float32, copy=False)
+        line2 = np.exp(-line2_ce).astype(np.float32, copy=False)
+
+    if line1.ndim != 1 or line2.ndim != 1:
+        raise ValueError("Saved logit-lens line arrays must be 1D")
+    if line1.shape[0] == 0 or line2.shape[0] == 0:
+        raise ValueError("Saved logit-lens line arrays are empty")
+    n = min(line1.shape[0], line2.shape[0])
+    return line1[:n], line2[:n]
+
+
 def plot_logit_lens_turn_taking_from_saved(
     root_dirs: List[str],
     *,
     span: int = 50,
 ) -> None:
-    """Average saved logit-lens CE traces around turn-taking anchors.
+    """Average saved logit-lens probability traces around turn-taking anchors.
 
     Reads ``<root>/*/in_out_ce_*.json`` and ``<root>/*/input_timing.json`` for
     each root in ``root_dirs``. For each layer and anchor
@@ -2177,27 +2201,14 @@ def plot_logit_lens_turn_taking_from_saved(
                     if not isinstance(ce_data, dict):
                         continue
 
-                    line1 = np.asarray(
-                        ce_data.get("line1_user_multimodal_ce", []), dtype=np.float32
-                    )
-                    line2 = np.asarray(
-                        ce_data.get("line2_model_multimodal_ce", []), dtype=np.float32
-                    )
-                    ratio = np.asarray(
-                        ce_data.get("ratio_line1_over_line2", []), dtype=np.float32
-                    )
-                    if line1.ndim != 1 or line2.ndim != 1:
+                    try:
+                        line1, line2 = _saved_logit_lens_prob_lines(ce_data)
+                    except ValueError:
                         continue
-                    if line1.shape[0] == 0 or line2.shape[0] == 0:
-                        continue
-
                     n = min(line1.shape[0], line2.shape[0])
                     line1 = line1[:n]
                     line2 = line2[:n]
-                    if ratio.ndim == 1 and ratio.shape[0] >= n:
-                        ratio = ratio[:n]
-                    else:
-                        ratio = line1 / np.clip(line2, 1e-6, None)
+                    ratio = line1 / np.clip(line2, 1e-12, None)
 
                     bucket = per_layer.setdefault(
                         int(layer_val),
@@ -2428,19 +2439,19 @@ def plot_logit_lens_turn_taking_from_saved(
 
                 merged_json["datasets"][ds_name] = {
                     "num_samples": n_samples,
-                    "avg_line1_user_multimodal_ce": avg_line1.tolist(),
-                    "avg_line2_model_multimodal_ce": avg_line2.tolist(),
+                    "avg_line1_user_prob": avg_line1.tolist(),
+                    "avg_line2_model_prob": avg_line2.tolist(),
                     "avg_ratio_line1_over_line2": (
-                        (avg_line1 / np.clip(avg_line2, 1e-6, None)).tolist()
+                        (avg_line1 / np.clip(avg_line2, 1e-12, None)).tolist()
                     ),
                     "num_samples_input_audio": n_input,
                     "avg_input_audio_abs_amplitude": avg_input_amp.tolist(),
                 }
 
             ax_top.axvline(0, color="#444444", linestyle="--", linewidth=0.9, alpha=0.8)
-            ax_top.set_ylabel("CE ratio")
+            ax_top.set_ylabel("Probability ratio")
             ax_top.set_title(
-                f"Average Logit-Lens CE Ratio Around {anchor} (layer={layer_val}, window=+/-{span})"
+                f"Average Logit-Lens Probability Ratio Around {anchor} (layer={layer_val}, window=+/-{span})"
             )
             ax_top.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
             ax_top.legend(loc="upper right", fontsize=8)
@@ -2501,23 +2512,23 @@ def plot_logit_lens_turn_taking_from_saved(
 def logit_lens_heatmap(root_dir) -> None:
     """
     For root dir look for
-    logit_lens_turn_taking_layer_{layer}_interrupt_start_user_interrupt_ce.json
-    and logit_lens_turn_taking_layer_{layer}_question_start_user_question_ce.json
+    logit_lens_turn_taking_layer_{layer}_interrupt_start_user_interrupt_prob.json
+    and logit_lens_turn_taking_layer_{layer}_question_start_user_question_prob.json
     for each layer 0-31 (raise error if not all 32 layers found).
 
     Supports four anchors from input_timing.json:
     question_start, question_end, interrupt_start, interrupt_end.
     Generates plots only for anchors that exist in data; missing anchors are
     skipped.
-    One heatmap is for listening mode CE and the other is for speaking mode CE (i'm not sure which is which (line1 or line2)) remember to show in the plot
+    One heatmap is for listening mode probability and the other is for speaking mode probability (line1 or line2).
     For each plot, the y axis should be the layer number (0-31) and the x axis should be the relative token index (-span to +span).
 
     The color scale for for each heatmap should be consistent across all layers
     decide the scale based on the 5th and 95th percentile to be 95% saturated of blue and 95% staturated for red
     the percentlie is calcuted from  10th to 20th layers as endpoints layers has some outliers.
 
-    Note: input JSON stores CE/NLL values, but this plot visualizes log-likelihood
-    by negating those values before rendering.
+    Note: current input JSON stores probability values; legacy CE/NLL files are
+    converted to probability with exp(-CE).
     """
     import matplotlib.pyplot as plt
     import numpy as np
@@ -2579,7 +2590,7 @@ def logit_lens_heatmap(root_dir) -> None:
                 missing_anchor_samples += 1
                 continue
 
-            # Must have all 32 per-layer CE JSONs in this sample directory.
+            # Must have all 32 per-layer probability JSONs in this sample directory.
             ce_paths = {lv: sd / f"in_out_ce_{lv}.json" for lv in layers}
             if any(not p.is_file() for p in ce_paths.values()):
                 missing_ce_samples += 1
@@ -2594,9 +2605,9 @@ def logit_lens_heatmap(root_dir) -> None:
                 if not isinstance(ce, dict):
                     ok = False
                     break
-                l1 = np.asarray(ce.get("line1_user_multimodal_ce", []), dtype=np.float32)
-                l2 = np.asarray(ce.get("line2_model_multimodal_ce", []), dtype=np.float32)
-                if l1.ndim != 1 or l2.ndim != 1 or l1.size == 0 or l2.size == 0:
+                try:
+                    l1, l2 = _saved_logit_lens_prob_lines(ce)
+                except ValueError:
                     ok = False
                     break
                 n = min(l1.shape[0], l2.shape[0])
@@ -2628,7 +2639,7 @@ def logit_lens_heatmap(root_dir) -> None:
             "(question_start/question_end/interrupt_start/interrupt_end) and "
             "in_out_ce_0..31.json. "
             f"Skipped due to missing anchors: {missing_anchor_samples}, "
-            f"missing CE layer files: {missing_ce_samples}."
+            f"missing probability layer files: {missing_ce_samples}."
         )
 
     anchors = [
@@ -2684,9 +2695,7 @@ def logit_lens_heatmap(root_dir) -> None:
     generated = 0
     for anchor in anchors:
         for which in ("line1", "line2"):
-            # Saved JSON is CE/NLL; visualize log-likelihood by negating it.
-            mat_nll = _build_heat(which=which, anchor=anchor)
-            mat = -mat_nll
+            mat = _build_heat(which=which, anchor=anchor)
             vmin, vmax = _get_scale_bounds(mat)
 
             fig, ax = plt.subplots(figsize=(11.0, 6.5), dpi=180)
@@ -2701,12 +2710,12 @@ def logit_lens_heatmap(root_dir) -> None:
                 extent=(float(rel_tok[0]), float(rel_tok[-1]), -0.5, 31.5),
             )
             cbar = fig.colorbar(img, ax=ax)
-            cbar.set_label("Log-likelihood value (negated from CE/NLL, P5/P95 from layers 10-20)")
+            cbar.set_label("Probability value (P5/P95 from layers 10-20)")
 
             line_desc = (
-                "line1 = user multimodal log-likelihood (from negated CE; likely listening-focus)"
+                "line1 = user audio probability (all codebooks; listening-focus)"
                 if which == "line1"
-                else "line2 = model multimodal log-likelihood (from negated CE; likely speaking-focus)"
+                else "line2 = average model text/audio probability (all audio codebooks; speaking-focus)"
             )
             ax.set_title(f"Logit-Lens Heatmap | {anchor} | {which}\n{line_desc}")
             ax.set_xlabel("Relative token index")
@@ -2798,7 +2807,7 @@ def main() -> None:
         "--plot-logit-lens-dataset",
         type=str,
         metavar="ROOT_DIR",
-        help="Plot step-n logit-lens CE + aligned waveforms for ROOT_DIR/*/output_hidden(.pt).",
+        help="Plot step-n logit-lens probability + aligned waveforms for ROOT_DIR/*/output_hidden(.pt).",
     )
     group.add_argument(
         "--plot-attention-heatmap-turn-taking",
@@ -2819,7 +2828,7 @@ def main() -> None:
         metavar="ROOT_DIR",
         help=(
             "Build layer-vs-token heatmaps from saved "
-            "logit_lens_turn_taking_layer_<layer>_<anchor>_<ce_type>.json files "
+            "logit_lens_turn_taking_layer_<layer>_<anchor>_<prob_type>.json files "
             "for layers 0..31."
         ),
     )
@@ -2885,15 +2894,6 @@ def main() -> None:
         default=5,
         help="Half-window size for hidden smoothing (default: 5).",
     )
-    ap.add_argument(
-        "--input-audio-only",
-        action="store_true",
-        help=(
-            "For --plot-logit-lens-dataset, compute line1/input CE using only "
-            "input audio token CE (cb0) instead of averaging with input text CE."
-        ),
-    )
-
     args = ap.parse_args()
 
     # ---- dispatch -----------------------------------------------------------
@@ -2994,7 +2994,6 @@ def main() -> None:
             moshi_weight=args.moshi_weight,
             device=args.device,
             ma_window=args.window,
-            input_audio_only=args.input_audio_only,
         )
 
     elif args.plot_attention_heatmap_turn_taking:
