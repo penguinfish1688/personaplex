@@ -1296,6 +1296,19 @@ def run_batch_inference(
             torch.save(payload, output_hidden)
             log("info", f"Wrote hidden payload to {output_hidden}")
 
+    for streaming_obj in (mimi, other_mimi, lm_gen):
+        try:
+            streaming_obj._stop_streaming()
+        except Exception:
+            pass
+    gc.collect()
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except RuntimeError:
+            pass
+
     log("info", f"Batch inference completed for {len(input_wavs)} instances")
     if return_hidden_layers and len(batch_hidden_layers) > 0:
         log("info", f"Hidden layers for {len(batch_hidden_layers)} instances with {len(batch_hidden_layers[0])} steps were returned during batch inference.")

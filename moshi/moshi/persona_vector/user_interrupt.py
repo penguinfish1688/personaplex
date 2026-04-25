@@ -1,4 +1,5 @@
 import argparse
+import gc
 import json
 import math
 import os
@@ -25,6 +26,17 @@ JSON_LAYER_MAX = MAIN_LAYER_MAX
 
 
 _MODE_CLASS_HIDDEN_CACHE: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _cleanup_cuda_memory() -> None:
+    """Release CUDA cache after per-sample inference reloads large models."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except RuntimeError:
+            pass
 
 
 def _load_existing_steering_payload(steering_path: Path) -> dict:
@@ -1519,59 +1531,62 @@ def inference_with_steering(
                     f"min_tokens={min_tokens}, non_null={non_null}"
                 )
 
-        with torch.no_grad():
-            if legacy_single_layer:
-                run_batch_inference(
-                    input_wavs=[input_wav],
-                    output_wavs=[output_wav],
-                    output_texts=[output_text],
-                    text_prompts=[SYSTEM_PROMPT],
-                    voice_prompt_path=voice_prompt_path,
-                    tokenizer_path=None,
-                    moshi_weight=None,
-                    mimi_weight=None,
-                    hf_repo=loaders.DEFAULT_REPO,
-                    device="cuda",
-                    seed=42,
-                    temp_audio=0.8,
-                    temp_text=0.7,
-                    topk_audio=250,
-                    topk_text=25,
-                    greedy=False,
-                    save_voice_prompt_embeddings=False,
-                    cpu_offload=False,
-                    return_hidden_layers=False,
-                    save_hidden_payload=bool(save_hidden),
-                    output_hiddens=[output_hidden] if save_hidden else None,
-                    steering_vectors=steering_vectors,
-                    steering_layer=int(requested_layers[0]),
-                )
-            else:
-                run_batch_inference(
-                    input_wavs=[input_wav],
-                    output_wavs=[output_wav],
-                    output_texts=[output_text],
-                    text_prompts=[SYSTEM_PROMPT],
-                    voice_prompt_path=voice_prompt_path,
-                    tokenizer_path=None,
-                    moshi_weight=None,
-                    mimi_weight=None,
-                    hf_repo=loaders.DEFAULT_REPO,
-                    device="cuda",
-                    seed=42,
-                    temp_audio=0.8,
-                    temp_text=0.7,
-                    topk_audio=250,
-                    topk_text=25,
-                    greedy=False,
-                    save_voice_prompt_embeddings=False,
-                    cpu_offload=False,
-                    return_hidden_layers=False,
-                    save_hidden_payload=bool(save_hidden),
-                    output_hiddens=[output_hidden] if save_hidden else None,
-                    steering_vectors_by_layer=steering_vectors_by_layer,
-                    steer_attn_only=bool(steer_attn_only),
-                )
+        try:
+            with torch.no_grad():
+                if legacy_single_layer:
+                    run_batch_inference(
+                        input_wavs=[input_wav],
+                        output_wavs=[output_wav],
+                        output_texts=[output_text],
+                        text_prompts=[SYSTEM_PROMPT],
+                        voice_prompt_path=voice_prompt_path,
+                        tokenizer_path=None,
+                        moshi_weight=None,
+                        mimi_weight=None,
+                        hf_repo=loaders.DEFAULT_REPO,
+                        device="cuda",
+                        seed=42,
+                        temp_audio=0.8,
+                        temp_text=0.7,
+                        topk_audio=250,
+                        topk_text=25,
+                        greedy=False,
+                        save_voice_prompt_embeddings=False,
+                        cpu_offload=False,
+                        return_hidden_layers=False,
+                        save_hidden_payload=bool(save_hidden),
+                        output_hiddens=[output_hidden] if save_hidden else None,
+                        steering_vectors=steering_vectors,
+                        steering_layer=int(requested_layers[0]),
+                    )
+                else:
+                    run_batch_inference(
+                        input_wavs=[input_wav],
+                        output_wavs=[output_wav],
+                        output_texts=[output_text],
+                        text_prompts=[SYSTEM_PROMPT],
+                        voice_prompt_path=voice_prompt_path,
+                        tokenizer_path=None,
+                        moshi_weight=None,
+                        mimi_weight=None,
+                        hf_repo=loaders.DEFAULT_REPO,
+                        device="cuda",
+                        seed=42,
+                        temp_audio=0.8,
+                        temp_text=0.7,
+                        topk_audio=250,
+                        topk_text=25,
+                        greedy=False,
+                        save_voice_prompt_embeddings=False,
+                        cpu_offload=False,
+                        return_hidden_layers=False,
+                        save_hidden_payload=bool(save_hidden),
+                        output_hiddens=[output_hidden] if save_hidden else None,
+                        steering_vectors_by_layer=steering_vectors_by_layer,
+                        steer_attn_only=bool(steer_attn_only),
+                    )
+        finally:
+            _cleanup_cuda_memory()
 
     if save_hidden:
         print(f"[user_interrupt] Done. Wrote output.wav/output.json/output_hidden.pt for {len(input_paths)} items.")
