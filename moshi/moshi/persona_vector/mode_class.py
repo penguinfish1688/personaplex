@@ -2553,7 +2553,7 @@ def logit_lens_heatmap(root_dir) -> None:
     question_start, question_end, interrupt_start, interrupt_end.
     Generates plots only for anchors that exist in data; missing anchors are
     skipped.
-    One heatmap is for listening mode probability and the other is for speaking mode probability (line1 or line2).
+    One heatmap is for listening mode log-probability and the other is for speaking mode log-probability (line1 or line2).
     For each plot, the y axis should be the layer number (0-31) and the x axis should be the relative token index (-span to +span).
 
     The color scale for for each heatmap should be consistent across all layers
@@ -2561,7 +2561,7 @@ def logit_lens_heatmap(root_dir) -> None:
     the percentlie is calcuted from  10th to 20th layers as endpoints layers has some outliers.
 
     Note: current input JSON stores probability values; legacy CE/NLL files are
-    converted to probability with exp(-CE).
+    converted to probability with exp(-CE). This heatmap visualizes log(prob).
     """
     import matplotlib.pyplot as plt
     import numpy as np
@@ -2701,7 +2701,7 @@ def logit_lens_heatmap(root_dir) -> None:
         rows: List[np.ndarray] = []
         for lv in layers:
             stack = np.stack(bucket[which][anchor][lv], axis=0)
-            rows.append(np.nanmean(stack, axis=0))
+            rows.append(np.nanmean(np.log(np.clip(stack, 1e-12, None)), axis=0))
         return np.stack(rows, axis=0).astype(np.float32)
 
     def _get_scale_bounds(mat: np.ndarray) -> tuple[float, float]:
@@ -2743,12 +2743,12 @@ def logit_lens_heatmap(root_dir) -> None:
                 extent=(float(rel_tok[0]), float(rel_tok[-1]), -0.5, 31.5),
             )
             cbar = fig.colorbar(img, ax=ax)
-            cbar.set_label("Probability value (P5/P95 from layers 10-20)")
+            cbar.set_label("Log probability value (P5/P95 from layers 10-20)")
 
             line_desc = (
-                "line1 = user audio probability (all codebooks; listening-focus)"
+                "line1 = user audio log probability (listening-focus)"
                 if which == "line1"
-                else "line2 = average model text/audio probability (all audio codebooks; speaking-focus)"
+                else "line2 = model text/audio log probability (speaking-focus)"
             )
             ax.set_title(f"Logit-Lens Heatmap | {anchor} | {which}\n{line_desc}")
             ax.set_xlabel("Relative token index")
