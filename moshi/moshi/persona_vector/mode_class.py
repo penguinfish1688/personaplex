@@ -1808,18 +1808,24 @@ def plot_logit_lens_step_n(
     # Expected token layout:
     # input_token_ids: [text(0), model_audio(1..8), user_audio(9..16)]
     # output_token_ids: [text(0), model_audio(1..8)]
-    output_audio_width = int(output_token_ids.shape[1]) - 1
-    user_audio_width = int(input_token_ids.shape[1]) - 1 - output_audio_width
-    num_audio_codebooks = min(
-        int(getattr(lm, "dep_q", output_audio_width)),
-        output_audio_width,
-        user_audio_width,
-    )
+    input_audio_width = int(input_token_ids.shape[1]) - 1
+    output_audio_width_raw = int(output_token_ids.shape[1]) - 1
+    if input_audio_width >= 2 and input_audio_width % 2 == 0:
+        # Personaplex duplex payloads store text + model-audio + user-audio.
+        output_audio_width = input_audio_width // 2
+        user_audio_width = input_audio_width // 2
+    else:
+        # Legacy payloads may store output_token_ids as text + model-audio only.
+        output_audio_width = output_audio_width_raw
+        user_audio_width = input_audio_width - output_audio_width
+    dep_q = int(getattr(lm, "dep_q", output_audio_width))
+    num_audio_codebooks = min(output_audio_width, user_audio_width, dep_q)
     if num_audio_codebooks <= 0:
         raise ValueError(
             "Unable to infer audio codebook layout from token IDs: "
             f"input_width={input_token_ids.shape[1]}, output_width={output_token_ids.shape[1]}, "
-            f"lm_dep_q={getattr(lm, 'dep_q', None)}"
+            f"lm_dep_q={getattr(lm, 'dep_q', None)}, input_audio_width={input_audio_width}, "
+            f"output_audio_width_raw={output_audio_width_raw}"
         )
     user_audio_start = 1 + output_audio_width
     if input_token_ids.shape[1] < user_audio_start + num_audio_codebooks:
