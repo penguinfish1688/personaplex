@@ -2542,6 +2542,177 @@ def plot_logit_lens_turn_taking_from_saved(
             print(f"[plot-logit-turn] Saved {out_json}")
 
 
+def plot_layerwise_turn_transition_heatmap(
+    heatmap,
+    token_offsets,
+    output_path_prefix,
+    vmin=None,
+    vmax=None,
+    title: str = "Layer-wise Perception Score Around Turn Transition",
+    colorbar_label: str = r"$\log P(u^{(t+1)}_{\mathrm{audio},0} \mid h^{(t)})$",
+    cmap: str = "RdBu_r",
+) -> tuple[Path, Path]:
+    """Save a publication-quality layer-vs-token-offset heatmap.
+
+    Example:
+        >>> heatmap = np.random.randn(32, 71)
+        >>> token_offsets = np.arange(-35, 36)
+        >>> plot_layerwise_turn_transition_heatmap(
+        ...     heatmap,
+        ...     token_offsets,
+        ...     "figures/perception_score",
+        ...     vmin=shared_vmin,
+        ...     vmax=shared_vmax,
+        ... )
+        >>> plot_layerwise_turn_transition_heatmap(
+        ...     heatmap,
+        ...     token_offsets,
+        ...     "figures/generation_score",
+        ...     vmin=shared_vmin,
+        ...     vmax=shared_vmax,
+        ...     title="Layer-wise Generation Score Around Turn Transition",
+        ...     colorbar_label=r"$\log S_{\mathrm{gen}}(t)$",
+        ... )
+    """
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib import ticker as mticker
+
+    mat = np.asarray(heatmap, dtype=np.float32)
+    offsets = np.asarray(token_offsets)
+    if mat.ndim != 2:
+        raise ValueError(f"heatmap must be 2D, got shape {mat.shape}")
+    if offsets.ndim != 1:
+        raise ValueError(f"token_offsets must be 1D, got shape {offsets.shape}")
+    if mat.shape[1] != offsets.shape[0]:
+        raise ValueError(
+            "heatmap width must match token_offsets length: "
+            f"{mat.shape[1]} vs {offsets.shape[0]}"
+        )
+
+    finite = mat[np.isfinite(mat)]
+    if finite.size == 0:
+        raise ValueError("heatmap contains no finite values")
+    if vmin is None or vmax is None:
+        auto_vmin = float(np.percentile(finite, 5.0))
+        auto_vmax = float(np.percentile(finite, 95.0))
+        if auto_vmax <= auto_vmin:
+            auto_vmax = auto_vmin + 1e-6
+        if vmin is None:
+            vmin = auto_vmin
+        if vmax is None:
+            vmax = auto_vmax
+    if float(vmax) <= float(vmin):
+        vmax = float(vmin) + 1e-6
+
+    if offsets.shape[0] > 1:
+        step = float(np.nanmedian(np.diff(offsets.astype(np.float64))))
+        if not np.isfinite(step) or step == 0.0:
+            step = 1.0
+    else:
+        step = 1.0
+    x_left = float(offsets[0]) - 0.5 * abs(step)
+    x_right = float(offsets[-1]) + 0.5 * abs(step)
+
+    fig, ax = plt.subplots(figsize=(5.4, 3.2), dpi=300)
+    img = ax.imshow(
+        mat,
+        aspect="auto",
+        interpolation="nearest",
+        origin="lower",
+        cmap=cmap,
+        vmin=float(vmin),
+        vmax=float(vmax),
+        extent=(x_left, x_right, -0.5, mat.shape[0] - 0.5),
+    )
+
+    ax.axvline(0, color="black", linestyle="--", linewidth=1.0, alpha=0.8)
+    ax.set_title(title, fontsize=14, pad=8)
+    ax.set_xlabel("Token offset from turn boundary", fontsize=12)
+    ax.set_ylabel("Transformer layer", fontsize=12)
+    ax.tick_params(axis="both", labelsize=9)
+    ax.set_xlim(x_left, x_right)
+    ax.set_ylim(-0.5, mat.shape[0] - 0.5)
+
+    x_locator = mticker.MaxNLocator(nbins=8, integer=True)
+    x_ticks = [
+        t
+        for t in x_locator.tick_values(float(offsets[0]), float(offsets[-1]))
+        if x_left <= t <= x_right
+    ]
+    if float(offsets[0]) <= 0.0 <= float(offsets[-1]) and not any(
+        abs(t) < 1e-9 for t in x_ticks
+    ):
+        x_ticks.append(0.0)
+    ax.set_xticks(sorted(set(float(t) for t in x_ticks)))
+
+    if mat.shape[0] <= 16:
+        y_ticks = np.arange(mat.shape[0])
+    else:
+        y_ticks = [
+            t
+            for t in mticker.MaxNLocator(nbins=7, integer=True).tick_values(
+                0, mat.shape[0] - 1
+            )
+            if 0 <= t <= mat.shape[0] - 1
+        ]
+        if 0 not in y_ticks:
+            y_ticks.append(0)
+        if (mat.shape[0] - 1) not in y_ticks:
+            y_ticks.append(mat.shape[0] - 1)
+        y_ticks = sorted(set(int(t) for t in y_ticks))
+    ax.set_yticks(y_ticks)
+
+    cbar = fig.colorbar(img, ax=ax, pad=0.02)
+    cbar.set_label(colorbar_label, fontsize=10)
+    cbar.ax.tick_params(labelsize=9)
+
+    prefix = Path(output_path_prefix)
+    if prefix.suffix:
+        prefix = prefix.with_suffix("")
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    pdf_path = prefix.with_suffix(".pdf")
+    png_path = prefix.with_suffix(".png")
+    fig.tight_layout()
+    fig.savefig(pdf_path, bbox_inches="tight")
+    fig.savefig(png_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return pdf_path, png_path
+
+
+def plot_generation_score_heatmap(
+    heatmap,
+    token_offsets,
+    output_path_prefix,
+    vmin=None,
+    vmax=None,
+    title: str = "Layer-wise Generation Score Around Turn Transition",
+) -> tuple[Path, Path]:
+    """Save a paper-quality generation-score heatmap.
+
+    Example:
+        >>> plot_generation_score_heatmap(
+        ...     generation_heatmap,
+        ...     np.arange(-35, 36),
+        ...     "figures/generation_score",
+        ...     vmin=shared_vmin,
+        ...     vmax=shared_vmax,
+        ... )
+    """
+    return plot_layerwise_turn_transition_heatmap(
+        heatmap=heatmap,
+        token_offsets=token_offsets,
+        output_path_prefix=output_path_prefix,
+        vmin=vmin,
+        vmax=vmax,
+        title=title,
+        colorbar_label=r"$\log S_{\mathrm{gen}}(t)$",
+    )
+
+
 def logit_lens_heatmap(root_dir) -> None:
     """
     For root dir look for
@@ -2549,24 +2720,18 @@ def logit_lens_heatmap(root_dir) -> None:
     and logit_lens_turn_taking_layer_{layer}_question_start_user_question_prob.json
     for each layer 0-31 (raise error if not all 32 layers found).
 
-    Supports four anchors from input_timing.json:
-    question_start, question_end, interrupt_start, interrupt_end.
-    Generates plots only for anchors that exist in data; missing anchors are
-    skipped.
-    One heatmap is for listening mode log-probability and the other is for speaking mode log-probability (line1 or line2).
+    Supports four anchors from input_timing.json and generates plots only for
+    anchors that exist in data; missing anchors are skipped. One heatmap is for
+    perception score and the other is for generation score.
     For each plot, the y axis should be the layer number (0-31) and the x axis should be the relative token index (-span to +span).
 
-    The color scale for for each heatmap should be consistent across all layers
-    decide the scale based on the 5th and 95th percentile to be 95% saturated of blue and 95% staturated for red
-    the percentlie is calcuted from  10th to 20th layers as endpoints layers has some outliers.
+    The color scale is shared across all related heatmaps for each score type
+    using 5th and 95th percentiles.
 
     Note: current input JSON stores probability values; legacy CE/NLL files are
-    converted to probability with exp(-CE). This saves both log(prob) and raw
-    probability heatmaps.
+    converted to probability with exp(-CE). This saves log-score heatmaps.
     """
-    import matplotlib.pyplot as plt
     import numpy as np
-    from matplotlib.colors import LinearSegmentedColormap
 
     root = Path(root_dir)
     if not root.is_dir():
@@ -2707,12 +2872,12 @@ def logit_lens_heatmap(root_dir) -> None:
             rows.append(np.nanmean(stack, axis=0))
         return np.stack(rows, axis=0).astype(np.float32)
 
-    def _get_scale_bounds(mat: np.ndarray) -> tuple[float, float]:
-        # Use middle layers (10..20) to reduce endpoint outlier impact.
-        vals = mat[10:21, :]
+    def _get_shared_scale_bounds(mats: List[np.ndarray]) -> tuple[float, float]:
+        finite_parts = [m[np.isfinite(m)] for m in mats if np.isfinite(m).any()]
+        if not finite_parts:
+            return 0.0, 1.0
+        vals = np.concatenate(finite_parts)
         finite = vals[np.isfinite(vals)]
-        if finite.size == 0:
-            finite = mat[np.isfinite(mat)]
         if finite.size == 0:
             return 0.0, 1.0
         p5 = float(np.percentile(finite, 5.0))
@@ -2721,58 +2886,51 @@ def logit_lens_heatmap(root_dir) -> None:
             p95 = p5 + 1e-6
         return p5, p95
 
-    base = plt.get_cmap("coolwarm")
-    cmap = LinearSegmentedColormap.from_list(
-        "coolwarm_soft_sat",
-        base(np.linspace(0.025, 0.975, 256)),
-    )
-
     rel_tok = np.arange(-span, span + 1, dtype=np.int32)
+    heatmaps: Dict[str, Dict[str, np.ndarray]] = {"line1": {}, "line2": {}}
+    for which in ("line1", "line2"):
+        for anchor in anchors:
+            heatmaps[which][anchor] = _build_heat(
+                which=which,
+                anchor=anchor,
+                use_log=True,
+            )
+
+    shared_bounds = {
+        which: _get_shared_scale_bounds(list(heatmaps[which].values()))
+        for which in ("line1", "line2")
+    }
+
     generated = 0
     for anchor in anchors:
         for which in ("line1", "line2"):
-            for use_log in (True, False):
-                mat = _build_heat(which=which, anchor=anchor, use_log=use_log)
-                vmin, vmax = _get_scale_bounds(mat)
+            mat = heatmaps[which][anchor]
+            vmin, vmax = shared_bounds[which]
 
-                fig, ax = plt.subplots(figsize=(11.0, 6.5), dpi=180)
-                img = ax.imshow(
+            if which == "line1":
+                out_prefix = root / f"logit_lens_heatmap_{anchor}_perception_score"
+                pdf_path, png_path = plot_layerwise_turn_transition_heatmap(
                     mat,
-                    aspect="auto",
-                    interpolation="nearest",
-                    origin="lower",
-                    cmap=cmap,
+                    rel_tok,
+                    out_prefix,
                     vmin=vmin,
                     vmax=vmax,
-                    extent=(float(rel_tok[0]), float(rel_tok[-1]), -0.5, 31.5),
                 )
-                cbar = fig.colorbar(img, ax=ax)
-                scale_name = "Log probability" if use_log else "Probability"
-                cbar.set_label(f"{scale_name} value (P5/P95 from layers 10-20)")
-
-                line_desc = (
-                    f"line1 = user audio {scale_name.lower()} (listening-focus)"
-                    if which == "line1"
-                    else f"line2 = model text/audio {scale_name.lower()} (speaking-focus)"
+            else:
+                out_prefix = root / f"logit_lens_heatmap_{anchor}_generation_score"
+                pdf_path, png_path = plot_generation_score_heatmap(
+                    mat,
+                    rel_tok,
+                    out_prefix,
+                    vmin=vmin,
+                    vmax=vmax,
                 )
-                ax.set_title(f"Logit-Lens Heatmap | {anchor} | {which}\n{line_desc}")
-                ax.set_xlabel("Relative token index")
-                ax.set_ylabel("Layer")
-                ax.set_yticks(np.arange(0, 32, 1))
-                ax.set_ylim(-0.5, 31.5)
-
-                if use_log:
-                    out_png = root / f"logit_lens_heatmap_{anchor}_{which}.png"
-                else:
-                    out_png = root / f"logit_lens_heatmap_no_log_{anchor}_{which}.png"
-                fig.tight_layout()
-                fig.savefig(out_png, bbox_inches="tight")
-                plt.close(fig)
-                print(f"[plot-logit-heatmap] Saved {out_png}")
-                generated += 1
+            print(f"[plot-logit-heatmap] Saved {pdf_path}")
+            print(f"[plot-logit-heatmap] Saved {png_path}")
+            generated += 2
 
     print(
-        f"[plot-logit-heatmap] Done. Generated {generated} heatmaps from {used_samples} samples."
+        f"[plot-logit-heatmap] Done. Generated {generated} files from {used_samples} samples."
     )
 
 # ---------------------------------------------------------------------------
