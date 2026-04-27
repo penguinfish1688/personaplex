@@ -2598,8 +2598,8 @@ def plot_layerwise_turn_transition_heatmap(
     if finite.size == 0:
         raise ValueError("heatmap contains no finite values")
     if vmin is None or vmax is None:
-        auto_vmin = float(np.percentile(finite, 5.0))
-        auto_vmax = float(np.percentile(finite, 95.0))
+        auto_vmin = float(np.percentile(finite, 7.5))
+        auto_vmax = float(np.percentile(finite, 92.5))
         if auto_vmax <= auto_vmin:
             auto_vmax = auto_vmin + 1e-6
         if vmin is None:
@@ -2721,7 +2721,7 @@ def logit_lens_heatmap(
     For each plot, the y axis should be the layer number (0-31) and the x axis should be the relative token index (-span to +span).
 
     The color scale is shared across all related heatmaps for each score type
-    using 5th and 95th percentiles.
+    using 7.5th and 92.5th percentiles.
 
     Note: current input JSON stores probability values; legacy CE/NLL files are
     converted to probability with exp(-CE). This saves log-score heatmaps.
@@ -2875,11 +2875,11 @@ def logit_lens_heatmap(
         finite = vals[np.isfinite(vals)]
         if finite.size == 0:
             return 0.0, 1.0
-        p5 = float(np.percentile(finite, 5.0))
-        p95 = float(np.percentile(finite, 95.0))
-        if p95 <= p5:
-            p95 = p5 + 1e-6
-        return p5, p95
+        p_low = float(np.percentile(finite, 7.5))
+        p_high = float(np.percentile(finite, 92.5))
+        if p_high <= p_low:
+            p_high = p_low + 1e-6
+        return p_low, p_high
 
     rel_tok = np.arange(-span, span + 1, dtype=np.int32)
     heatmaps: Dict[str, Dict[str, np.ndarray]] = {"line1": {}, "line2": {}}
