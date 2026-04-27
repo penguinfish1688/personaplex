@@ -2638,9 +2638,10 @@ def plot_layerwise_turn_transition_heatmap(
     )
 
     ax.axvline(0, color="black", linestyle="--", linewidth=1.0, alpha=0.8)
-    ax.set_title(title)
-    ax.set_xlabel("Token offset from turn boundary")
-    ax.set_ylabel("Transformer layer")
+    ax.set_title(title, fontsize=15)
+    ax.set_xlabel("Token offset from turn boundary", fontsize=13)
+    ax.set_ylabel("Transformer layer", fontsize=13)
+    ax.tick_params(axis="both", labelsize=11)
     ax.set_xlim(x_left, x_right)
     ax.set_ylim(-0.5, mat.shape[0] - 0.5)
 
@@ -2659,7 +2660,8 @@ def plot_layerwise_turn_transition_heatmap(
     ax.set_yticks(np.arange(mat.shape[0]))
 
     cbar = fig.colorbar(img, ax=ax, pad=0.02)
-    cbar.set_label(colorbar_label)
+    cbar.set_label(colorbar_label, fontsize=13)
+    cbar.ax.tick_params(labelsize=11)
 
     prefix = Path(output_path_prefix)
     if prefix.suffix:
