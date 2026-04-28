@@ -1573,6 +1573,7 @@ def plot_attention_by_subseqent_token_heatmap(
     import numpy as np
 
     root = Path(root_dir)
+    log_prefix = "[plot-attn-subseq]"
     if not root.is_dir():
         raise FileNotFoundError(f"Root directory not found: {root}")
     if span < 1:
@@ -1583,6 +1584,11 @@ def plot_attention_by_subseqent_token_heatmap(
     sample_dirs = sorted([p for p in root.iterdir() if p.is_dir()])
     if not sample_dirs:
         raise FileNotFoundError(f"No sample directories found under {root}")
+    print(
+        f"{log_prefix} Scanning {len(sample_dirs)} sample dirs under {root} "
+        f"(span={span}, future_query_window={window})",
+        flush=True,
+    )
 
     def _jsonable_2d(arr: np.ndarray) -> List[List[Optional[float]]]:
         out: List[List[Optional[float]]] = []
@@ -1619,32 +1625,67 @@ def plot_attention_by_subseqent_token_heatmap(
     # Collect per-sample anchored matrices for plotting: [L, span+1]
     sample_maps: List[np.ndarray] = []
     num_layers_ref: Optional[int] = None
+    skipped = 0
 
-    for sd in sample_dirs:
+    for sample_idx, sd in enumerate(sample_dirs, start=1):
         timing_path = sd / "input_timing.json"
         hidden_path = sd / "output_hidden.pt"
         if not hidden_path.exists():
             hidden_path = sd / "output_hidden"
         if not timing_path.is_file() or not hidden_path.is_file():
+            skipped += 1
+            print(
+                f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] SKIP {sd.name}: "
+                "missing input_timing.json or output_hidden(.pt)",
+                flush=True,
+            )
             continue
 
         try:
+            print(
+                f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] Loading {sd.name}",
+                flush=True,
+            )
             with timing_path.open("r", encoding="utf-8") as f:
                 timing = json.load(f)
             if not isinstance(timing, dict) or "interrupt_start" not in timing:
+                skipped += 1
+                print(
+                    f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] SKIP {sd.name}: "
+                    "input_timing.json missing interrupt_start",
+                    flush=True,
+                )
                 continue
 
             payload = _load_hidden_payload(str(hidden_path))
             frame_rate_hz = float(payload.get("frame_rate", 12.5))
             anchor_tok = int(round(float(timing["interrupt_start"]) * frame_rate_hz))
             if anchor_tok < 0:
+                skipped += 1
+                print(
+                    f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] SKIP {sd.name}: "
+                    f"negative anchor token {anchor_tok}",
+                    flush=True,
+                )
                 continue
 
             attn_steps = payload.get("text_attention_weights", None)
             if not isinstance(attn_steps, list) or len(attn_steps) == 0:
+                skipped += 1
+                print(
+                    f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] SKIP {sd.name}: "
+                    "missing non-empty text_attention_weights",
+                    flush=True,
+                )
                 continue
             first_attn = next((a for a in attn_steps if isinstance(a, torch.Tensor)), None)
             if first_attn is None or first_attn.ndim != 3:
+                skipped += 1
+                print(
+                    f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] SKIP {sd.name}: "
+                    "no valid attention tensor",
+                    flush=True,
+                )
                 continue
 
             L = int(first_attn.shape[0])
@@ -1652,13 +1693,35 @@ def plot_attention_by_subseqent_token_heatmap(
                 num_layers_ref = L
             elif num_layers_ref != L:
                 # Keep a consistent layer dimension across samples.
+                skipped += 1
+                print(
+                    f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] SKIP {sd.name}: "
+                    f"layer count {L} != reference {num_layers_ref}",
+                    flush=True,
+                )
                 continue
 
             T = len(attn_steps)
+            print(
+                f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] Calculating {sd.name}: "
+                f"layers={L}, steps={T}, anchor_token={anchor_tok}, "
+                f"frame_rate={frame_rate_hz:g}Hz",
+                flush=True,
+            )
             # Full conversation values for this sample: [L, T].
             local_all_tokens = np.full((L, T), np.nan, dtype=np.float32)
             for l in range(L):
+                print(
+                    f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] "
+                    f"Layer {l + 1}/{L}: building attention matrix",
+                    flush=True,
+                )
                 mat = _build_attn_prob_matrix(payload, l)  # [T, T]
+                print(
+                    f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] "
+                    f"Layer {l + 1}/{L}: averaging future attention",
+                    flush=True,
+                )
                 for t in range(T):
                     if t >= T - 1:
                         continue
@@ -1698,7 +1761,19 @@ def plot_attention_by_subseqent_token_heatmap(
                 json.dump(per_sample_json, f, indent=2, ensure_ascii=False)
 
             sample_maps.append(local)
-        except Exception:
+            finite_count = int(np.isfinite(local_all_tokens).sum())
+            print(
+                f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] Done {sd.name}: "
+                f"finite_cells={finite_count}/{local_all_tokens.size}, wrote {per_sample_out}",
+                flush=True,
+            )
+        except Exception as exc:
+            skipped += 1
+            print(
+                f"{log_prefix} [{sample_idx}/{len(sample_dirs)}] SKIP {sd.name}: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
             continue
 
     if not sample_maps:
@@ -1706,6 +1781,11 @@ def plot_attention_by_subseqent_token_heatmap(
             "No valid samples found with input_timing.json (interrupt_start) and output_hidden(.pt)."
         )
 
+    print(
+        f"{log_prefix} Aggregating {len(sample_maps)} valid samples "
+        f"({skipped} skipped)",
+        flush=True,
+    )
     heat = np.nanmean(np.stack(sample_maps, axis=0), axis=0)  # [L, span+1]
     L = int(heat.shape[0])
 
@@ -1745,7 +1825,7 @@ def plot_attention_by_subseqent_token_heatmap(
     fig.tight_layout()
     fig.savefig(out_png, bbox_inches="tight")
     plt.close(fig)
-    print(f"[plot-attn-subseq] Saved {out_png}")
+    print(f"{log_prefix} Saved {out_png}", flush=True)
 
 def plot_logit_lens_step_n(
     hidden_path: str,
@@ -3239,6 +3319,7 @@ def main() -> None:
         plot_attention_by_subseqent_token_heatmap(
             root_dir=args.plot_attention_by_subseqent_token_heatmap,
             span=max(1, int(args.window)),
+            window=max(1, int(args.window)),
         )
 
 
