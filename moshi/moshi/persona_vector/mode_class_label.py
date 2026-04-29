@@ -248,20 +248,13 @@ def _compute_prob_lines_for_layer(
 
 
 def _saved_logit_lens_prob_lines(data: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
-	if "line1_user_prob" in data or "line2_model_prob" in data:
-		line1 = np.asarray(data.get("line1_user_prob", []), dtype=np.float32)
-		line2 = np.asarray(data.get("line2_model_prob", []), dtype=np.float32)
-	else:
-		line1_ce = np.asarray(
-			data.get("line1_user_multimodal_ce", []),
-			dtype=np.float32,
+	if "line1_user_prob" not in data or "line2_model_prob" not in data:
+		raise ValueError(
+			"Saved logit-lens json must use current probability fields: "
+			"line1_user_prob and line2_model_prob"
 		)
-		line2_ce = np.asarray(
-			data.get("line2_model_multimodal_ce", []),
-			dtype=np.float32,
-		)
-		line1 = np.exp(-line1_ce).astype(np.float32, copy=False)
-		line2 = np.exp(-line2_ce).astype(np.float32, copy=False)
+	line1 = np.asarray(data.get("line1_user_prob", []), dtype=np.float32)
+	line2 = np.asarray(data.get("line2_model_prob", []), dtype=np.float32)
 	if line1.ndim != 1 or line2.ndim != 1 or line1.size == 0 or line2.size == 0:
 		raise ValueError("Malformed probability arrays in saved logit-lens json")
 	n = min(line1.shape[0], line2.shape[0])
@@ -269,6 +262,10 @@ def _saved_logit_lens_prob_lines(data: Dict[str, Any]) -> Tuple[np.ndarray, np.n
 
 
 def _saved_codebook_mode_matches(data: Dict[str, Any], use_all_codebook: bool) -> bool:
+	if data.get("metric") != "probability":
+		return False
+	if "line1_user_prob" not in data or "line2_model_prob" not in data:
+		return False
 	expected = "all" if use_all_codebook else "first"
 	mode = data.get("audio_codebook_mode")
 	if mode is not None:

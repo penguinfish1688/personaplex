@@ -2185,21 +2185,17 @@ def plot_logit_lens_dataset(
 
 
 def _saved_logit_lens_prob_lines(data: Dict[str, Any]) -> tuple["np.ndarray", "np.ndarray"]:
-    """Return saved line1/line2 probabilities, converting legacy CE/NLL files."""
+    """Return saved line1/line2 probabilities from the current JSON schema."""
     import numpy as np
 
-    if "line1_user_prob" in data or "line2_model_prob" in data:
-        line1 = np.asarray(data.get("line1_user_prob", []), dtype=np.float32)
-        line2 = np.asarray(data.get("line2_model_prob", []), dtype=np.float32)
-    else:
-        line1_ce = np.asarray(
-            data.get("line1_user_multimodal_ce", []), dtype=np.float32
+    if "line1_user_prob" not in data or "line2_model_prob" not in data:
+        raise ValueError(
+            "Saved logit-lens JSON must use current probability fields: "
+            "line1_user_prob and line2_model_prob"
         )
-        line2_ce = np.asarray(
-            data.get("line2_model_multimodal_ce", []), dtype=np.float32
-        )
-        line1 = np.exp(-line1_ce).astype(np.float32, copy=False)
-        line2 = np.exp(-line2_ce).astype(np.float32, copy=False)
+
+    line1 = np.asarray(data.get("line1_user_prob", []), dtype=np.float32)
+    line2 = np.asarray(data.get("line2_model_prob", []), dtype=np.float32)
 
     if line1.ndim != 1 or line2.ndim != 1:
         raise ValueError("Saved logit-lens line arrays must be 1D")
@@ -2254,9 +2250,6 @@ def plot_logit_lens_turn_taking_from_saved(
             suffix = stem.replace("in_out_ce_", "", 1)
             if suffix.lstrip("-").isdigit():
                 layer_files[int(suffix)] = p
-        legacy = sample_dir / "in_out_ce.json"
-        if legacy.is_file() and -1 not in layer_files:
-            layer_files[-1] = legacy
         return layer_files
 
     def _collect_per_root(
@@ -2421,9 +2414,7 @@ def plot_logit_lens_turn_taking_from_saved(
         missing: list[str] = []
         for sd in sample_dirs:
             has_timing = (sd / "input_timing.json").is_file()
-            has_ce = (sd / "in_out_ce.json").is_file() or any(
-                sd.glob("in_out_ce_*.json")
-            )
+            has_ce = any(sd.glob("in_out_ce_*.json"))
             if has_timing and has_ce:
                 valid_ids.add(sd.name)
             else:
@@ -2447,7 +2438,7 @@ def plot_logit_lens_turn_taking_from_saved(
     if not common_ids:
         raise FileNotFoundError(
             "No shared valid subdirectories across provided roots. "
-            "Need subdirs that exist with both input_timing.json and in_out_ce.json in every dataset root."
+            "Need subdirs that exist with both input_timing.json and current in_out_ce_*.json files in every dataset root."
         )
 
     # Warn about subdirs excluded because they are not present/valid in all roots.
@@ -2485,7 +2476,7 @@ def plot_logit_lens_turn_taking_from_saved(
     if not per_root:
         raise FileNotFoundError(
             "No valid aligned samples found across provided root directories. "
-            "Expected each root to contain subdirs with input_timing.json and in_out_ce.json."
+            "Expected each root to contain subdirs with input_timing.json and current in_out_ce_*.json files."
         )
 
     rel_tok = np.arange(-span, span + 1, dtype=np.int32)
@@ -2805,8 +2796,8 @@ def logit_lens_heatmap(
     The color scale is shared across all related heatmaps for each score type
     using 15th and 85th percentiles.
 
-    Note: current input JSON stores probability values; legacy CE/NLL files are
-    converted to probability with exp(-CE). This saves log-score heatmaps.
+    Note: input JSON must store current probability values
+    (line1_user_prob/line2_model_prob). This saves log-score heatmaps.
     """
     import numpy as np
 
@@ -3098,7 +3089,7 @@ def main() -> None:
         type=str,
         nargs="+",
         metavar="ROOT_DIR",
-        help="Average saved in_out_ce.json traces aligned by question_start/interrupt_start. Accepts one or more ROOT_DIR values and overlays them.",
+        help="Average saved current in_out_ce_*.json probability traces aligned by question_start/interrupt_start. Accepts one or more ROOT_DIR values and overlays them.",
     )
     group.add_argument(
         "--plot-logit-lens-heatmap",
