@@ -67,6 +67,30 @@ def _apply_plot_font_style() -> None:
     )
 
 
+def _half_tick_label(value: float) -> str:
+    scaled = float(value) * 0.5
+    if abs(scaled) < 1e-12:
+        scaled = 0.0
+    return f"{scaled:g}"
+
+
+def _apply_half_tick_formatter(ax, *, x: bool = True, y: bool = True) -> None:
+    from matplotlib import ticker as mticker
+
+    formatter = mticker.FuncFormatter(lambda value, _pos: _half_tick_label(value))
+    if x:
+        ax.xaxis.set_major_formatter(formatter)
+    if y:
+        ax.yaxis.set_major_formatter(formatter)
+
+
+def _apply_half_colorbar_formatter(cbar) -> None:
+    from matplotlib import ticker as mticker
+
+    cbar.formatter = mticker.FuncFormatter(lambda value, _pos: _half_tick_label(value))
+    cbar.update_ticks()
+
+
 def _load_hidden_payload(path: str) -> Dict[str, Any]:
     """Load a hidden payload ``.pt`` file and return its dict."""
     if not os.path.exists(path):
@@ -1294,9 +1318,11 @@ def plot_attention_heatmap(
     # does not shrink the top subplot relative to the waveform subplot.
     cax = ax_top.inset_axes([1.01, 0.0, 0.018, 1.0])
     cbar = fig.colorbar(img, cax=cax)
+    _apply_half_colorbar_formatter(cbar)
     cbar.set_label("Attention logit", fontsize=24)
     cbar.ax.tick_params(labelsize=21)
     ax_top.set_ylabel("Query token position", fontsize=24)
+    _apply_half_tick_formatter(ax_top, x=True, y=True)
     ax_top.tick_params(axis="both", labelsize=21)
     ax_top.grid(False)
 
@@ -1533,9 +1559,11 @@ def plot_attention_heatmap_at_turn_taking(root_dir, span=20, layer=-1):
         )
         cax = ax_top.inset_axes([1.01, 0.0, 0.018, 1.0])
         cbar = fig.colorbar(img, cax=cax)
+        _apply_half_colorbar_formatter(cbar)
         cbar.set_label("Attention logit (P5->5, P95->95)", fontsize=24)
         cbar.ax.tick_params(labelsize=21)
         ax_top.set_ylabel("Query offset (s)", fontsize=24)
+        _apply_half_tick_formatter(ax_top, x=True, y=True)
         ax_top.tick_params(axis="both", labelsize=21)
 
         ax_bot.plot(rel_sec, avg_user, color="#2ca02c", linewidth=0.9, alpha=0.95, label="|input.wav| avg")
@@ -1842,13 +1870,15 @@ def plot_attention_by_subseqent_token_heatmap(
         extent=(float(x[0]), float(x[-1]), -0.5, float(L) - 0.5),
     )
     cbar = fig.colorbar(img, ax=ax)
+    _apply_half_colorbar_formatter(cbar)
     cbar.set_label("Avg future attention weight to token t (vmin=P5, vmax=P95)", fontsize=24)
     cbar.ax.tick_params(labelsize=21)
 
     ax.set_xlabel("Token offset from interrupt_start", fontsize=24)
     ax.set_ylabel("Layer", fontsize=24)
-    ax.tick_params(axis="both", labelsize=21)
     ax.set_yticks(np.arange(0, L, 1))
+    _apply_half_tick_formatter(ax, x=True, y=True)
+    ax.tick_params(axis="both", labelsize=21)
     ax.set_ylim(-0.5, float(L) - 0.5)
 
     out_png = root / "attention_by_subsequent_token_heatmap.png"
@@ -2768,12 +2798,14 @@ def plot_layerwise_turn_transition_heatmap(
 
     layer_ticks = [tick for tick in (0, 7, 15, 23, 31) if tick < mat.shape[0]]
     ax.set_yticks(layer_ticks)
+    _apply_half_tick_formatter(ax, x=True, y=True)
 
     cbar = fig.colorbar(img, ax=ax, pad=0.02)
     if colorbar_ticks is not None:
         cbar.set_ticks(colorbar_ticks)
     if colorbar_ticklabels is not None:
         cbar.set_ticklabels(colorbar_ticklabels)
+    _apply_half_colorbar_formatter(cbar)
     cbar_label_fontsize = 34.5 if r"\text{per}" in colorbar_label else 28.5
     cbar.set_label(colorbar_label, fontsize=cbar_label_fontsize)
     cbar.ax.tick_params(labelsize=22.5)
@@ -3037,7 +3069,7 @@ def logit_lens_heatmap(
             if anchor == "interrupt_start":
                 vmin, vmax = -16.5, -5.5
                 colorbar_ticks = [-16, -14, -12, -10, -8, -6]
-                colorbar_ticklabels = [str(tick) for tick in colorbar_ticks]
+                colorbar_ticklabels = None
             else:
                 vmin, vmax = shared_bounds[which]
                 colorbar_ticks = None
