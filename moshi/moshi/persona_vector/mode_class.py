@@ -2622,6 +2622,7 @@ def plot_layerwise_turn_transition_heatmap(
     title: str = "Layer-wise Perception Score Around Turn Transition",
     colorbar_label: str = r"$\mathcal{S}_\text{per}$",
     cmap: str = "coolwarm_soft_sat",
+    x_label: str = "Token offset from turn boundary",
 ) -> tuple[Path, Path]:
     """Save a publication-quality layer-vs-token-offset heatmap.
 
@@ -2709,10 +2710,10 @@ def plot_layerwise_turn_transition_heatmap(
     )
 
     ax.axvline(0, color="black", linestyle="--", linewidth=1.0, alpha=0.8)
-    ax.set_title(title, fontsize=15)
-    ax.set_xlabel("Token offset from turn boundary", fontsize=13)
-    ax.set_ylabel("Transformer layer", fontsize=13)
-    ax.tick_params(axis="both", labelsize=11)
+    ax.set_title(title, fontsize=18)
+    ax.set_xlabel(x_label, fontsize=16)
+    ax.set_ylabel("Transformer layer", fontsize=16)
+    ax.tick_params(axis="both", labelsize=14)
     ax.set_xlim(x_left, x_right)
     ax.set_ylim(-0.5, mat.shape[0] - 0.5)
 
@@ -2731,8 +2732,8 @@ def plot_layerwise_turn_transition_heatmap(
     ax.set_yticks(np.arange(mat.shape[0]))
 
     cbar = fig.colorbar(img, ax=ax, pad=0.02)
-    cbar.set_label(colorbar_label, fontsize=13)
-    cbar.ax.tick_params(labelsize=11)
+    cbar.set_label(colorbar_label, fontsize=15)
+    cbar.ax.tick_params(labelsize=13)
 
     prefix = Path(output_path_prefix)
     if prefix.suffix:
@@ -2754,6 +2755,7 @@ def plot_generation_score_heatmap(
     vmin=None,
     vmax=None,
     title: str = "Layer-wise Generation Score Around Turn Transition",
+    x_label: str = "Token offset from turn boundary",
 ) -> tuple[Path, Path]:
     """Save a paper-quality generation-score heatmap.
 
@@ -2774,6 +2776,7 @@ def plot_generation_score_heatmap(
         vmax=vmax,
         title=title,
         colorbar_label=r"$\mathcal{S}_\text{gen}$",
+        x_label=x_label,
     )
 
 
@@ -2971,6 +2974,17 @@ def logit_lens_heatmap(
 
     generated = 0
     for anchor in anchors:
+        if anchor == "question_end":
+            x_label = "Token offset from user stop speaking"
+        elif anchor == "interrupt_start":
+            x_label = "Token offset from interruption start"
+        elif anchor == "question_start":
+            x_label = "Token offset from user start speaking"
+        elif anchor == "interrupt_end":
+            x_label = "Token offset from interruption end"
+        else:
+            x_label = f"Token offset from {anchor.replace('_', ' ')}"
+
         for which in ("line1", "line2"):
             mat = heatmaps[which][anchor]
             vmin, vmax = shared_bounds[which]
@@ -2984,6 +2998,7 @@ def logit_lens_heatmap(
                     vmin=vmin,
                     vmax=vmax,
                     title=sper_title,
+                    x_label=x_label,
                 )
             else:
                 out_prefix = root / f"logit_lens_heatmap_{anchor}_generation_score"
@@ -2994,6 +3009,7 @@ def logit_lens_heatmap(
                     vmin=vmin,
                     vmax=vmax,
                     title=sgen_title,
+                    x_label=x_label,
                 )
             print(f"[plot-logit-heatmap] Saved {pdf_path}")
             print(f"[plot-logit-heatmap] Saved {png_path}")
