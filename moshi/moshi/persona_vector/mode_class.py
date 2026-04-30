@@ -1267,11 +1267,10 @@ def plot_attention_heatmap(
     # does not shrink the top subplot relative to the waveform subplot.
     cax = ax_top.inset_axes([1.01, 0.0, 0.018, 1.0])
     cbar = fig.colorbar(img, cax=cax)
-    cbar.set_label("Attention logit")
-    ax_top.set_ylabel("Query token position")
-    ax_top.set_title(
-        f"Attention Logit Heatmap + Audio Timeline (layer={layer}, steps={T})"
-    )
+    cbar.set_label("Attention logit", fontsize=16)
+    cbar.ax.tick_params(labelsize=14)
+    ax_top.set_ylabel("Query token position", fontsize=16)
+    ax_top.tick_params(axis="both", labelsize=14)
     ax_top.grid(False)
 
     ax_bot.plot(
@@ -1290,10 +1289,11 @@ def plot_attention_heatmap(
         alpha=0.85,
         label="|output.wav| (model)",
     )
-    ax_bot.set_ylabel("Absolute amplitude")
-    ax_bot.set_xlabel("Time (seconds)  [aligned with key-axis above]")
+    ax_bot.set_ylabel("Absolute amplitude", fontsize=16)
+    ax_bot.set_xlabel("Time (seconds)  [aligned with key-axis above]", fontsize=16)
+    ax_bot.tick_params(axis="both", labelsize=14)
     ax_bot.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
-    ax_bot.legend(loc="upper right", fontsize=8)
+    ax_bot.legend(loc="upper right", fontsize=13)
     ax_bot.set_xlim(0.0, max_t)
 
     out_p = Path(output_path)
@@ -1504,19 +1504,19 @@ def plot_attention_heatmap_at_turn_taking(root_dir, span=20, layer=-1):
         )
         cax = ax_top.inset_axes([1.01, 0.0, 0.018, 1.0])
         cbar = fig.colorbar(img, cax=cax)
-        cbar.set_label("Attention logit (P5->5, P95->95)")
-        ax_top.set_ylabel("Query offset (s)")
-        ax_top.set_title(
-            f"Average Attention Around {anchor} (layer={layer}, span={span}, n={len(per_anchor_heatmaps[anchor])})"
-        )
+        cbar.set_label("Attention logit (P5->5, P95->95)", fontsize=16)
+        cbar.ax.tick_params(labelsize=14)
+        ax_top.set_ylabel("Query offset (s)", fontsize=16)
+        ax_top.tick_params(axis="both", labelsize=14)
 
         ax_bot.plot(rel_sec, avg_user, color="#2ca02c", linewidth=0.9, alpha=0.95, label="|input.wav| avg")
         ax_bot.plot(rel_sec, avg_model, color="#9467bd", linewidth=0.9, alpha=0.9, label="|output.wav| avg")
         ax_bot.axvline(0.0, color="#444444", linestyle="--", linewidth=0.8, alpha=0.8)
-        ax_bot.set_ylabel("Absolute amplitude")
-        ax_bot.set_xlabel(f"Relative time to {anchor} (s)")
+        ax_bot.set_ylabel("Absolute amplitude", fontsize=16)
+        ax_bot.set_xlabel(f"Relative time to {anchor} (s)", fontsize=16)
+        ax_bot.tick_params(axis="both", labelsize=14)
         ax_bot.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
-        ax_bot.legend(loc="upper right", fontsize=8)
+        ax_bot.legend(loc="upper right", fontsize=13)
         ax_bot.set_xlim(-window_sec, window_sec)
 
         out_path = root / f"attention_heatmap_turn_taking_{anchor}.png"
@@ -1811,13 +1811,12 @@ def plot_attention_by_subseqent_token_heatmap(
         extent=(float(x[0]), float(x[-1]), -0.5, float(L) - 0.5),
     )
     cbar = fig.colorbar(img, ax=ax)
-    cbar.set_label("Avg future attention weight to token t (vmin=P5, vmax=P95)")
+    cbar.set_label("Avg future attention weight to token t (vmin=P5, vmax=P95)", fontsize=16)
+    cbar.ax.tick_params(labelsize=14)
 
-    ax.set_title(
-        f"Attention to Subsequent Tokens (anchor=interrupt_start, span={span}, n={len(sample_maps)})"
-    )
-    ax.set_xlabel("Token offset from interrupt_start")
-    ax.set_ylabel("Layer")
+    ax.set_xlabel("Token offset from interrupt_start", fontsize=16)
+    ax.set_ylabel("Layer", fontsize=16)
+    ax.tick_params(axis="both", labelsize=14)
     ax.set_yticks(np.arange(0, L, 1))
     ax.set_ylim(-0.5, float(L) - 0.5)
 
@@ -2712,8 +2711,6 @@ def plot_layerwise_turn_transition_heatmap(
     )
 
     ax.axvline(0, color="black", linestyle="--", linewidth=1.0, alpha=0.8)
-    if title.strip():
-        ax.set_title(title, fontsize=20)
     ax.set_xlabel(x_label, fontsize=18)
     ax.set_ylabel("Transformer layer", fontsize=18)
     ax.tick_params(axis="both", labelsize=16)
@@ -3002,8 +2999,8 @@ def logit_lens_heatmap(
             mat = heatmaps[which][anchor]
             if anchor == "interrupt_start":
                 vmin, vmax = -16.5, -5.5
-                colorbar_ticks = [-16.5, -5.5]
-                colorbar_ticklabels = ["0% (-16.5)", "100% (-5.5)"]
+                colorbar_ticks = [-16, -14, -12, -10, -8, -6]
+                colorbar_ticklabels = [str(tick) for tick in colorbar_ticks]
             else:
                 vmin, vmax = shared_bounds[which]
                 colorbar_ticks = None
