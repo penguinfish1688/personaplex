@@ -35,6 +35,24 @@ PCA_X_MIN = -10.0
 PCA_X_MAX = 10.0
 
 
+def _apply_plot_font_style() -> None:
+	plt.rcParams.update(
+		{
+			"font.family": "serif",
+			"font.serif": [
+				"Times New Roman",
+				"Times",
+				"Nimbus Roman",
+				"Nimbus Roman No9 L",
+				"DejaVu Serif",
+			],
+			"mathtext.fontset": "stix",
+			"pdf.fonttype": 42,
+			"ps.fonttype": 42,
+		}
+	)
+
+
 def _collect_sample_dirs(root: Path) -> list[Path]:
 	if not root.is_dir():
 		raise FileNotFoundError(f"Root directory not found: {root}")
@@ -122,6 +140,8 @@ def _pca_projection(x_nd: np.ndarray, component: int) -> np.ndarray:
 
 
 def plot_mode_class_pca(root_dir: str, output: str | None, max_points_per_class: int) -> Path:
+	_apply_plot_font_style()
+
 	root = Path(root_dir)
 	sample_dirs = _collect_sample_dirs(root)
 
@@ -216,8 +236,8 @@ def plot_mode_class_pca(root_dir: str, output: str | None, max_points_per_class:
 		(ax1, "PCA Dimension (PC1 projection)", "State-Class PCA Distribution by Layer (PC1)"),
 		(ax2, "PCA Dimension (PC2 projection)", "State-Class PCA Distribution by Layer (PC2)"),
 	):
-		ax.set_xlabel(xlabel, fontsize=18)
-		ax.set_ylabel("Transformer layer", fontsize=18)
+		ax.set_xlabel(xlabel, fontsize=22)
+		ax.set_ylabel("Transformer layer", fontsize=22)
 		ax.set_title(title, fontsize=20)
 		ax.tick_params(axis="both", labelsize=16)
 		ax.grid(True, linestyle=":", linewidth=0.7, alpha=0.5)
