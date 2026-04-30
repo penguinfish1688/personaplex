@@ -31,6 +31,10 @@ import numpy as np
 import torch
 
 
+PCA_X_MIN = -10.0
+PCA_X_MAX = 10.0
+
+
 def _collect_sample_dirs(root: Path) -> list[Path]:
 	if not root.is_dir():
 		raise FileNotFoundError(f"Root directory not found: {root}")
@@ -194,10 +198,15 @@ def plot_mode_class_pca(root_dir: str, output: str | None, max_points_per_class:
 		y_l = np.full((proj_l_pc1.shape[0],), fill_value=float(layer), dtype=np.float32) + rng.normal(0.0, 0.06, size=proj_l_pc1.shape[0])
 		y_s = np.full((proj_s_pc1.shape[0],), fill_value=float(layer), dtype=np.float32) + rng.normal(0.0, 0.06, size=proj_s_pc1.shape[0])
 
-		ax1.scatter(proj_l_pc1, y_l, s=6, c="#2ca02c", alpha=0.35, linewidths=0.0, label="listening" if layer == 0 else "_nolegend_")
-		ax1.scatter(proj_s_pc1, y_s, s=6, c="#d62728", alpha=0.35, linewidths=0.0, label="speaking" if layer == 0 else "_nolegend_")
-		ax2.scatter(proj_l_pc2, y_l, s=6, c="#2ca02c", alpha=0.35, linewidths=0.0, label="listening" if layer == 0 else "_nolegend_")
-		ax2.scatter(proj_s_pc2, y_s, s=6, c="#d62728", alpha=0.35, linewidths=0.0, label="speaking" if layer == 0 else "_nolegend_")
+		pc1_l_keep = (PCA_X_MIN <= proj_l_pc1) & (proj_l_pc1 <= PCA_X_MAX)
+		pc1_s_keep = (PCA_X_MIN <= proj_s_pc1) & (proj_s_pc1 <= PCA_X_MAX)
+		pc2_l_keep = (PCA_X_MIN <= proj_l_pc2) & (proj_l_pc2 <= PCA_X_MAX)
+		pc2_s_keep = (PCA_X_MIN <= proj_s_pc2) & (proj_s_pc2 <= PCA_X_MAX)
+
+		ax1.scatter(proj_l_pc1[pc1_l_keep], y_l[pc1_l_keep], s=8, c="#2ca02c", alpha=0.35, linewidths=0.0, label="listening" if layer == 0 else "_nolegend_")
+		ax1.scatter(proj_s_pc1[pc1_s_keep], y_s[pc1_s_keep], s=8, c="#d62728", alpha=0.35, linewidths=0.0, label="speaking" if layer == 0 else "_nolegend_")
+		ax2.scatter(proj_l_pc2[pc2_l_keep], y_l[pc2_l_keep], s=8, c="#2ca02c", alpha=0.35, linewidths=0.0, label="listening" if layer == 0 else "_nolegend_")
+		ax2.scatter(proj_s_pc2[pc2_s_keep], y_s[pc2_s_keep], s=8, c="#d62728", alpha=0.35, linewidths=0.0, label="speaking" if layer == 0 else "_nolegend_")
 		plotted_any = True
 
 	if not plotted_any:
@@ -207,13 +216,14 @@ def plot_mode_class_pca(root_dir: str, output: str | None, max_points_per_class:
 		(ax1, "PCA Dimension (PC1 projection)", "State-Class PCA Distribution by Layer (PC1)"),
 		(ax2, "PCA Dimension (PC2 projection)", "State-Class PCA Distribution by Layer (PC2)"),
 	):
-		ax.set_xlabel(xlabel)
-		ax.set_ylabel("Layer")
-		ax.set_title(title)
+		ax.set_xlabel(xlabel, fontsize=18)
+		ax.set_ylabel("Transformer layer", fontsize=18)
+		ax.set_title(title, fontsize=20)
+		ax.tick_params(axis="both", labelsize=16)
 		ax.grid(True, linestyle=":", linewidth=0.7, alpha=0.5)
-		ax.legend(loc="upper right", markerscale=2.8)
+		ax.legend(loc="upper right", markerscale=2.8, fontsize=16)
 		ax.set_ylim(-0.75, float(n_layers_ref) - 0.25)
-		ax.set_xlim(-5.0, 5.0)
+		ax.set_xlim(PCA_X_MIN, PCA_X_MAX)
 
 	out_path = Path(output) if output is not None else (root / "mode_class_pca.png")
 	out_path.parent.mkdir(parents=True, exist_ok=True)

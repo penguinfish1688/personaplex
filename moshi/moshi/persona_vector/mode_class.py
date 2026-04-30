@@ -2989,7 +2989,10 @@ def logit_lens_heatmap(
 
         for which in ("line1", "line2"):
             mat = heatmaps[which][anchor]
-            vmin, vmax = shared_bounds[which]
+            if anchor == "interrupt_start":
+                vmin, vmax = -16.5, -5.5
+            else:
+                vmin, vmax = shared_bounds[which]
 
             if which == "line1":
                 out_prefix = root / f"logit_lens_heatmap_{anchor}_perception_score"
