@@ -1294,10 +1294,10 @@ def plot_attention_heatmap(
     # does not shrink the top subplot relative to the waveform subplot.
     cax = ax_top.inset_axes([1.01, 0.0, 0.018, 1.0])
     cbar = fig.colorbar(img, cax=cax)
-    cbar.set_label("Attention logit", fontsize=16)
-    cbar.ax.tick_params(labelsize=14)
-    ax_top.set_ylabel("Query token position", fontsize=16)
-    ax_top.tick_params(axis="both", labelsize=14)
+    cbar.set_label("Attention logit", fontsize=24)
+    cbar.ax.tick_params(labelsize=21)
+    ax_top.set_ylabel("Query token position", fontsize=24)
+    ax_top.tick_params(axis="both", labelsize=21)
     ax_top.grid(False)
 
     ax_bot.plot(
@@ -1316,11 +1316,11 @@ def plot_attention_heatmap(
         alpha=0.85,
         label="|output.wav| (model)",
     )
-    ax_bot.set_ylabel("Absolute amplitude", fontsize=16)
-    ax_bot.set_xlabel("Time (seconds)  [aligned with key-axis above]", fontsize=16)
-    ax_bot.tick_params(axis="both", labelsize=14)
+    ax_bot.set_ylabel("Absolute amplitude", fontsize=24)
+    ax_bot.set_xlabel("Time (seconds)  [aligned with key-axis above]", fontsize=24)
+    ax_bot.tick_params(axis="both", labelsize=21)
     ax_bot.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
-    ax_bot.legend(loc="upper right", fontsize=13)
+    ax_bot.legend(loc="upper right", fontsize=19.5)
     ax_bot.set_xlim(0.0, max_t)
 
     out_p = Path(output_path)
@@ -1533,19 +1533,19 @@ def plot_attention_heatmap_at_turn_taking(root_dir, span=20, layer=-1):
         )
         cax = ax_top.inset_axes([1.01, 0.0, 0.018, 1.0])
         cbar = fig.colorbar(img, cax=cax)
-        cbar.set_label("Attention logit (P5->5, P95->95)", fontsize=16)
-        cbar.ax.tick_params(labelsize=14)
-        ax_top.set_ylabel("Query offset (s)", fontsize=16)
-        ax_top.tick_params(axis="both", labelsize=14)
+        cbar.set_label("Attention logit (P5->5, P95->95)", fontsize=24)
+        cbar.ax.tick_params(labelsize=21)
+        ax_top.set_ylabel("Query offset (s)", fontsize=24)
+        ax_top.tick_params(axis="both", labelsize=21)
 
         ax_bot.plot(rel_sec, avg_user, color="#2ca02c", linewidth=0.9, alpha=0.95, label="|input.wav| avg")
         ax_bot.plot(rel_sec, avg_model, color="#9467bd", linewidth=0.9, alpha=0.9, label="|output.wav| avg")
         ax_bot.axvline(0.0, color="#444444", linestyle="--", linewidth=0.8, alpha=0.8)
-        ax_bot.set_ylabel("Absolute amplitude", fontsize=16)
-        ax_bot.set_xlabel(f"Relative time to {anchor} (s)", fontsize=16)
-        ax_bot.tick_params(axis="both", labelsize=14)
+        ax_bot.set_ylabel("Absolute amplitude", fontsize=24)
+        ax_bot.set_xlabel(f"Relative time to {anchor} (s)", fontsize=24)
+        ax_bot.tick_params(axis="both", labelsize=21)
         ax_bot.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
-        ax_bot.legend(loc="upper right", fontsize=13)
+        ax_bot.legend(loc="upper right", fontsize=19.5)
         ax_bot.set_xlim(-window_sec, window_sec)
 
         out_path = root / f"attention_heatmap_turn_taking_{anchor}.png"
@@ -1842,12 +1842,12 @@ def plot_attention_by_subseqent_token_heatmap(
         extent=(float(x[0]), float(x[-1]), -0.5, float(L) - 0.5),
     )
     cbar = fig.colorbar(img, ax=ax)
-    cbar.set_label("Avg future attention weight to token t (vmin=P5, vmax=P95)", fontsize=16)
-    cbar.ax.tick_params(labelsize=14)
+    cbar.set_label("Avg future attention weight to token t (vmin=P5, vmax=P95)", fontsize=24)
+    cbar.ax.tick_params(labelsize=21)
 
-    ax.set_xlabel("Token offset from interrupt_start", fontsize=16)
-    ax.set_ylabel("Layer", fontsize=16)
-    ax.tick_params(axis="both", labelsize=14)
+    ax.set_xlabel("Token offset from interrupt_start", fontsize=24)
+    ax.set_ylabel("Layer", fontsize=24)
+    ax.tick_params(axis="both", labelsize=21)
     ax.set_yticks(np.arange(0, L, 1))
     ax.set_ylim(-0.5, float(L) - 0.5)
 
@@ -2748,9 +2748,9 @@ def plot_layerwise_turn_transition_heatmap(
     )
 
     ax.axvline(0, color="black", linestyle="--", linewidth=1.0, alpha=0.8)
-    ax.set_xlabel(x_label, fontsize=18)
-    ax.set_ylabel("Transformer layer", fontsize=18)
-    ax.tick_params(axis="both", labelsize=16)
+    ax.set_xlabel(x_label, fontsize=27)
+    ax.set_ylabel("Transformer layer", fontsize=27)
+    ax.tick_params(axis="both", labelsize=24)
     ax.set_xlim(x_left, x_right)
     ax.set_ylim(-0.5, mat.shape[0] - 0.5)
 
@@ -2774,9 +2774,9 @@ def plot_layerwise_turn_transition_heatmap(
         cbar.set_ticks(colorbar_ticks)
     if colorbar_ticklabels is not None:
         cbar.set_ticklabels(colorbar_ticklabels)
-    cbar_label_fontsize = 23 if r"\text{per}" in colorbar_label else 19
+    cbar_label_fontsize = 34.5 if r"\text{per}" in colorbar_label else 28.5
     cbar.set_label(colorbar_label, fontsize=cbar_label_fontsize)
-    cbar.ax.tick_params(labelsize=15)
+    cbar.ax.tick_params(labelsize=22.5)
 
     prefix = Path(output_path_prefix)
     if prefix.suffix:
