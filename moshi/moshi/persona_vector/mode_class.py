@@ -46,6 +46,27 @@ from moshi.models import loaders
 # ---------------------------------------------------------------------------
 
 
+def _apply_plot_font_style() -> None:
+    """Use Times New Roman for plot text while keeping math in a math font."""
+    import matplotlib as mpl
+
+    mpl.rcParams.update(
+        {
+            "font.family": "serif",
+            "font.serif": [
+                "Times New Roman",
+                "Times",
+                "Nimbus Roman",
+                "Nimbus Roman No9 L",
+                "DejaVu Serif",
+            ],
+            "mathtext.fontset": "stix",
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    )
+
+
 def _load_hidden_payload(path: str) -> Dict[str, Any]:
     """Load a hidden payload ``.pt`` file and return its dict."""
     if not os.path.exists(path):
@@ -766,6 +787,8 @@ def plot_prediction(
     import numpy as np
     from matplotlib.patches import Rectangle
 
+    _apply_plot_font_style()
+
     # ---- load prediction JSON ------------------------------------------------
     with open(prediction_path, "r", encoding="utf-8") as f:
         predictions: Dict[str, Dict[str, Any]] = json.load(f)
@@ -969,6 +992,7 @@ def plot_hidden_self_similarity(
     import matplotlib.pyplot as plt
     import numpy as np
 
+    _apply_plot_font_style()
     sns = importlib.import_module("seaborn")
 
     if window < 0:
@@ -1045,7 +1069,8 @@ def plot_hidden_self_similarity(
     M = X_norm @ X_norm.T
     M_np = M.numpy()
 
-    sns.set_theme(context="paper", style="white", font="serif")
+    sns.set_theme(context="paper", style="white", font="Times New Roman")
+    _apply_plot_font_style()
     fig_size = max(6.0, min(14.0, T / 30.0))
     fig, ax = plt.subplots(figsize=(fig_size, fig_size), dpi=300)
     sns.heatmap(
@@ -1161,6 +1186,8 @@ def plot_attention_heatmap(
     import matplotlib.pyplot as plt
     from matplotlib.colors import TwoSlopeNorm
     import numpy as np
+
+    _apply_plot_font_style()
 
     payload = _load_hidden_payload(hidden_path)
     frame_rate_hz = float(payload.get("frame_rate", 12.5))
@@ -1316,6 +1343,8 @@ def plot_attention_heatmap_at_turn_taking(root_dir, span=20, layer=-1):
     """
     import matplotlib.pyplot as plt
     import numpy as np
+
+    _apply_plot_font_style()
 
     root = Path(root_dir)
     if not root.is_dir():
@@ -1571,6 +1600,8 @@ def plot_attention_by_subseqent_token_heatmap(
     import matplotlib.pyplot as plt
     from matplotlib import ticker as mticker
     import numpy as np
+
+    _apply_plot_font_style()
 
     root = Path(root_dir)
     log_prefix = "[plot-attn-subseq]"
@@ -1851,6 +1882,8 @@ def plot_logit_lens_step_n(
     """
     import matplotlib.pyplot as plt
     import numpy as np
+
+    _apply_plot_font_style()
 
     payload = _load_hidden_payload(hidden_path)
     frame_rate_hz = float(payload.get("frame_rate", 12.5))
@@ -2221,6 +2254,8 @@ def plot_logit_lens_turn_taking_from_saved(
     """
     import matplotlib.pyplot as plt
     import numpy as np
+
+    _apply_plot_font_style()
 
     if not root_dirs:
         raise ValueError("root_dirs must contain at least one directory")
@@ -2654,6 +2689,8 @@ def plot_layerwise_turn_transition_heatmap(
     import numpy as np
     from matplotlib.colors import LinearSegmentedColormap
     from matplotlib import ticker as mticker
+
+    _apply_plot_font_style()
 
     mat = np.asarray(heatmap, dtype=np.float32)
     offsets = np.asarray(token_offsets)
