@@ -2624,6 +2624,7 @@ def plot_layerwise_turn_transition_heatmap(
     cmap: str = "coolwarm_soft_sat",
     x_label: str = "Token offset from turn boundary",
     colorbar_ticks: Optional[List[float]] = None,
+    colorbar_ticklabels: Optional[List[str]] = None,
 ) -> tuple[Path, Path]:
     """Save a publication-quality layer-vs-token-offset heatmap.
 
@@ -2711,7 +2712,8 @@ def plot_layerwise_turn_transition_heatmap(
     )
 
     ax.axvline(0, color="black", linestyle="--", linewidth=1.0, alpha=0.8)
-    ax.set_title(title, fontsize=20)
+    if title.strip():
+        ax.set_title(title, fontsize=20)
     ax.set_xlabel(x_label, fontsize=18)
     ax.set_ylabel("Transformer layer", fontsize=18)
     ax.tick_params(axis="both", labelsize=16)
@@ -2736,6 +2738,8 @@ def plot_layerwise_turn_transition_heatmap(
     cbar = fig.colorbar(img, ax=ax, pad=0.02)
     if colorbar_ticks is not None:
         cbar.set_ticks(colorbar_ticks)
+    if colorbar_ticklabels is not None:
+        cbar.set_ticklabels(colorbar_ticklabels)
     cbar_label_fontsize = 23 if r"\text{per}" in colorbar_label else 19
     cbar.set_label(colorbar_label, fontsize=cbar_label_fontsize)
     cbar.ax.tick_params(labelsize=15)
@@ -2762,6 +2766,7 @@ def plot_generation_score_heatmap(
     title: str = "Layer-wise Generation Score Around Turn Transition",
     x_label: str = "Token offset from turn boundary",
     colorbar_ticks: Optional[List[float]] = None,
+    colorbar_ticklabels: Optional[List[str]] = None,
 ) -> tuple[Path, Path]:
     """Save a paper-quality generation-score heatmap.
 
@@ -2784,6 +2789,7 @@ def plot_generation_score_heatmap(
         colorbar_label=r"$\mathcal{S}_\text{gen}$",
         x_label=x_label,
         colorbar_ticks=colorbar_ticks,
+        colorbar_ticklabels=colorbar_ticklabels,
     )
 
 
@@ -2996,10 +3002,12 @@ def logit_lens_heatmap(
             mat = heatmaps[which][anchor]
             if anchor == "interrupt_start":
                 vmin, vmax = -16.5, -5.5
-                colorbar_ticks = [-16.5, -13.75, -11.0, -8.25, -5.5]
+                colorbar_ticks = [-16.5, -5.5]
+                colorbar_ticklabels = ["0% (-16.5)", "100% (-5.5)"]
             else:
                 vmin, vmax = shared_bounds[which]
                 colorbar_ticks = None
+                colorbar_ticklabels = None
 
             if which == "line1":
                 out_prefix = root / f"logit_lens_heatmap_{anchor}_perception_score"
@@ -3009,9 +3017,10 @@ def logit_lens_heatmap(
                     out_prefix,
                     vmin=vmin,
                     vmax=vmax,
-                    title=sper_title,
+                    title="",
                     x_label=x_label,
                     colorbar_ticks=colorbar_ticks,
+                    colorbar_ticklabels=colorbar_ticklabels,
                 )
             else:
                 out_prefix = root / f"logit_lens_heatmap_{anchor}_generation_score"
@@ -3021,9 +3030,10 @@ def logit_lens_heatmap(
                     out_prefix,
                     vmin=vmin,
                     vmax=vmax,
-                    title=sgen_title,
+                    title="",
                     x_label=x_label,
                     colorbar_ticks=colorbar_ticks,
+                    colorbar_ticklabels=colorbar_ticklabels,
                 )
             print(f"[plot-logit-heatmap] Saved {pdf_path}")
             print(f"[plot-logit-heatmap] Saved {png_path}")
