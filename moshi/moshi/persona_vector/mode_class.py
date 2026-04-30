@@ -2729,10 +2729,12 @@ def plot_layerwise_turn_transition_heatmap(
         x_ticks.append(0.0)
     ax.set_xticks(sorted(set(float(t) for t in x_ticks)))
 
-    ax.set_yticks(np.arange(mat.shape[0]))
+    layer_ticks = [tick for tick in (0, 7, 15, 23, 31) if tick < mat.shape[0]]
+    ax.set_yticks(layer_ticks)
 
     cbar = fig.colorbar(img, ax=ax, pad=0.02)
-    cbar.set_label(colorbar_label, fontsize=19)
+    cbar_label_fontsize = 23 if r"\text{per}" in colorbar_label else 19
+    cbar.set_label(colorbar_label, fontsize=cbar_label_fontsize)
     cbar.ax.tick_params(labelsize=15)
 
     prefix = Path(output_path_prefix)
