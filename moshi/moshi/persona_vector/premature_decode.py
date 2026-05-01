@@ -309,30 +309,31 @@ def plot_final_token_probability_heatmap(
     token_start_idx: int = 0,
     transcript_spans: Optional[list[tuple[float, float, str]]] = None,
 ):
-    """Plot probability of the final-layer decoded token across all layers/steps.
+    """Plot log probability of the final-layer decoded token across all layers/steps.
 
     For each token step `t`, let `y_t` be the token id decoded at the final layer.
-    This plot shows `P_layer_t(y_t)` for each layer at that same step.
+    This plot shows `log P_layer_t(y_t)` for each layer at that same step.
 
     Heatmap layout:
         - x-axis: token step index
-        - y-axis: layer index
-        - cell value: probability in [0, 1]
+        - y-axis: layer index, with layer 0 at the bottom
+        - cell text: greedy logit-lens token for that layer and token step
+        - cell value: log probability, <= 0
     """
     if len(decode_data_list) == 0:
         raise ValueError("decode_data_list is empty")
 
     num_tokens = len(decode_data_list)
     num_layers = int(decode_data_list[0].logits.shape[0])
-    prob_grid = np.zeros((num_layers, num_tokens), dtype=np.float32)
+    logprob_grid = np.zeros((num_layers, num_tokens), dtype=np.float32)
     token_grid: list[list[str]] = [["" for _ in range(num_tokens)] for _ in range(num_layers)]
 
     for t, item in enumerate(decode_data_list):
         if item.logits.shape[0] != num_layers:
             raise ValueError("All DecodeData entries must have the same number of layers")
         final_token_id = int(item.token_ids[-1].item())
-        probs = F.softmax(item.logits.float(), dim=-1)  # [L, V]
-        prob_grid[:, t] = probs[:, final_token_id].cpu().numpy()
+        log_probs = F.log_softmax(item.logits.float(), dim=-1)  # [L, V]
+        logprob_grid[:, t] = log_probs[:, final_token_id].cpu().numpy()
         for layer_idx in range(num_layers):
             token_grid[layer_idx][t] = item.tokens[layer_idx]
 
@@ -340,23 +341,27 @@ def plot_final_token_probability_heatmap(
     fig_h = max(8.0, num_layers * 0.24)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
 
-    positive_probs = prob_grid[prob_grid > 0]
-    if positive_probs.size == 0:
-        prob_vmin = 1e-8
-        prob_vmax = 1.0
+    finite_values = logprob_grid[np.isfinite(logprob_grid)]
+    if finite_values.size == 0:
+        logprob_vmin = -50.0
+        logprob_vmax = 0.0
     else:
-        prob_vmin = max(float(np.min(positive_probs)), 1e-8)
-        prob_vmax = max(float(np.max(positive_probs)), prob_vmin)
+        logprob_vmin = float(np.min(finite_values))
+        logprob_vmax = float(np.max(finite_values))
+        if logprob_vmin == logprob_vmax:
+            logprob_vmin -= 1.0
+            logprob_vmax += 1.0
 
     im = ax.imshow(
-        np.clip(prob_grid, prob_vmin, prob_vmax),
+        logprob_grid,
         aspect="auto",
-        cmap="YlOrRd",
-        origin="upper",
-        norm=LogNorm(vmin=prob_vmin, vmax=prob_vmax),
+        cmap="magma",
+        origin="lower",
+        vmin=logprob_vmin,
+        vmax=logprob_vmax,
     )
     cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("P(final-layer decoded token) [log scale]")
+    cbar.set_label("log P(final-layer decoded token)")
 
     def _plot_safe_text(text: str) -> str:
         return text.replace("\n", " ").replace("$", "\\$")
@@ -364,8 +369,8 @@ def plot_final_token_probability_heatmap(
     for y in range(num_layers):
         for x in range(num_tokens):
             token_txt = _plot_safe_text(token_grid[y][x])
-            p = float(prob_grid[y, x])
-            txt_color = "white" if p < 0.2 else "black"
+            norm_value = (float(logprob_grid[y, x]) - logprob_vmin) / max(logprob_vmax - logprob_vmin, 1e-12)
+            txt_color = "white" if norm_value < 0.55 else "black"
             try:
                 ax.text(
                     x,
@@ -388,12 +393,15 @@ def plot_final_token_probability_heatmap(
                     color=txt_color,
                 )
 
-    ax.set_xlabel("Token index")
-    ax.set_ylabel("Layer (1..L)")
+    ax.set_xlabel("Token timestep")
+    ax.set_ylabel("Layer")
     ax.set_xticks(np.arange(num_tokens))
+    ax.set_xticklabels([str(token_start_idx + i) for i in range(num_tokens)])
     ax.set_yticks(np.arange(num_layers))
-    ax.set_yticklabels([str(i + 1) for i in range(num_layers)])
-    ax.set_title("Premature decode: final-token probability across layers")
+    ax.set_yticklabels([str(i) for i in range(num_layers)])
+    ax.tick_params(axis="x", labelsize=6, rotation=90)
+    ax.tick_params(axis="y", labelsize=6)
+    ax.set_title("Logit lens: final-token log probability across layers")
 
     if transcript_spans:
         lane_y = float(num_layers)
@@ -426,7 +434,7 @@ def plot_final_token_probability_heatmap(
 
         ax.axhline(num_layers - 0.5, color="#666666", linewidth=0.8)
         ax.text(-1.2, lane_y + lane_h / 2, "User", ha="right", va="center", fontsize=7, color="black")
-        ax.set_ylim(num_layers + lane_h + 0.4, -0.5)
+        ax.set_ylim(-0.5, num_layers + lane_h + 0.4)
 
     fig.tight_layout()
     out_path = Path(output_path)
@@ -579,6 +587,21 @@ def _resolve_hidden_paths(root_dir: Path, sample_number: int) -> list[Path]:
     if not pts:
         raise FileNotFoundError(f"No *_hidden.pt files found in {sample_dir}")
     return pts
+
+
+def _resolve_dataset_output_hidden_paths(root_dir: Path) -> list[Path]:
+    """Return ``<root_dir>/*/output_hidden.pt`` sorted by sample folder."""
+    pts = list(root_dir.glob("*/output_hidden.pt"))
+    if not pts:
+        raise FileNotFoundError(f"No output_hidden.pt files found under {root_dir}/*/")
+
+    def _key(path: Path) -> tuple[int, int | str]:
+        try:
+            return (0, int(path.parent.name))
+        except ValueError:
+            return (1, path.parent.name)
+
+    return sorted(pts, key=_key)
 
 
 def _load_decoder_projection(
@@ -760,11 +783,13 @@ def main():
     )
     ap = argparse.ArgumentParser("premature_decode")
     ap.add_argument("--root-dir", type=str, required=True, help="Root dir containing <n>/output_hidden.pt")
-    ap.add_argument("-n", "--sample-number", type=int, required=True, help="Sample folder number under root-dir")
+    ap.add_argument("-n", "--sample-number", type=int, default=None, help="Sample folder number under root-dir. If omitted, process root-dir/*/output_hidden.pt")
     ap.add_argument("--hidden-path", type=str, default=None, help="Direct path to output_hidden.pt (overrides root-dir/-n)")
     ap.add_argument("-s", "--start", type=int, default=0, help="Start token index (inclusive)")
     ap.add_argument("-e", "--end", type=int, default=-1, help="End token index (exclusive), -1 means end")
     ap.add_argument("--output", type=str, default=None, help="Output figure path")
+    ap.add_argument("--output-dir", type=str, default=None, help="Directory for batch output figures. Defaults to root-dir when processing all samples.")
+    ap.add_argument("--only-final-token-logprob", action="store_true", help="Only plot the final-token log-probability heatmap requested by prem_dec.sh")
     ap.add_argument("--preview-output", action="store_true", help="Print final decoded output preview")
     ap.add_argument("--hf-repo", type=str, default=loaders.DEFAULT_REPO)
     ap.add_argument("--tokenizer", type=str, default=None)
@@ -776,8 +801,13 @@ def main():
     root_dir = Path(args.root_dir)
     if args.hidden_path:
         hidden_paths = [Path(args.hidden_path)]
-    else:
+        dataset_batch = False
+    elif args.sample_number is not None:
         hidden_paths = _resolve_hidden_paths(root_dir, args.sample_number)
+        dataset_batch = False
+    else:
+        hidden_paths = _resolve_dataset_output_hidden_paths(root_dir)
+        dataset_batch = True
 
     # Preview mode: just show token names from the first valid payload.
     if args.preview_output:
@@ -836,29 +866,42 @@ def main():
 
         if args.output and len(hidden_paths) == 1:
             output_path = Path(args.output)
+        elif dataset_batch:
+            batch_output_dir = Path(args.output_dir) if args.output_dir else root_dir
+            output_path = batch_output_dir / f"{hidden_path.parent.name}_{stem}_logits_evolution_{start_idx}_{end_idx}.png"
         else:
             output_path = hidden_path.with_name(f"{stem}_logits_evolution_{start_idx}_{end_idx}.png")
 
-        print("Plotting logits evolution heatmap...")
-        plot_logits_evolution(
-            decode_data,
-            str(output_path),
-            token_start_idx=start_idx,
-            transcript_spans=transcript_spans,
-        )
-
-        if args.output and len(hidden_paths) == 1:
-            prob_output_path = output_path.with_name(f"{output_path.stem}_final_token_prob{output_path.suffix}")
+        if args.output and len(hidden_paths) == 1 and args.only_final_token_logprob:
+            prob_output_path = Path(args.output)
+        elif args.output and len(hidden_paths) == 1:
+            prob_output_path = output_path.with_name(f"{output_path.stem}_final_token_logprob{output_path.suffix}")
+        elif dataset_batch:
+            batch_output_dir = Path(args.output_dir) if args.output_dir else root_dir
+            prob_output_path = batch_output_dir / f"{hidden_path.parent.name}_{stem}_final_token_logprob_{start_idx}_{end_idx}.png"
         else:
-            prob_output_path = hidden_path.with_name(f"{stem}_final_token_probability_{start_idx}_{end_idx}.png")
+            prob_output_path = hidden_path.with_name(f"{stem}_final_token_logprob_{start_idx}_{end_idx}.png")
 
-        print("Plotting final token probability heatmap...")
+        if not args.only_final_token_logprob:
+            print("Plotting logits evolution heatmap...")
+            plot_logits_evolution(
+                decode_data,
+                str(output_path),
+                token_start_idx=start_idx,
+                transcript_spans=transcript_spans,
+            )
+
+        print("Plotting final token log-probability heatmap...")
         plot_final_token_probability_heatmap(
             decode_data,
             str(prob_output_path),
             token_start_idx=start_idx,
             transcript_spans=transcript_spans,
         )
+
+        if args.only_final_token_logprob:
+            print(f"Saved figure to {prob_output_path}")
+            continue
 
         if args.output and len(hidden_paths) == 1:
             pad_prob_output_path = output_path.with_name(f"{output_path.stem}_pad_token_prob{output_path.suffix}")
