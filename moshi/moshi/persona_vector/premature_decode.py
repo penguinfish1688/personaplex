@@ -422,9 +422,10 @@ def plot_final_token_probability_heatmap(
             lane_top = -0.5 - lane_gap - lane_idx * (lane_h + lane_gap)
             lane_y = lane_top - lane_h
             for start_tok, end_tok, word in spans:
-                # Convert token-time boundaries to heatmap x coordinates.
-                local_start = start_tok - token_start_idx - 0.5
-                local_end = end_tok - token_start_idx - 0.5
+                # Use continuous token-time coordinates directly:
+                # transcript_sec * frame_rate - token_start_idx.
+                local_start = start_tok - token_start_idx
+                local_end = end_tok - token_start_idx
                 if local_end <= -0.5 or local_start >= num_tokens - 0.5:
                     continue
                 draw_start = max(local_start, -0.5)
