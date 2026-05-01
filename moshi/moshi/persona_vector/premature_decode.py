@@ -321,6 +321,7 @@ def plot_final_token_probability_heatmap(
     token_start_idx: int = 0,
     transcript_spans: Optional[list[tuple[float, float, str]]] = None,
     transcript_lanes: Optional[list[tuple[str, list[tuple[float, float, str]]]]] = None,
+    color_scale: Optional[tuple[float, float]] = None,
 ):
     """Plot log probability of the final-layer decoded token across all layers/steps.
 
@@ -354,16 +355,22 @@ def plot_final_token_probability_heatmap(
     fig_h = max(8.0, num_layers * 0.24)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
 
-    finite_values = logprob_grid[np.isfinite(logprob_grid)]
-    if finite_values.size == 0:
-        logprob_vmin = -50.0
-        logprob_vmax = 0.0
-    else:
-        logprob_vmin = float(np.min(finite_values))
-        logprob_vmax = float(np.max(finite_values))
+    if color_scale is not None:
+        logprob_vmin, logprob_vmax = color_scale
         if logprob_vmin == logprob_vmax:
             logprob_vmin -= 1.0
             logprob_vmax += 1.0
+    else:
+        finite_values = logprob_grid[np.isfinite(logprob_grid)]
+        if finite_values.size == 0:
+            logprob_vmin = -50.0
+            logprob_vmax = 0.0
+        else:
+            logprob_vmin = float(np.min(finite_values))
+            logprob_vmax = float(np.max(finite_values))
+            if logprob_vmin == logprob_vmax:
+                logprob_vmin -= 1.0
+                logprob_vmax += 1.0
 
     im = ax.imshow(
         logprob_grid,
@@ -383,6 +390,7 @@ def plot_final_token_probability_heatmap(
         for x in range(num_tokens):
             token_txt = _plot_safe_text(token_grid[y][x])
             norm_value = (float(logprob_grid[y, x]) - logprob_vmin) / max(logprob_vmax - logprob_vmin, 1e-12)
+            norm_value = float(np.clip(norm_value, 0.0, 1.0))
             txt_color = "white" if norm_value < 0.55 else "black"
             try:
                 ax.text(
@@ -679,6 +687,47 @@ def premature_decode(
         )
     return decode_data_list
 
+
+def final_token_logprob_percentile_scale(
+    hidden_payload: dict,
+    projection: DecoderProjection,
+    low_percentile: float,
+    high_percentile: float,
+) -> tuple[float, float]:
+    """Compute full-sequence color bounds for final-token log-probability plots.
+
+    Bounds are computed across every token step in the hidden payload and every
+    layer, so different visible start/end windows for the same output_hidden.pt
+    share a consistent colorbar scale.
+    """
+    hidden = hidden_payload["text_hidden_layers"]
+    if not isinstance(hidden, torch.Tensor) or hidden.dim() != 3:
+        raise ValueError("Expected payload['text_hidden_layers'] with shape [T, L, D]")
+
+    t_total = int(hidden.shape[0])
+    values: list[np.ndarray] = []
+    for t in range(t_total):
+        logits = _project_hidden_states_to_logits(hidden[t], projection)
+        final_token_id = int(torch.argmax(logits[-1], dim=-1).item())
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        values.append(log_probs[:, final_token_id].cpu().numpy())
+
+    if not values:
+        return (-50.0, 0.0)
+
+    flat = np.concatenate(values).astype(np.float32)
+    flat = flat[np.isfinite(flat)]
+    if flat.size == 0:
+        return (-50.0, 0.0)
+
+    lo = float(np.percentile(flat, low_percentile))
+    hi = float(np.percentile(flat, high_percentile))
+    if lo == hi:
+        lo -= 1.0
+        hi += 1.0
+    return lo, hi
+
+
 def plot_pad_lookback_ratio(
     decode_data_list: list[DecodeData],
     output_path: str,
@@ -815,6 +864,8 @@ def main():
     ap.add_argument("--output", type=str, default=None, help="Output figure path")
     ap.add_argument("--output-dir", type=str, default=None, help="Directory for batch output figures. Defaults to root-dir when processing all samples.")
     ap.add_argument("--only-final-token-logprob", action="store_true", help="Only plot the final-token log-probability heatmap requested by prem_dec.sh")
+    ap.add_argument("--color-percentile-low", type=float, default=1.0, help="Lower colorbar percentile computed over the full output_hidden.pt sequence")
+    ap.add_argument("--color-percentile-high", type=float, default=99.0, help="Upper colorbar percentile computed over the full output_hidden.pt sequence")
     ap.add_argument("--preview-output", action="store_true", help="Print final decoded output preview")
     ap.add_argument("--hf-repo", type=str, default=loaders.DEFAULT_REPO)
     ap.add_argument("--tokenizer", type=str, default=None)
@@ -822,6 +873,12 @@ def main():
     ap.add_argument("--device", type=str, default="cpu")
     ap.add_argument("--transcript-base", type=str, default="auto", help="Base name for user transcript JSON. 'auto' (default) derives from hidden stem by stripping '_hidden', e.g. complete_sentence_hidden.pt -> complete_sentence.json. Use 'input' for sibling input.json.")
     args = ap.parse_args()
+
+    if not (0.0 <= args.color_percentile_low <= args.color_percentile_high <= 100.0):
+        raise ValueError(
+            "--color-percentile-low/high must satisfy "
+            "0 <= low <= high <= 100"
+        )
 
     root_dir = Path(args.root_dir)
     if args.hidden_path:
@@ -891,6 +948,17 @@ def main():
             ("Model", output_transcript_spans),
         ]
 
+        print(
+            "Computing full-sequence color scale "
+            f"({args.color_percentile_low:g}..{args.color_percentile_high:g} percentiles)..."
+        )
+        color_scale = final_token_logprob_percentile_scale(
+            hidden_payload=payload,
+            projection=projection,
+            low_percentile=args.color_percentile_low,
+            high_percentile=args.color_percentile_high,
+        )
+
         print("Running premature decode...")
         decode_data = premature_decode(
             hidden_payload=payload,
@@ -934,6 +1002,7 @@ def main():
             token_start_idx=start_idx,
             transcript_spans=transcript_spans,
             transcript_lanes=transcript_lanes,
+            color_scale=color_scale,
         )
 
         if args.only_final_token_logprob:
