@@ -314,6 +314,7 @@ def plot_final_token_probability_heatmap(
     output_path: str,
     token_start_idx: int = 0,
     transcript_spans: Optional[list[tuple[float, float, str]]] = None,
+    transcript_lanes: Optional[list[tuple[str, list[tuple[float, float, str]]]]] = None,
 ):
     """Plot log probability of the final-layer decoded token across all layers/steps.
 
@@ -409,38 +410,49 @@ def plot_final_token_probability_heatmap(
     ax.tick_params(axis="y", labelsize=6)
     ax.set_title("Logit lens: final-token log probability across layers")
 
-    if transcript_spans:
-        lane_y = float(num_layers)
-        lane_h = 0.8
-        for start_tok, end_tok, word in transcript_spans:
-            local_start = start_tok - token_start_idx
-            local_end = end_tok - token_start_idx
-            if local_end <= -0.5 or local_start >= num_tokens - 0.5:
-                continue
-            draw_start = max(local_start, -0.5)
-            draw_end = min(local_end, num_tokens - 0.5)
-            if draw_end <= draw_start:
-                continue
-            rect = Rectangle(
-                (draw_start, lane_y),
-                draw_end - draw_start,
-                lane_h,
-                facecolor="#f3f3f3",
-                edgecolor="#888888",
-                linewidth=0.5,
-                alpha=0.9,
-            )
-            ax.add_patch(rect)
-            center_x = 0.5 * (draw_start + draw_end)
-            safe_word = _plot_safe_text(word)
-            try:
-                ax.text(center_x, lane_y + lane_h / 2, safe_word, ha="center", va="center", fontsize=6, color="black", parse_math=False)
-            except TypeError:
-                ax.text(center_x, lane_y + lane_h / 2, safe_word, ha="center", va="center", fontsize=6, color="black")
+    if transcript_lanes is None:
+        transcript_lanes = [("User", transcript_spans)] if transcript_spans else []
 
-        ax.axhline(num_layers - 0.5, color="#666666", linewidth=0.8)
-        ax.text(-1.2, lane_y + lane_h / 2, "User", ha="right", va="center", fontsize=7, color="black")
-        ax.set_ylim(-0.5, num_layers + lane_h + 0.4)
+    transcript_lanes = [(label, spans) for label, spans in transcript_lanes if spans]
+    if transcript_lanes:
+        lane_h = 0.8
+        lane_gap = 0.12
+        lane_colors = ["#e8f0fe", "#fce8e6"]
+        for lane_idx, (label, spans) in enumerate(transcript_lanes):
+            lane_top = -0.5 - lane_gap - lane_idx * (lane_h + lane_gap)
+            lane_y = lane_top - lane_h
+            for start_tok, end_tok, word in spans:
+                # Convert token-time boundaries to heatmap x coordinates.
+                local_start = start_tok - token_start_idx - 0.5
+                local_end = end_tok - token_start_idx - 0.5
+                if local_end <= -0.5 or local_start >= num_tokens - 0.5:
+                    continue
+                draw_start = max(local_start, -0.5)
+                draw_end = min(local_end, num_tokens - 0.5)
+                if draw_end <= draw_start:
+                    continue
+                rect = Rectangle(
+                    (draw_start, lane_y),
+                    draw_end - draw_start,
+                    lane_h,
+                    facecolor=lane_colors[lane_idx % len(lane_colors)],
+                    edgecolor="#888888",
+                    linewidth=0.5,
+                    alpha=0.95,
+                )
+                ax.add_patch(rect)
+                center_x = 0.5 * (draw_start + draw_end)
+                safe_word = _plot_safe_text(word)
+                try:
+                    ax.text(center_x, lane_y + lane_h / 2, safe_word, ha="center", va="center", fontsize=6, color="black", parse_math=False)
+                except TypeError:
+                    ax.text(center_x, lane_y + lane_h / 2, safe_word, ha="center", va="center", fontsize=6, color="black")
+
+            ax.text(-1.2, lane_y + lane_h / 2, label, ha="right", va="center", fontsize=7, color="black")
+
+        bottom_y = -0.5 - lane_gap - len(transcript_lanes) * (lane_h + lane_gap)
+        ax.axhline(-0.5, color="#666666", linewidth=0.8)
+        ax.set_ylim(bottom_y, num_layers - 0.5)
 
     fig.tight_layout()
     out_path = Path(output_path)
@@ -854,12 +866,23 @@ def main():
         start_idx, end_idx = _resolve_token_range(t_total, args.start, args.end)
         frame_rate_hz = float(payload.get("frame_rate", 12.5))
 
-        # Derive transcript base: 'auto' strips '_hidden' from stem.
+        input_transcript_spans = _load_input_transcript_spans(hidden_path, frame_rate_hz, base="input_transcript")
+        output_transcript_spans = _load_input_transcript_spans(hidden_path, frame_rate_hz, base="output_transcript")
+        if not input_transcript_spans:
+            input_transcript_spans = _load_input_transcript_spans(hidden_path, frame_rate_hz, base="input")
+
+        # Derive legacy transcript base: 'auto' strips '_hidden' from stem.
         if args.transcript_base == "auto":
             t_base = stem.removesuffix("_hidden") if stem.endswith("_hidden") else "input"
         else:
             t_base = args.transcript_base
-        transcript_spans = _load_input_transcript_spans(hidden_path, frame_rate_hz, base=t_base)
+        transcript_spans = input_transcript_spans
+        if not output_transcript_spans:
+            output_transcript_spans = _load_input_transcript_spans(hidden_path, frame_rate_hz, base=t_base)
+        transcript_lanes = [
+            ("User", input_transcript_spans),
+            ("Model", output_transcript_spans),
+        ]
 
         print("Running premature decode...")
         decode_data = premature_decode(
@@ -903,6 +926,7 @@ def main():
             str(prob_output_path),
             token_start_idx=start_idx,
             transcript_spans=transcript_spans,
+            transcript_lanes=transcript_lanes,
         )
 
         if args.only_final_token_logprob:
