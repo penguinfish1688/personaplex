@@ -58,6 +58,29 @@ class DecoderProjection:
     text_linear: torch.nn.Module
 
 
+def _project_hidden_states_to_logits(
+    hidden_states: torch.Tensor,
+    projection: DecoderProjection,
+) -> torch.Tensor:
+    """Project hidden states `[L, D]` to logits `[L, vocab_size]`."""
+    if hidden_states.dim() != 2:
+        raise RuntimeError(f"Expected hidden states shape [L, D], got {tuple(hidden_states.shape)}")
+
+    text_linear_weight = projection.text_linear.weight
+    proj_device = text_linear_weight.device
+    proj_dtype = text_linear_weight.dtype
+
+    x = hidden_states.float().to(device=proj_device, dtype=proj_dtype).unsqueeze(0)  # [1, L, D]
+    with torch.no_grad():
+        if projection.out_norm is not None:
+            x = projection.out_norm(x)
+        logits = projection.text_linear(x)
+    logits = logits.squeeze(0)  # [L, V]
+    if logits.dim() != 2:
+        raise RuntimeError(f"Unexpected logits shape: {tuple(logits.shape)}")
+    return logits.float().cpu()
+
+
 class DecodeData:
     """Per-token layer-wise decode information.
 
@@ -91,24 +114,7 @@ class DecodeData:
         The projection is executed in the same dtype/device as `text_linear.weight`
         for parity with model behavior, then converted to float32 for analysis.
         """
-        x = self.hidden_states
-        if x.dim() != 2:
-            raise RuntimeError(f"Expected hidden states shape [L, D], got {tuple(x.shape)}")
-
-        # `lm.out_norm` can be RMSNorm, which expects 3D `[B, T, D]`.
-        text_linear_weight = self._projection.text_linear.weight
-        proj_device = text_linear_weight.device
-        proj_dtype = text_linear_weight.dtype
-
-        x = x.to(device=proj_device, dtype=proj_dtype).unsqueeze(0)  # [1, L, D]
-        with torch.no_grad():
-            if self._projection.out_norm is not None:
-                x = self._projection.out_norm(x)
-            logits = self._projection.text_linear(x)
-        logits = logits.squeeze(0)  # [L, V]
-        if logits.dim() != 2:
-            raise RuntimeError(f"Unexpected logits shape: {tuple(logits.shape)}")
-        return logits.float().cpu()
+        return _project_hidden_states_to_logits(self.hidden_states, self._projection)
 
     def _greedy_decode(self) -> torch.Tensor:
         """Greedy token ids for every layer: `[L]`."""
@@ -169,7 +175,13 @@ def _load_input_transcript_spans(
     with open(input_json, "r") as f:
         payload = json.load(f)
 
-    chunks = payload.get("chunks", [])
+    if isinstance(payload, dict):
+        chunks = payload.get("chunks", [])
+    elif isinstance(payload, list) and all(isinstance(item, dict) for item in payload):
+        chunks = payload
+    else:
+        return []
+
     spans: list[tuple[float, float, str]] = []
     for chunk in chunks:
         text = str(chunk.get("text", "")).strip()
@@ -308,6 +320,8 @@ def plot_final_token_probability_heatmap(
     output_path: str,
     token_start_idx: int = 0,
     transcript_spans: Optional[list[tuple[float, float, str]]] = None,
+    transcript_lanes: Optional[list[tuple[str, list[tuple[float, float, str]]]]] = None,
+    color_scale: Optional[tuple[float, float]] = None,
 ):
     """Plot log probability of the final-layer decoded token across all layers/steps.
 
@@ -341,16 +355,22 @@ def plot_final_token_probability_heatmap(
     fig_h = max(8.0, num_layers * 0.24)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
 
-    finite_values = logprob_grid[np.isfinite(logprob_grid)]
-    if finite_values.size == 0:
-        logprob_vmin = -50.0
-        logprob_vmax = 0.0
-    else:
-        logprob_vmin = float(np.min(finite_values))
-        logprob_vmax = float(np.max(finite_values))
+    if color_scale is not None:
+        logprob_vmin, logprob_vmax = color_scale
         if logprob_vmin == logprob_vmax:
             logprob_vmin -= 1.0
             logprob_vmax += 1.0
+    else:
+        finite_values = logprob_grid[np.isfinite(logprob_grid)]
+        if finite_values.size == 0:
+            logprob_vmin = -50.0
+            logprob_vmax = 0.0
+        else:
+            logprob_vmin = float(np.min(finite_values))
+            logprob_vmax = float(np.max(finite_values))
+            if logprob_vmin == logprob_vmax:
+                logprob_vmin -= 1.0
+                logprob_vmax += 1.0
 
     im = ax.imshow(
         logprob_grid,
@@ -370,6 +390,7 @@ def plot_final_token_probability_heatmap(
         for x in range(num_tokens):
             token_txt = _plot_safe_text(token_grid[y][x])
             norm_value = (float(logprob_grid[y, x]) - logprob_vmin) / max(logprob_vmax - logprob_vmin, 1e-12)
+            norm_value = float(np.clip(norm_value, 0.0, 1.0))
             txt_color = "white" if norm_value < 0.55 else "black"
             try:
                 ax.text(
@@ -403,38 +424,50 @@ def plot_final_token_probability_heatmap(
     ax.tick_params(axis="y", labelsize=6)
     ax.set_title("Logit lens: final-token log probability across layers")
 
-    if transcript_spans:
-        lane_y = float(num_layers)
-        lane_h = 0.8
-        for start_tok, end_tok, word in transcript_spans:
-            local_start = start_tok - token_start_idx
-            local_end = end_tok - token_start_idx
-            if local_end <= -0.5 or local_start >= num_tokens - 0.5:
-                continue
-            draw_start = max(local_start, -0.5)
-            draw_end = min(local_end, num_tokens - 0.5)
-            if draw_end <= draw_start:
-                continue
-            rect = Rectangle(
-                (draw_start, lane_y),
-                draw_end - draw_start,
-                lane_h,
-                facecolor="#f3f3f3",
-                edgecolor="#888888",
-                linewidth=0.5,
-                alpha=0.9,
-            )
-            ax.add_patch(rect)
-            center_x = 0.5 * (draw_start + draw_end)
-            safe_word = _plot_safe_text(word)
-            try:
-                ax.text(center_x, lane_y + lane_h / 2, safe_word, ha="center", va="center", fontsize=6, color="black", parse_math=False)
-            except TypeError:
-                ax.text(center_x, lane_y + lane_h / 2, safe_word, ha="center", va="center", fontsize=6, color="black")
+    if transcript_lanes is None:
+        transcript_lanes = [("User", transcript_spans)] if transcript_spans else []
 
-        ax.axhline(num_layers - 0.5, color="#666666", linewidth=0.8)
-        ax.text(-1.2, lane_y + lane_h / 2, "User", ha="right", va="center", fontsize=7, color="black")
-        ax.set_ylim(-0.5, num_layers + lane_h + 0.4)
+    transcript_lanes = [(label, spans) for label, spans in transcript_lanes if spans]
+    if transcript_lanes:
+        lane_h = 0.8
+        lane_gap = 0.12
+        lane_colors = ["#e8f0fe", "#fce8e6"]
+        for lane_idx, (label, spans) in enumerate(transcript_lanes):
+            lane_top = -0.5 - lane_gap - lane_idx * (lane_h + lane_gap)
+            lane_y = lane_top - lane_h
+            for start_tok, end_tok, word in spans:
+                # Use continuous token-time coordinates directly:
+                # transcript_sec * frame_rate - token_start_idx.
+                local_start = start_tok - token_start_idx
+                local_end = end_tok - token_start_idx
+                if local_end <= -0.5 or local_start >= num_tokens - 0.5:
+                    continue
+                draw_start = max(local_start, -0.5)
+                draw_end = min(local_end, num_tokens - 0.5)
+                if draw_end <= draw_start:
+                    continue
+                rect = Rectangle(
+                    (draw_start, lane_y),
+                    draw_end - draw_start,
+                    lane_h,
+                    facecolor=lane_colors[lane_idx % len(lane_colors)],
+                    edgecolor="#888888",
+                    linewidth=0.5,
+                    alpha=0.95,
+                )
+                ax.add_patch(rect)
+                center_x = 0.5 * (draw_start + draw_end)
+                safe_word = _plot_safe_text(word)
+                try:
+                    ax.text(center_x, lane_y + lane_h / 2, safe_word, ha="center", va="center", fontsize=6, color="black", parse_math=False)
+                except TypeError:
+                    ax.text(center_x, lane_y + lane_h / 2, safe_word, ha="center", va="center", fontsize=6, color="black")
+
+            ax.text(-1.2, lane_y + lane_h / 2, label, ha="right", va="center", fontsize=7, color="black")
+
+        bottom_y = -0.5 - lane_gap - len(transcript_lanes) * (lane_h + lane_gap)
+        ax.axhline(-0.5, color="#666666", linewidth=0.8)
+        ax.set_ylim(bottom_y, num_layers - 0.5)
 
     fig.tight_layout()
     out_path = Path(output_path)
@@ -654,6 +687,47 @@ def premature_decode(
         )
     return decode_data_list
 
+
+def final_token_logprob_percentile_scale(
+    hidden_payload: dict,
+    projection: DecoderProjection,
+    low_percentile: float,
+    high_percentile: float,
+) -> tuple[float, float]:
+    """Compute full-sequence color bounds for final-token log-probability plots.
+
+    Bounds are computed across every token step in the hidden payload and every
+    layer, so different visible start/end windows for the same output_hidden.pt
+    share a consistent colorbar scale.
+    """
+    hidden = hidden_payload["text_hidden_layers"]
+    if not isinstance(hidden, torch.Tensor) or hidden.dim() != 3:
+        raise ValueError("Expected payload['text_hidden_layers'] with shape [T, L, D]")
+
+    t_total = int(hidden.shape[0])
+    values: list[np.ndarray] = []
+    for t in range(t_total):
+        logits = _project_hidden_states_to_logits(hidden[t], projection)
+        final_token_id = int(torch.argmax(logits[-1], dim=-1).item())
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        values.append(log_probs[:, final_token_id].cpu().numpy())
+
+    if not values:
+        return (-50.0, 0.0)
+
+    flat = np.concatenate(values).astype(np.float32)
+    flat = flat[np.isfinite(flat)]
+    if flat.size == 0:
+        return (-50.0, 0.0)
+
+    lo = float(np.percentile(flat, low_percentile))
+    hi = float(np.percentile(flat, high_percentile))
+    if lo == hi:
+        lo -= 1.0
+        hi += 1.0
+    return lo, hi
+
+
 def plot_pad_lookback_ratio(
     decode_data_list: list[DecodeData],
     output_path: str,
@@ -790,6 +864,8 @@ def main():
     ap.add_argument("--output", type=str, default=None, help="Output figure path")
     ap.add_argument("--output-dir", type=str, default=None, help="Directory for batch output figures. Defaults to root-dir when processing all samples.")
     ap.add_argument("--only-final-token-logprob", action="store_true", help="Only plot the final-token log-probability heatmap requested by prem_dec.sh")
+    ap.add_argument("--color-percentile-low", type=float, default=1.0, help="Lower colorbar percentile computed over the full output_hidden.pt sequence")
+    ap.add_argument("--color-percentile-high", type=float, default=99.0, help="Upper colorbar percentile computed over the full output_hidden.pt sequence")
     ap.add_argument("--preview-output", action="store_true", help="Print final decoded output preview")
     ap.add_argument("--hf-repo", type=str, default=loaders.DEFAULT_REPO)
     ap.add_argument("--tokenizer", type=str, default=None)
@@ -797,6 +873,12 @@ def main():
     ap.add_argument("--device", type=str, default="cpu")
     ap.add_argument("--transcript-base", type=str, default="auto", help="Base name for user transcript JSON. 'auto' (default) derives from hidden stem by stripping '_hidden', e.g. complete_sentence_hidden.pt -> complete_sentence.json. Use 'input' for sibling input.json.")
     args = ap.parse_args()
+
+    if not (0.0 <= args.color_percentile_low <= args.color_percentile_high <= 100.0):
+        raise ValueError(
+            "--color-percentile-low/high must satisfy "
+            "0 <= low <= high <= 100"
+        )
 
     root_dir = Path(args.root_dir)
     if args.hidden_path:
@@ -848,12 +930,34 @@ def main():
         start_idx, end_idx = _resolve_token_range(t_total, args.start, args.end)
         frame_rate_hz = float(payload.get("frame_rate", 12.5))
 
-        # Derive transcript base: 'auto' strips '_hidden' from stem.
+        input_transcript_spans = _load_input_transcript_spans(hidden_path, frame_rate_hz, base="input_transcript")
+        output_transcript_spans = _load_input_transcript_spans(hidden_path, frame_rate_hz, base="output_transcript")
+        if not input_transcript_spans:
+            input_transcript_spans = _load_input_transcript_spans(hidden_path, frame_rate_hz, base="input")
+
+        # Derive legacy transcript base: 'auto' strips '_hidden' from stem.
         if args.transcript_base == "auto":
             t_base = stem.removesuffix("_hidden") if stem.endswith("_hidden") else "input"
         else:
             t_base = args.transcript_base
-        transcript_spans = _load_input_transcript_spans(hidden_path, frame_rate_hz, base=t_base)
+        transcript_spans = input_transcript_spans
+        if not output_transcript_spans:
+            output_transcript_spans = _load_input_transcript_spans(hidden_path, frame_rate_hz, base=t_base)
+        transcript_lanes = [
+            ("User", input_transcript_spans),
+            ("Model", output_transcript_spans),
+        ]
+
+        print(
+            "Computing full-sequence color scale "
+            f"({args.color_percentile_low:g}..{args.color_percentile_high:g} percentiles)..."
+        )
+        color_scale = final_token_logprob_percentile_scale(
+            hidden_payload=payload,
+            projection=projection,
+            low_percentile=args.color_percentile_low,
+            high_percentile=args.color_percentile_high,
+        )
 
         print("Running premature decode...")
         decode_data = premature_decode(
@@ -897,6 +1001,8 @@ def main():
             str(prob_output_path),
             token_start_idx=start_idx,
             transcript_spans=transcript_spans,
+            transcript_lanes=transcript_lanes,
+            color_scale=color_scale,
         )
 
         if args.only_final_token_logprob:
