@@ -1,10 +1,11 @@
 """False-injection robustness utilities.
 
 This script supports two workflows:
-1) Generate random steering vectors under ``root_dir/*/steering_vector.json``:
-   - Normal vector is extracted from SVM classifier (same source as user_interrupt.py)
-   - Vector is multiplied by ``alpha``
-   - Inject periodic false signals by expectation interval in seconds
+1) Generate false-trigger steering schedules under ``root_dir/*/steering_vector.json``:
+   - The steering vector is the mean-hidden-diff vector computed from a mode-class dataset
+     (same source as ``user_interrupt.py --generate-steering-vectors-mean-diff``)
+   - Vector is multiplied by ``alpha`` and injected at ``layer``
+   - Randomly inject false signals with the requested expectation interval in seconds
      (e.g. 20 means one signal every 20s; -1 disables false signals)
 2) Evaluate generated outputs (0-5 relatedness score) and save summary to:
    ``root_dir/false_injection_{layer}_{expectation}.json``
@@ -13,6 +14,7 @@ This script supports two workflows:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -26,7 +28,6 @@ from typing import Any, Optional
 import torch
 from openai import OpenAI
 
-from moshi.persona_vector.mode_class import extract_normal_vector
 from moshi.offline import run_batch_inference, _get_voice_prompt_dir
 from moshi.models import loaders
 
@@ -92,16 +93,6 @@ def _wav_duration_seconds(wav_path: Path) -> float:
     return float(info.frames) / float(info.samplerate)
 
 
-def _discover_classifier_path(classifier_dir: str, layer: int) -> Path:
-  p = Path(classifier_dir) / f"hidden_mode_classifier_layer_{int(layer)}.pt"
-  if not p.is_file():
-    raise FileNotFoundError(
-      f"Cannot find classifier for layer {layer}: {p}. "
-      "Expected hidden_mode_classifier_layer_<layer>.pt"
-    )
-  return p
-
-
 def _format_expectation_tag(expectation: float) -> str:
   if expectation == -1.0:
     return "-1"
@@ -109,15 +100,164 @@ def _format_expectation_tag(expectation: float) -> str:
   return text or "0"
 
 
-def _build_injection_mask(total_tokens: int, expectation: float) -> list[bool]:
+def _build_injection_mask(total_tokens: int, expectation: float, seed_key: str) -> list[bool]:
   if expectation == -1.0:
     return [False] * total_tokens
   if expectation <= 0.0:
     raise ValueError(f"expectation must be > 0 or -1, got {expectation}")
 
-  step_tokens = max(1, int(round(float(expectation) * TOKEN_RATE_HZ)))
-  # Inject at deterministic periodic positions: one signal every N seconds.
-  return [((tok_idx + 1) % step_tokens == 0) for tok_idx in range(total_tokens)]
+  probability = min(1.0, 1.0 / max(1.0, float(expectation) * TOKEN_RATE_HZ))
+  digest = hashlib.sha256(seed_key.encode("utf-8")).digest()
+  seed = int.from_bytes(digest[:8], "little", signed=False)
+  generator = torch.Generator(device="cpu")
+  generator.manual_seed(seed)
+  return (torch.rand(total_tokens, generator=generator) < probability).tolist()
+
+
+def _extract_all_layer_hidden_from_payload(payload: dict[str, Any]) -> torch.Tensor:
+  if "text_hidden_layers" in payload:
+    hidden = payload["text_hidden_layers"]
+    if not isinstance(hidden, torch.Tensor):
+      hidden = torch.as_tensor(hidden)
+    if hidden.ndim != 3:
+      raise ValueError(f"Expected text_hidden_layers [T,L,D], got shape {tuple(hidden.shape)}")
+    return hidden.float()
+
+  if "hidden_states" in payload:
+    hidden = payload["hidden_states"]
+    if not isinstance(hidden, torch.Tensor):
+      hidden = torch.as_tensor(hidden)
+    if hidden.ndim == 2:
+      hidden = hidden.unsqueeze(1)
+    if hidden.ndim != 3:
+      raise ValueError(f"Expected hidden_states [T,L,D] or [T,D], got shape {tuple(hidden.shape)}")
+    return hidden.float()
+
+  raise KeyError("Payload has neither 'text_hidden_layers' nor 'hidden_states'")
+
+
+def _load_mean_hidden_diff_vectors(mean_hidden_diff_path: Path) -> dict[int, torch.Tensor]:
+  with mean_hidden_diff_path.open("r", encoding="utf-8") as f:
+    payload = json.load(f)
+  if not isinstance(payload, dict):
+    raise ValueError(f"Expected dict in {mean_hidden_diff_path}, got {type(payload).__name__}")
+
+  vectors: dict[int, torch.Tensor] = {}
+  for key, value in payload.items():
+    try:
+      layer = int(key)
+    except (TypeError, ValueError) as exc:
+      raise ValueError(f"Invalid layer key '{key}' in {mean_hidden_diff_path}") from exc
+    if not _is_valid_main_layer(layer):
+      continue
+    if not isinstance(value, list):
+      raise ValueError(f"Layer {layer} vector in {mean_hidden_diff_path} must be a list")
+    vec = torch.as_tensor(value, dtype=torch.float32).reshape(-1)
+    if vec.numel() == 0:
+      raise ValueError(f"Layer {layer} vector is empty in {mean_hidden_diff_path}")
+    vectors[layer] = vec
+  if not vectors:
+    raise ValueError(f"No valid layer vectors found in {mean_hidden_diff_path}")
+  return vectors
+
+
+def _compute_mean_hidden_diff_vectors_from_mode_class_dataset(classifier_dir: str) -> dict[int, torch.Tensor]:
+  base = Path(classifier_dir)
+  if not base.is_dir():
+    raise FileNotFoundError(f"classifier_dir not found: {classifier_dir}")
+
+  sample_dirs = [p for p in base.iterdir() if p.is_dir()]
+  sample_dirs.sort(key=lambda p: int(p.name) if p.name.isdigit() else p.name)
+  valid_dirs = [
+    sd for sd in sample_dirs
+    if (sd / "output_hidden.pt").is_file() and (sd / "input_timing.json").is_file()
+  ]
+  if not valid_dirs:
+    raise FileNotFoundError(
+      f"No valid mode-class samples in {classifier_dir}. Expected */output_hidden.pt and */input_timing.json"
+    )
+
+  listen_sum: Optional[torch.Tensor] = None
+  speak_sum: Optional[torch.Tensor] = None
+  listen_count = 0
+  speak_count = 0
+
+  for sd in valid_dirs:
+    payload = torch.load(sd / "output_hidden.pt", map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+      raise TypeError(f"Expected dict payload in {sd / 'output_hidden.pt'}, got {type(payload).__name__}")
+    hidden = _extract_all_layer_hidden_from_payload(payload)
+    frame_rate = float(payload.get("frame_rate", TOKEN_RATE_HZ))
+    if frame_rate <= 0.0:
+      raise ValueError(f"Invalid frame_rate in {sd / 'output_hidden.pt'}: {frame_rate}")
+
+    with (sd / "input_timing.json").open("r", encoding="utf-8") as f:
+      timing_payload = json.load(f)
+    if not isinstance(timing_payload, dict):
+      raise ValueError(f"Expected dict in {sd / 'input_timing.json'}, got {type(timing_payload).__name__}")
+    if "question_start" not in timing_payload or "question_end" not in timing_payload:
+      raise KeyError(f"Missing question_start/question_end in {sd / 'input_timing.json'}")
+
+    question_start = float(timing_payload["question_start"])
+    question_end = float(timing_payload["question_end"])
+    if question_end <= question_start:
+      raise ValueError(f"Expected question_end > question_start in {sd / 'input_timing.json'}")
+
+    times = torch.arange(int(hidden.shape[0]), dtype=torch.float32) / frame_rate
+    listen_mask = (times > (question_start + 1.0)) & (times < (question_end - 1.0))
+    speak_mask = (times > (question_end + 1.0)) & (times < (question_end + 11.0))
+
+    if int(listen_mask.sum()) > 0:
+      chunk = hidden[listen_mask].sum(dim=0).cpu()
+      if listen_sum is None:
+        listen_sum = torch.zeros_like(chunk)
+      if listen_sum.shape != chunk.shape:
+        raise ValueError(f"Listening hidden shape mismatch in {sd}")
+      listen_sum += chunk
+      listen_count += int(listen_mask.sum())
+
+    if int(speak_mask.sum()) > 0:
+      chunk = hidden[speak_mask].sum(dim=0).cpu()
+      if speak_sum is None:
+        speak_sum = torch.zeros_like(chunk)
+      if speak_sum.shape != chunk.shape:
+        raise ValueError(f"Speaking hidden shape mismatch in {sd}")
+      speak_sum += chunk
+      speak_count += int(speak_mask.sum())
+
+  if listen_sum is None or speak_sum is None or listen_count <= 0 or speak_count <= 0:
+    raise RuntimeError(
+      f"Insufficient labeled tokens in mode-class dataset: listening={listen_count} speaking={speak_count}"
+    )
+
+  diff = (speak_sum / float(speak_count)) - (listen_sum / float(listen_count))
+  vectors: dict[int, torch.Tensor] = {}
+  for layer in range(int(diff.shape[0])):
+    if _is_valid_main_layer(layer):
+      vectors[layer] = diff[layer].reshape(-1).float()
+  if not vectors:
+    raise RuntimeError(f"No valid layers found from computed mean diff. Computed layers={int(diff.shape[0])}")
+  return vectors
+
+
+def _load_or_compute_mean_diff_vector(classifier_dir: str, layer: int) -> torch.Tensor:
+  mean_hidden_diff_path = Path(classifier_dir) / "mean_hidden_diff.json"
+  if mean_hidden_diff_path.exists():
+    vectors = _load_mean_hidden_diff_vectors(mean_hidden_diff_path)
+    print(f"[false_injection] Loaded mean-hidden-diff vectors from {mean_hidden_diff_path}")
+  else:
+    vectors = _compute_mean_hidden_diff_vectors_from_mode_class_dataset(classifier_dir)
+    serializable = {str(k): v.tolist() for k, v in vectors.items()}
+    _atomic_write_json(mean_hidden_diff_path, serializable)
+    print(
+      f"[false_injection] Computed mean-hidden-diff vectors from mode-class hidden states and wrote {mean_hidden_diff_path}"
+    )
+  if int(layer) not in vectors:
+    raise FileNotFoundError(
+      f"Layer {layer} mean-hidden-diff vector not found in {classifier_dir}. "
+      f"Available layers: {sorted(vectors.keys())}"
+    )
+  return vectors[int(layer)].reshape(-1).float()
 
 
 def generate_random_vector(
@@ -125,25 +265,26 @@ def generate_random_vector(
   layer: int,
   expectation: float,
   alpha: float,
+  decay_span: int,
   classifier_dir: Optional[str],
-  classifier_path: Optional[str],
 ) -> None:
   if not _is_valid_main_layer(layer):
     raise ValueError(f"layer must be in [{MAIN_LAYER_MIN}..{MAIN_LAYER_MAX}], got {layer}")
   if expectation != -1.0 and expectation <= 0.0:
     raise ValueError(f"expectation must be > 0 or -1, got {expectation}")
+  if decay_span < 0:
+    raise ValueError(f"decay_span must be >= 0, got {decay_span}")
+  if classifier_dir is None:
+    raise ValueError("--generate-random-vector requires --classifier-dir")
 
-  if classifier_path is None:
-    if classifier_dir is None:
-      raise ValueError("--generate-random-vector requires --classifier-dir or --classifier-path")
-    classifier_path = str(_discover_classifier_path(classifier_dir, layer))
-
-  normal_vector = torch.as_tensor(
-    extract_normal_vector(str(classifier_path)), dtype=torch.float32
-  ).reshape(-1)
-  if normal_vector.numel() == 0:
-    raise ValueError(f"Extracted empty normal vector from classifier: {classifier_path}")
-  steering_vec = (normal_vector * float(alpha)).tolist()
+  mean_diff = _load_or_compute_mean_diff_vector(classifier_dir, int(layer))
+  base_vector = mean_diff * float(alpha)
+  if base_vector.numel() == 0:
+    raise ValueError(f"Layer {layer} mean-hidden-diff vector is empty")
+  print(
+    f"[false_injection] layer={layer} alpha={alpha} decay_span={decay_span} "
+    f"||mean_diff||={torch.norm(mean_diff).item():.6f} ||vector||={torch.norm(base_vector).item():.6f}"
+  )
 
   root = Path(root_dir)
   input_paths = [p for p in root.glob("*/input.wav") if p.is_file()]
@@ -163,15 +304,26 @@ def generate_random_vector(
         f"Computed non-positive token count for {input_wav}: duration={duration_s:.6f}s"
       )
 
-    inject_mask = _build_injection_mask(total_tokens=total_tokens, expectation=float(expectation))
-    layer_payload: dict[str, Optional[list[float]]] = {}
+    inject_mask = _build_injection_mask(
+      total_tokens=total_tokens,
+      expectation=float(expectation),
+      seed_key=f"{input_wav.parent.name}:{layer}:{expectation_tag}",
+    )
+    layer_payload: dict[str, Optional[list[float]]] = {
+      str(tok_idx): None for tok_idx in range(total_tokens)
+    }
     injected_count = 0
     for tok_idx in range(total_tokens):
       if inject_mask[tok_idx]:
-        layer_payload[str(tok_idx)] = steering_vec
+        layer_payload[str(tok_idx)] = base_vector.tolist()
         injected_count += 1
-      else:
-        layer_payload[str(tok_idx)] = None
+        for k in range(1, int(decay_span) + 1):
+          next_idx = tok_idx + k
+          if next_idx >= total_tokens:
+            break
+          decay_factor = 1.0 - (float(k) / float(decay_span)) if decay_span > 0 else 0.0
+          if decay_factor > 0.0:
+            layer_payload[str(next_idx)] = (base_vector * decay_factor).tolist()
 
     steering_path = input_wav.parent / "steering_vector.json"
     steering_named_path = input_wav.parent / f"steering_vector_{int(layer)}_{expectation_tag}.json"
@@ -182,7 +334,8 @@ def generate_random_vector(
 
     print(
       f"[false_injection] {input_wav.parent.name}: wrote {steering_path.name} and {steering_named_path.name} {layer_key} "
-      f"(tokens={total_tokens}, injected={injected_count}, expectation={expectation_tag}s)"
+      f"(tokens={total_tokens}, triggers={injected_count}, non_null={sum(v is not None for v in layer_payload.values())}, "
+      f"expectation={expectation_tag}s)"
     )
     updated += 1
 
@@ -479,7 +632,7 @@ def main() -> None:
   mode_group.add_argument(
     "--generate-random-vector",
     action="store_true",
-    help="Generate root-dir/*/steering_vector.json with expectation-based periodic false signals.",
+    help="Generate root-dir/*/steering_vector.json with random expectation-based false signals.",
   )
   mode_group.add_argument(
     "--evaluate-results",
@@ -499,19 +652,24 @@ def main() -> None:
     required=True,
     help="Expected interval seconds between false signals; -1 disables false signals.",
   )
-  parser.add_argument("--alpha", type=float, default=0.05, help="Multiplier for extracted SVM normal vector")
+  parser.add_argument(
+    "--alpha",
+    type=float,
+    default=0.05,
+    help="Multiplier for the layer mean-hidden-diff vector.",
+  )
+  parser.add_argument(
+    "--decay-span",
+    type=int,
+    default=1,
+    help="Linear decay span in tokens for each false trigger; 1 gives one active token.",
+  )
 
   parser.add_argument(
     "--classifier-dir",
     type=str,
     default=None,
-    help="Directory containing hidden_mode_classifier_layer_<layer>.pt",
-  )
-  parser.add_argument(
-    "--classifier-path",
-    type=str,
-    default=None,
-    help="Optional explicit classifier checkpoint path (overrides --classifier-dir)",
+    help="Mode-class dataset directory containing mean_hidden_diff.json or */output_hidden.pt and */input_timing.json.",
   )
 
   parser.add_argument(
@@ -535,8 +693,8 @@ def main() -> None:
       layer=int(args.layer),
       expectation=float(args.expectation),
       alpha=float(args.alpha),
+      decay_span=int(args.decay_span),
       classifier_dir=args.classifier_dir,
-      classifier_path=args.classifier_path,
     )
     return
 
