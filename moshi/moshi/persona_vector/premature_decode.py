@@ -169,7 +169,13 @@ def _load_input_transcript_spans(
     with open(input_json, "r") as f:
         payload = json.load(f)
 
-    chunks = payload.get("chunks", [])
+    if isinstance(payload, dict):
+        chunks = payload.get("chunks", [])
+    elif isinstance(payload, list) and all(isinstance(item, dict) for item in payload):
+        chunks = payload
+    else:
+        return []
+
     spans: list[tuple[float, float, str]] = []
     for chunk in chunks:
         text = str(chunk.get("text", "")).strip()
