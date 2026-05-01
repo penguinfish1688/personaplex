@@ -326,14 +326,12 @@ def generate_random_vector(
             layer_payload[str(next_idx)] = (base_vector * decay_factor).tolist()
 
     steering_path = input_wav.parent / "steering_vector.json"
-    steering_named_path = input_wav.parent / f"steering_vector_{int(layer)}_{expectation_tag}.json"
     existing = _load_existing_steering_payload(steering_path)
     existing[layer_key] = layer_payload
     _atomic_write_json(steering_path, existing)
-    _atomic_write_json(steering_named_path, existing)
 
     print(
-      f"[false_injection] {input_wav.parent.name}: wrote {steering_path.name} and {steering_named_path.name} {layer_key} "
+      f"[false_injection] {input_wav.parent.name}: wrote {steering_path.name} {layer_key} "
       f"(tokens={total_tokens}, triggers={injected_count}, non_null={sum(v is not None for v in layer_payload.values())}, "
       f"expectation={expectation_tag}s)"
     )
@@ -396,14 +394,14 @@ def inference_with_steering(root_dir: str, layer: int, expectation: float) -> No
   if not input_paths:
     raise FileNotFoundError(f"No files matched pattern {root_dir}/*/input.wav")
 
-  expectation_tag = _format_expectation_tag(expectation)
-
-  # Strictly require per-run steering file for tracking and reproducibility.
+  # Use the same live steering file as normal steering inference. Each scan
+  # parameter overwrites this file before inference; aggregate eval files carry
+  # the parameterized names.
   for p in input_paths:
-    steering_named = p.parent / f"steering_vector_{int(layer)}_{expectation_tag}.json"
-    if not steering_named.exists():
+    steering_json = p.parent / "steering_vector.json"
+    if not steering_json.exists():
       raise FileNotFoundError(
-        f"Missing required steering file for inference: {steering_named}. "
+        f"Missing required steering file for inference: {steering_json}. "
         "Run --generate-random-vector with matching --layer/--expectation first."
       )
 
@@ -417,14 +415,14 @@ def inference_with_steering(root_dir: str, layer: int, expectation: float) -> No
   for path in input_paths:
     entry_dir = path.parent
     input_wav = str(path)
-    output_wav = str(entry_dir / f"output_{int(layer)}_{expectation_tag}.wav")
-    output_text = str(entry_dir / f"output_{int(layer)}_{expectation_tag}.json")
-    steering_named = entry_dir / f"steering_vector_{int(layer)}_{expectation_tag}.json"
+    output_wav = str(entry_dir / "output.wav")
+    output_text = str(entry_dir / "output.json")
+    steering_json = entry_dir / "steering_vector.json"
 
-    with steering_named.open("r", encoding="utf-8") as f:
+    with steering_json.open("r", encoding="utf-8") as f:
       steering_payload = json.load(f)
     if not isinstance(steering_payload, dict):
-      raise ValueError(f"Expected dict in {steering_named}, got {type(steering_payload)}")
+      raise ValueError(f"Expected dict in {steering_json}, got {type(steering_payload)}")
 
     steering_vectors = _extract_layer_vector_legacy(steering_payload, int(layer))
 
@@ -442,7 +440,7 @@ def inference_with_steering(root_dir: str, layer: int, expectation: float) -> No
 
     non_null = sum(1 for v in steering_vectors if v is not None)
     print(
-      f"[false_injection] {entry_dir.name}: using {steering_named.name}, "
+      f"[false_injection] {entry_dir.name}: using {steering_json.name}, "
       f"len={len(steering_vectors)}, min_tokens={min_tokens}, non_null={non_null}"
     )
 
@@ -477,7 +475,7 @@ def inference_with_steering(root_dir: str, layer: int, expectation: float) -> No
     )
 
   print(
-    f"[false_injection] Done. Wrote output_<layer>_<expectation>.wav/json for {len(input_paths)} items at {root_dir}"
+    f"[false_injection] Done. Wrote output.wav/output.json for {len(input_paths)} items at {root_dir}"
   )
 
 
@@ -549,11 +547,11 @@ def evaluate_results(
 
   root = Path(root_dir)
   expectation_tag = _format_expectation_tag(expectation)
-  output_wavs = [p for p in root.glob(f"*/output_{int(layer)}_{expectation_tag}.wav") if p.is_file()]
+  output_wavs = [p for p in root.glob("*/output.wav") if p.is_file()]
   output_wavs.sort(key=lambda p: int(p.parent.name) if p.parent.name.isdigit() else p.parent.name)
   if not output_wavs:
     raise FileNotFoundError(
-      f"No files matched pattern {root_dir}/*/output_{int(layer)}_{expectation_tag}.wav"
+      f"No files matched pattern {root_dir}/*/output.wav"
     )
 
   client = _build_openai_client()
@@ -562,7 +560,7 @@ def evaluate_results(
   scores: list[int] = []
   for output_wav in output_wavs:
     sample_dir = output_wav.parent
-    output_json = sample_dir / f"output_{int(layer)}_{expectation_tag}.json"
+    output_json = sample_dir / "output.json"
     answer_text = _load_output_text(output_json)
 
     if not answer_text:
@@ -642,7 +640,7 @@ def main() -> None:
   mode_group.add_argument(
     "--inference-with-steering",
     action="store_true",
-    help="Run inference using steering_vector_<layer>_<expectation>.json and write output_<layer>_<expectation>.wav/json.",
+    help="Run inference using root-dir/*/steering_vector.json and write root-dir/*/output.wav/json.",
   )
 
   parser.add_argument("--layer", type=int, required=True, help="Injection layer (0..31)")
