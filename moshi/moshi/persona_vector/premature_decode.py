@@ -381,7 +381,9 @@ def plot_final_token_probability_heatmap(
         vmax=logprob_vmax,
     )
     cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("log P(final-layer decoded token)")
+    label_font = {"fontname": "Times New Roman", "fontsize": 12}
+    title_font = {"fontname": "Times New Roman", "fontsize": 14}
+    cbar.set_label("log P(final-layer decoded token)", **label_font)
 
     def _plot_safe_text(text: str) -> str:
         return text.replace("\n", " ").replace("$", "\\$")
@@ -414,15 +416,15 @@ def plot_final_token_probability_heatmap(
                     color=txt_color,
                 )
 
-    ax.set_xlabel("Token timestep")
-    ax.set_ylabel("Layer")
+    ax.set_xlabel("Token timestep", **label_font)
+    ax.set_ylabel("Layer", **label_font)
     ax.set_xticks(np.arange(num_tokens))
     ax.set_xticklabels([str(token_start_idx + i) for i in range(num_tokens)])
     ax.set_yticks(np.arange(num_layers))
     ax.set_yticklabels([str(i) for i in range(num_layers)])
     ax.tick_params(axis="x", labelsize=6, rotation=90)
     ax.tick_params(axis="y", labelsize=6)
-    ax.set_title("Logit lens: final-token log probability across layers")
+    ax.set_title("Logit lens: final-token log probability across layers", **title_font)
 
     if transcript_lanes is None:
         transcript_lanes = [("User", transcript_spans)] if transcript_spans else []
@@ -463,7 +465,16 @@ def plot_final_token_probability_heatmap(
                 except TypeError:
                     ax.text(center_x, lane_y + lane_h / 2, safe_word, ha="center", va="center", fontsize=6, color="black")
 
-            ax.text(-1.2, lane_y + lane_h / 2, label, ha="right", va="center", fontsize=7, color="black")
+            ax.text(
+                -1.2,
+                lane_y + lane_h / 2,
+                label,
+                ha="right",
+                va="center",
+                fontsize=9,
+                fontname="Times New Roman",
+                color="black",
+            )
 
         bottom_y = -0.5 - lane_gap - len(transcript_lanes) * (lane_h + lane_gap)
         ax.axhline(-0.5, color="#666666", linewidth=0.8)
