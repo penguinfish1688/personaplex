@@ -58,6 +58,29 @@ class DecoderProjection:
     text_linear: torch.nn.Module
 
 
+def _project_hidden_states_to_logits(
+    hidden_states: torch.Tensor,
+    projection: DecoderProjection,
+) -> torch.Tensor:
+    """Project hidden states `[L, D]` to logits `[L, vocab_size]`."""
+    if hidden_states.dim() != 2:
+        raise RuntimeError(f"Expected hidden states shape [L, D], got {tuple(hidden_states.shape)}")
+
+    text_linear_weight = projection.text_linear.weight
+    proj_device = text_linear_weight.device
+    proj_dtype = text_linear_weight.dtype
+
+    x = hidden_states.float().to(device=proj_device, dtype=proj_dtype).unsqueeze(0)  # [1, L, D]
+    with torch.no_grad():
+        if projection.out_norm is not None:
+            x = projection.out_norm(x)
+        logits = projection.text_linear(x)
+    logits = logits.squeeze(0)  # [L, V]
+    if logits.dim() != 2:
+        raise RuntimeError(f"Unexpected logits shape: {tuple(logits.shape)}")
+    return logits.float().cpu()
+
+
 class DecodeData:
     """Per-token layer-wise decode information.
 
@@ -91,24 +114,7 @@ class DecodeData:
         The projection is executed in the same dtype/device as `text_linear.weight`
         for parity with model behavior, then converted to float32 for analysis.
         """
-        x = self.hidden_states
-        if x.dim() != 2:
-            raise RuntimeError(f"Expected hidden states shape [L, D], got {tuple(x.shape)}")
-
-        # `lm.out_norm` can be RMSNorm, which expects 3D `[B, T, D]`.
-        text_linear_weight = self._projection.text_linear.weight
-        proj_device = text_linear_weight.device
-        proj_dtype = text_linear_weight.dtype
-
-        x = x.to(device=proj_device, dtype=proj_dtype).unsqueeze(0)  # [1, L, D]
-        with torch.no_grad():
-            if self._projection.out_norm is not None:
-                x = self._projection.out_norm(x)
-            logits = self._projection.text_linear(x)
-        logits = logits.squeeze(0)  # [L, V]
-        if logits.dim() != 2:
-            raise RuntimeError(f"Unexpected logits shape: {tuple(logits.shape)}")
-        return logits.float().cpu()
+        return _project_hidden_states_to_logits(self.hidden_states, self._projection)
 
     def _greedy_decode(self) -> torch.Tensor:
         """Greedy token ids for every layer: `[L]`."""
