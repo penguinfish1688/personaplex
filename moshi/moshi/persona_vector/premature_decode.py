@@ -400,7 +400,7 @@ def plot_final_token_probability_heatmap(
     cbar = fig.colorbar(im, ax=ax)
     label_font = {"fontfamily": SERIF_PLOT_FONT_FAMILY, "fontsize": 12}
     title_font = {"fontfamily": SERIF_PLOT_FONT_FAMILY, "fontsize": 14}
-    cbar.set_label("log P(final-layer decoded token)", **label_font)
+    cbar.set_label(r"$\log P(y_{\text{decode}}^{(t)} \mid h^{(t)})$", **label_font)
 
     def _plot_safe_text(text: str) -> str:
         return text.replace("\n", " ").replace("$", "\\$")
