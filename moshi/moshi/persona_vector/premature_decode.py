@@ -35,6 +35,7 @@ import sentencepiece
 import torch
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
+from matplotlib import font_manager
 from matplotlib.colors import LogNorm
 from matplotlib.patches import Rectangle
 
@@ -48,6 +49,22 @@ SPECIAL_TOKEN_MAP = {
     3: "PAD",
 }
 PAD_TOKEN_ID = 3
+
+
+def _serif_plot_font_family() -> str:
+    for family in ("Times New Roman", "Times", "Liberation Serif", "Nimbus Roman", "DejaVu Serif"):
+        try:
+            font_manager.findfont(
+                font_manager.FontProperties(family=family),
+                fallback_to_default=False,
+            )
+        except ValueError:
+            continue
+        return family
+    return "serif"
+
+
+SERIF_PLOT_FONT_FAMILY = _serif_plot_font_family()
 
 
 @dataclass
@@ -381,8 +398,8 @@ def plot_final_token_probability_heatmap(
         vmax=logprob_vmax,
     )
     cbar = fig.colorbar(im, ax=ax)
-    label_font = {"fontname": "Times New Roman", "fontsize": 12}
-    title_font = {"fontname": "Times New Roman", "fontsize": 14}
+    label_font = {"fontfamily": SERIF_PLOT_FONT_FAMILY, "fontsize": 12}
+    title_font = {"fontfamily": SERIF_PLOT_FONT_FAMILY, "fontsize": 14}
     cbar.set_label("log P(final-layer decoded token)", **label_font)
 
     def _plot_safe_text(text: str) -> str:
@@ -472,7 +489,7 @@ def plot_final_token_probability_heatmap(
                 ha="right",
                 va="center",
                 fontsize=9,
-                fontname="Times New Roman",
+                fontfamily=SERIF_PLOT_FONT_FAMILY,
                 color="black",
             )
 
