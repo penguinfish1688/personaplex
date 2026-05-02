@@ -2140,6 +2140,7 @@ def plot_logit_lens_dataset(
     device: str = "cuda",
     ma_window: int = 5,
     use_all_codebook: bool = False,
+    resume: int = 0,
 ) -> None:
     """Find ``root_dir/*/output_hidden(.pt)`` and save logit-lens probabilities.
 
@@ -2163,6 +2164,20 @@ def plot_logit_lens_dataset(
         raise FileNotFoundError(
             f"No output_hidden(.pt) files found under {root}/*/"
         )
+    if resume < 0:
+        raise ValueError(f"--resume must be >= 0, got {resume}")
+    total_hidden_files = len(hidden_files)
+    if resume >= total_hidden_files:
+        raise ValueError(
+            f"--resume {resume} is past the last hidden file index "
+            f"({total_hidden_files - 1})"
+        )
+    if resume > 0:
+        print(
+            f"[plot-logit-lens] Resuming from sorted hidden file index {resume}; "
+            f"skipping {resume}/{total_hidden_files} files."
+        )
+        hidden_files = hidden_files[resume:]
 
     if moshi_weight is None:
         moshi_weight = hf_hub_download(hf_repo, loaders.MOSHI_NAME)  # type: ignore
@@ -2170,7 +2185,8 @@ def plot_logit_lens_dataset(
     lm.eval()
 
     print(
-        f"[plot-logit-lens] Found {len(hidden_files)} output_hidden(.pt) files under {root}/*/"
+        f"[plot-logit-lens] Processing {len(hidden_files)}/{total_hidden_files} "
+        f"output_hidden(.pt) files under {root}/*/"
     )
     ok = 0
     total_jobs = 0
@@ -3246,6 +3262,15 @@ def main() -> None:
         ),
     )
     ap.add_argument(
+        "--resume",
+        type=int,
+        default=0,
+        help=(
+            "For dataset plotting modes that iterate sorted sample files, start "
+            "from this zero-based file index (default: 0)."
+        ),
+    )
+    ap.add_argument(
         "--sper-title",
         type=str,
         default="Layer-wise Perception Score Around Turn Transition",
@@ -3358,6 +3383,7 @@ def main() -> None:
             device=args.device,
             ma_window=args.window,
             use_all_codebook=args.use_all_codebook,
+            resume=args.resume,
         )
 
     elif args.plot_attention_heatmap_turn_taking:
