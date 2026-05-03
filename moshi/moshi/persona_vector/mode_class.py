@@ -2670,7 +2670,7 @@ def plot_layerwise_turn_transition_heatmap(
     vmin=None,
     vmax=None,
     title: str = "Layer-wise Perception Score Around Turn Transition",
-    colorbar_label: str = r"$\mathcal{S}_\text{per}$",
+    colorbar_label: str = r"$\ln S_\text{per}$",
     cmap: str = "coolwarm_soft_sat",
     x_label: str = "Token offset from turn boundary",
     colorbar_ticks: Optional[List[float]] = None,
@@ -2695,7 +2695,7 @@ def plot_layerwise_turn_transition_heatmap(
         ...     vmin=shared_vmin,
         ...     vmax=shared_vmax,
         ...     title="Layer-wise Generation Score Around Turn Transition",
-        ...     colorbar_label=r"$\mathcal{S}_\text{gen}$",
+        ...     colorbar_label=r"$\log S_\text{gen}$",
         ... )
     """
     import matplotlib
@@ -2836,7 +2836,7 @@ def plot_generation_score_heatmap(
         vmin=vmin,
         vmax=vmax,
         title=title,
-        colorbar_label=r"$\mathcal{S}_\text{gen}$",
+        colorbar_label=r"$\log S_\text{gen}$",
         x_label=x_label,
         colorbar_ticks=colorbar_ticks,
         colorbar_ticklabels=colorbar_ticklabels,
