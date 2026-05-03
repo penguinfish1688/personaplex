@@ -2670,7 +2670,7 @@ def plot_layerwise_turn_transition_heatmap(
     vmin=None,
     vmax=None,
     title: str = "Layer-wise Perception Score Around Turn Transition",
-    colorbar_label: str = r"$\ln S_\text{per}$",
+    colorbar_label: str = r"$\log S_\text{per}$",
     cmap: str = "coolwarm_soft_sat",
     x_label: str = "Token offset from turn boundary",
     colorbar_ticks: Optional[List[float]] = None,
