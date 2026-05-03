@@ -2670,7 +2670,7 @@ def plot_layerwise_turn_transition_heatmap(
     vmin=None,
     vmax=None,
     title: str = "Layer-wise Perception Score Around Turn Transition",
-    colorbar_label: str = r"$\log S_\text{per}$",
+    colorbar_label: str = r"$\log S_{per}$",
     cmap: str = "coolwarm_soft_sat",
     x_label: str = "Token offset from turn boundary",
     colorbar_ticks: Optional[List[float]] = None,
@@ -2695,7 +2695,7 @@ def plot_layerwise_turn_transition_heatmap(
         ...     vmin=shared_vmin,
         ...     vmax=shared_vmax,
         ...     title="Layer-wise Generation Score Around Turn Transition",
-        ...     colorbar_label=r"$\log S_\text{gen}$",
+        ...     colorbar_label=r"$\log S_{gen}$",
         ... )
     """
     import matplotlib
@@ -2790,7 +2790,7 @@ def plot_layerwise_turn_transition_heatmap(
         cbar.set_ticks(colorbar_ticks)
     if colorbar_ticklabels is not None:
         cbar.set_ticklabels(colorbar_ticklabels)
-    cbar_label_fontsize = 26 if r"\text{per}" in colorbar_label else 23
+    cbar_label_fontsize = 26 if "per" in colorbar_label else 23
     cbar.set_label(colorbar_label, fontsize=cbar_label_fontsize)
     cbar.ax.tick_params(labelsize=15)
 
@@ -2836,7 +2836,7 @@ def plot_generation_score_heatmap(
         vmin=vmin,
         vmax=vmax,
         title=title,
-        colorbar_label=r"$\log S_\text{gen}$",
+        colorbar_label=r"$\log S_{gen}$",
         x_label=x_label,
         colorbar_ticks=colorbar_ticks,
         colorbar_ticklabels=colorbar_ticklabels,
