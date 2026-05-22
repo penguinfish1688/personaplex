@@ -61,6 +61,7 @@ from .models.lm import load_audio as lm_load_audio
 from .models.lm import _iterate_audio as lm_iterate_audio
 from .models.lm import encode_from_sphn as lm_encode_from_sphn
 from .models.lm import HiddenLayerOutputs, SILENCE_TOKENS
+from .modules.attention_suppression import _validate_lambda
 
 def log(level: str, msg: str):
     print(make_log(level, msg))
@@ -250,6 +251,28 @@ def _extract_step_token_ids(step_tokens: torch.Tensor) -> torch.Tensor:
     elif x.dim() != 1:
         raise ValueError(f"Unsupported step token shape: {tuple(x.shape)}")
     return x
+
+
+def _text_transformer_offset_cpu(lm: Any) -> int:
+    """Return the current absolute text-transformer stream offset."""
+    layers = getattr(getattr(lm, "transformer", None), "layers", None)
+    if layers is None or len(layers) == 0:
+        return 0
+    attn = getattr(layers[0], "self_attn", None)
+    state = getattr(attn, "_streaming_state", None)
+    if state is None:
+        return 0
+    return int(getattr(state, "offset_cpu", 0))
+
+
+def _json_ready_attention_suppression_stats(stats: dict[str, Any]) -> dict[str, Any]:
+    out = dict(stats)
+    query_steps = sorted(int(x) for x in out.pop("suppressed_query_steps", set()))
+    layers = sorted(int(x) for x in out.pop("layers_applied", set()) if x is not None)
+    out["number_of_suppressed_query_steps"] = len(query_steps)
+    out["suppressed_query_steps_abs"] = query_steps
+    out["layers_applied"] = layers
+    return out
 
 
 def _extract_target_layer_text_keys_and_positions(
@@ -843,6 +866,8 @@ def run_batch_inference(
     embed_stat: bool = False,
     force_pad_start_steps: Optional[List[Optional[int]]] = None,
     force_pad_num_steps: int = 0,
+    attention_suppression_configs: Optional[List[Optional[dict[str, Any]]]] = None,
+    attention_suppression_stats_path: Optional[str] = None,
 ) -> Optional[List[List[HiddenLayerOutputs]]]:
     """Run batch offline inference using multiple input WAVs and text prompts.
     
@@ -876,8 +901,16 @@ def run_batch_inference(
         raise ValueError(
             "force_pad_start_steps must have the same length as input_wavs when provided"
         )
+    if attention_suppression_configs is not None and len(attention_suppression_configs) != len(input_wavs):
+        raise ValueError(
+            "attention_suppression_configs must have the same length as input_wavs when provided"
+        )
     if int(force_pad_num_steps) < 0:
         raise ValueError(f"force_pad_num_steps must be >= 0, got {force_pad_num_steps}")
+    if attention_suppression_configs is not None:
+        for cfg in attention_suppression_configs:
+            if cfg is not None and bool(cfg.get("enabled", False)):
+                _validate_lambda(float(cfg.get("lambda_suppression", 0.2)))
 
     has_single_steer = steering_vectors is not None
     has_multi_steer = steering_vectors_by_layer is not None and len(steering_vectors_by_layer) > 0
@@ -921,6 +954,9 @@ def run_batch_inference(
             f"force-pad enabled: text_pad_token_id={text_pad_token_id}, "
             f"audio_silence_tokens={SILENCE_TOKENS.tolist()}, span={int(force_pad_num_steps)}",
         )
+    if attention_suppression_configs is not None:
+        enabled_count = sum(1 for cfg in attention_suppression_configs if cfg is not None and bool(cfg.get("enabled", False)))
+        log("info", f"attention suppression enabled for {enabled_count}/{len(input_wavs)} instances")
 
     # 4) Construct LMGen (shared across all instances)
     frame_size = int(mimi.sample_rate / mimi.frame_rate)
@@ -985,6 +1021,30 @@ def run_batch_inference(
         lm_gen.reset_streaming()
         lm_gen.step_system_prompts(mimi)
         mimi.reset_streaming()
+        prompt_offset = _text_transformer_offset_cpu(lm)
+        step_attention_suppression: Optional[dict[str, Any]] = None
+        attention_suppression_stats: Optional[dict[str, Any]] = None
+        if attention_suppression_configs is not None:
+            raw_suppression = attention_suppression_configs[i]
+            if raw_suppression is not None and bool(raw_suppression.get("enabled", False)):
+                attention_suppression_stats = {
+                    "example_id": raw_suppression.get("example_id", Path(input_wav).parent.name),
+                    "input_wav": input_wav,
+                    "interrupt_timestep": int(raw_suppression["interrupt_timestep"]) + int(prompt_offset),
+                    "interrupt_timestep_input_relative": int(raw_suppression["interrupt_timestep"]),
+                    "prompt_offset": int(prompt_offset),
+                    "k_post_interrupt": int(raw_suppression.get("k_post_interrupt", 10)),
+                    "n_pre_interrupt": int(raw_suppression.get("n_pre_interrupt", 30)),
+                    "lambda_suppression": float(raw_suppression.get("lambda_suppression", 0.2)),
+                    "layers": raw_suppression.get("layers", [23]),
+                    "suppressed_key_range_abs": [
+                        max(0, int(raw_suppression["interrupt_timestep"]) + int(prompt_offset) - int(raw_suppression.get("n_pre_interrupt", 30))),
+                        int(raw_suppression["interrupt_timestep"]) + int(prompt_offset),
+                    ],
+                }
+                step_attention_suppression = dict(raw_suppression)
+                step_attention_suppression["interrupt_timestep"] = int(raw_suppression["interrupt_timestep"]) + int(prompt_offset)
+                step_attention_suppression["stats"] = attention_suppression_stats
 
         # Load and process user audio for this instance
         sample_rate = mimi.sample_rate
@@ -1122,6 +1182,7 @@ def run_batch_inference(
                         steering_layer=steering_layer,
                         steering_vectors_by_layer=step_steering_vectors_by_layer,
                         steer_attn_only=steer_attn_only,
+                        attention_suppression=step_attention_suppression,
                         **step_kwargs,
                     )
                     if save_hidden_payload:
@@ -1153,6 +1214,7 @@ def run_batch_inference(
                         steering_layer=steering_layer,
                         steering_vectors_by_layer=step_steering_vectors_by_layer,
                         steer_attn_only=steer_attn_only,
+                        attention_suppression=step_attention_suppression,
                         **step_kwargs,
                     )
                     if need_step_input_tokens:
@@ -1295,6 +1357,16 @@ def run_batch_inference(
                 payload["embed_stats"] = embed_stats_payload
             torch.save(payload, output_hidden)
             log("info", f"Wrote hidden payload to {output_hidden}")
+
+        if attention_suppression_stats is not None:
+            stats_payload = _json_ready_attention_suppression_stats(attention_suppression_stats)
+            stats_out = attention_suppression_stats_path
+            if stats_out is None:
+                stats_out = str(Path(output_wav).parent.parent / "attention_suppression_stats.jsonl")
+            Path(stats_out).parent.mkdir(parents=True, exist_ok=True)
+            with open(stats_out, "a", encoding="utf-8") as f:
+                f.write(json.dumps(stats_payload, ensure_ascii=False) + "\n")
+            log("info", f"Wrote attention suppression stats to {stats_out}")
 
     for streaming_obj in (mimi, other_mimi, lm_gen):
         try:

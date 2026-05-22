@@ -41,6 +41,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 from ..utils.compile import no_compile
+from .attention_suppression import apply_pre_interrupt_attention_suppression
 from .gating import make_gating
 from .rope import RotaryEmbedding
 from .streaming import StreamingModule, StreamingContainer
@@ -404,6 +405,7 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
         key: torch.Tensor,
         value: torch.Tensor,
         return_attention_weights: bool = False,
+        attention_suppression: tp.Optional[dict[str, tp.Any]] = None,
     ):
         state = self._streaming_state
         T = query.shape[1]
@@ -441,7 +443,11 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
                 attn_bias = attn_bias & (delta < self.context)
         else:
             attn_bias = None
-        if return_attention_weights:
+        use_manual_attention = return_attention_weights or (
+            attention_suppression is not None
+            and bool(attention_suppression.get("enabled", False))
+        )
+        if use_manual_attention:
             scale = 1.0 / math.sqrt(q.shape[-1])
             attn_logits = torch.matmul(q, k.transpose(-2, -1)) * scale
             if attn_bias is not None:
@@ -451,6 +457,18 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
                 elif attn_mask.dim() == 3:
                     attn_mask = attn_mask.unsqueeze(1)
                 attn_logits = attn_logits.masked_fill(~attn_mask, float("-inf"))
+            if attention_suppression is not None and bool(attention_suppression.get("enabled", False)):
+                attn_logits = apply_pre_interrupt_attention_suppression(
+                    attn_logits,
+                    current_timestep=offset_cpu,
+                    interrupt_timestep=int(attention_suppression["interrupt_timestep"]),
+                    k_post_interrupt=int(attention_suppression.get("k_post_interrupt", 10)),
+                    n_pre_interrupt=int(attention_suppression.get("n_pre_interrupt", 30)),
+                    lambda_suppression=float(attention_suppression.get("lambda_suppression", 0.2)),
+                    key_positions=pos_k.reshape(-1) if pos_k is not None else None,
+                    stats=attention_suppression.get("stats"),
+                    layer_idx=attention_suppression.get("layer_idx"),
+                )
             attn_weights = torch.softmax(attn_logits.float(), dim=-1).to(q.dtype)
             x = torch.matmul(attn_weights, v)
         else:
@@ -632,7 +650,12 @@ class StreamingTransformerLayer(StreamingModule[_LayerState]):
                 update = self.gating(x)
         return x_orig + self.layer_scale_2(update)
 
-    def _sa_block(self, x: torch.Tensor, return_attention_weights: bool = False):
+    def _sa_block(
+        self,
+        x: torch.Tensor,
+        return_attention_weights: bool = False,
+        attention_suppression: tp.Optional[dict[str, tp.Any]] = None,
+    ):
         if self.skip_self_attn:
             if return_attention_weights:
                 return x, None
@@ -645,9 +668,10 @@ class StreamingTransformerLayer(StreamingModule[_LayerState]):
                 x,
                 x,
                 return_attention_weights=True,
+                attention_suppression=attention_suppression,
             )
             return x_orig + self.layer_scale_1(update), attn_weights
-        update = self.self_attn(x, x, x)
+        update = self.self_attn(x, x, x, attention_suppression=attention_suppression)
         return x_orig + self.layer_scale_1(update)
 
     def forward(
@@ -655,6 +679,7 @@ class StreamingTransformerLayer(StreamingModule[_LayerState]):
         x: torch.Tensor,
         return_attention_weights: bool = False,
         steer_for_attn_only: torch.Tensor | None = None,
+        attention_suppression: tp.Optional[dict[str, tp.Any]] = None,
     ):
         with ExitStack() as stack:
             if x.device.type != 'cuda':
@@ -672,7 +697,11 @@ class StreamingTransformerLayer(StreamingModule[_LayerState]):
                 steer_view = vec.to(device=x.device, dtype=x.dtype).view((1,) * (x.dim() - 1) + (x.shape[-1],))
                 x = x + steer_view
 
-            sa_result = self._sa_block(x, return_attention_weights=return_attention_weights)
+            sa_result = self._sa_block(
+                x,
+                return_attention_weights=return_attention_weights,
+                attention_suppression=attention_suppression,
+            )
             if return_attention_weights:
                 assert isinstance(sa_result, tuple), "Expected (x, attn_weights) tuple from _sa_block"
                 x, attn_weights = sa_result
@@ -780,6 +809,7 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
         steering_layer: int | None = None,
         steering_vectors_by_layer: dict[int, torch.Tensor] | None = None,
         steer_attn_only: bool = False,
+        attention_suppression: tp.Optional[dict[str, tp.Any]] = None,
         *args,
         **kwargs,
     ):
@@ -857,11 +887,24 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
                 x = x + layer_steer.view(steering_view_shape)
 
             layer_steer_arg = layer_steer if steer_attn_only else None
+            layer_attention_suppression = None
+            if attention_suppression is not None and bool(attention_suppression.get("enabled", False)):
+                suppression_layers = attention_suppression.get("layers", [23])
+                if suppression_layers == "all":
+                    apply_layer = True
+                elif isinstance(suppression_layers, (int, str)):
+                    apply_layer = int(layer_idx) == int(suppression_layers)
+                else:
+                    apply_layer = int(layer_idx) in {int(x) for x in suppression_layers}
+                if apply_layer:
+                    layer_attention_suppression = dict(attention_suppression)
+                    layer_attention_suppression["layer_idx"] = int(layer_idx)
             if return_attention_weights:
                 x, layer_attn = layer(
                     x,
                     return_attention_weights=True,
                     steer_for_attn_only=layer_steer_arg,
+                    attention_suppression=layer_attention_suppression,
                     *args,
                     **kwargs,
                 )
@@ -871,6 +914,7 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
                 x = layer(
                     x,
                     steer_for_attn_only=layer_steer_arg,
+                    attention_suppression=layer_attention_suppression,
                     *args,
                     **kwargs,
                 )

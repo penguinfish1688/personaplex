@@ -36,7 +36,7 @@ from os.path import splitext
 import logging
 import numpy as np
 import sys
-from typing import Optional, Union, List, Tuple, Callable, Iterator
+from typing import Optional, Union, List, Tuple, Callable, Iterator, Any
 import sphn
 import torch
 from tqdm.auto import tqdm
@@ -469,6 +469,7 @@ class LMModel(StreamingContainer):
         steering_layer: int | None = None,
         steering_vectors_by_layer: dict[int, torch.Tensor] | None = None,
         steer_attn_only: bool = False,
+        attention_suppression: Optional[dict[str, Any]] = None,
     ):
         return self.forward_embeddings(
             self.embed_codes(sequence),
@@ -478,6 +479,7 @@ class LMModel(StreamingContainer):
             steering_layer=steering_layer,
             steering_vectors_by_layer=steering_vectors_by_layer,
             steer_attn_only=steer_attn_only,
+            attention_suppression=attention_suppression,
         )
     
     def forward_embeddings(
@@ -489,6 +491,7 @@ class LMModel(StreamingContainer):
         steering_layer: int | None = None,
         steering_vectors_by_layer: dict[int, torch.Tensor] | None = None,
         steer_attn_only: bool = False,
+        attention_suppression: Optional[dict[str, Any]] = None,
     ) -> ForwardCodesOutput:
         # print("EMBED:", input[0, 0, :10].float().cpu().tolist()) # DEBUG
         if return_hidden_layers and return_attention_weights:
@@ -500,6 +503,7 @@ class LMModel(StreamingContainer):
                 steering_layer=steering_layer,
                 steering_vectors_by_layer=steering_vectors_by_layer,
                 steer_attn_only=steer_attn_only,
+                attention_suppression=attention_suppression,
             )
         elif return_hidden_layers:
             transformer_out, hidden_layers = self.transformer(
@@ -509,6 +513,7 @@ class LMModel(StreamingContainer):
                 steering_layer=steering_layer,
                 steering_vectors_by_layer=steering_vectors_by_layer,
                 steer_attn_only=steer_attn_only,
+                attention_suppression=attention_suppression,
             )
             attention_weights = None
         elif return_attention_weights:
@@ -519,6 +524,7 @@ class LMModel(StreamingContainer):
                 steering_layer=steering_layer,
                 steering_vectors_by_layer=steering_vectors_by_layer,
                 steer_attn_only=steer_attn_only,
+                attention_suppression=attention_suppression,
             )
             hidden_layers = None
         else:
@@ -528,6 +534,7 @@ class LMModel(StreamingContainer):
                 steering_layer=steering_layer,
                 steering_vectors_by_layer=steering_vectors_by_layer,
                 steer_attn_only=steer_attn_only,
+                attention_suppression=attention_suppression,
             )
             hidden_layers = None
             attention_weights = None
@@ -939,6 +946,7 @@ class LMGen(StreamingModule[_LMGenState]):
                steering_layer: int | None = None,
              steering_vectors_by_layer: dict[int, torch.Tensor] | None = None,
                          steer_attn_only: bool = False,
+                         attention_suppression: Optional[dict[str, Any]] = None,
                          return_step_input_tokens: bool = False) \
         -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]] | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]] | tuple[torch.Tensor, HiddenLayerOutputs] | tuple[torch.Tensor, HiddenLayerOutputs, bool]:
         """Run a single step of the language model.
@@ -997,6 +1005,7 @@ class LMGen(StreamingModule[_LMGenState]):
 
         do_steer = steering_vector is not None
         do_multi_steer = steering_vectors_by_layer is not None and len(steering_vectors_by_layer) > 0
+        do_attention_suppression = attention_suppression is not None and bool(attention_suppression.get("enabled", False))
         if do_steer and do_multi_steer:
             raise ValueError("Provide either steering_vector/steering_layer or steering_vectors_by_layer, not both")
         if do_steer:
@@ -1013,6 +1022,7 @@ class LMGen(StreamingModule[_LMGenState]):
                 steering_layer=steering_layer,
                 steering_vectors_by_layer=steering_vectors_by_layer,
                 steer_attn_only=steer_attn_only,
+                attention_suppression=attention_suppression,
             )
             transformer_out = forward_out.transformer_out
             text_logits = forward_out.text_logits
@@ -1026,6 +1036,7 @@ class LMGen(StreamingModule[_LMGenState]):
                     steering_layer=steering_layer,
                     steering_vectors_by_layer=steering_vectors_by_layer,
                     steer_attn_only=steer_attn_only,
+                    attention_suppression=attention_suppression,
                 )
                 transformer_out = forward_out.transformer_out
                 text_logits = forward_out.text_logits
@@ -1034,6 +1045,14 @@ class LMGen(StreamingModule[_LMGenState]):
                     input_,
                     steering_vectors_by_layer=steering_vectors_by_layer,
                     steer_attn_only=steer_attn_only,
+                    attention_suppression=attention_suppression,
+                )
+                transformer_out = forward_out.transformer_out
+                text_logits = forward_out.text_logits
+            elif do_attention_suppression:
+                forward_out = lm_model.forward_codes(
+                    input_,
+                    attention_suppression=attention_suppression,
                 )
                 transformer_out = forward_out.transformer_out
                 text_logits = forward_out.text_logits
@@ -1461,4 +1480,3 @@ class LMGen(StreamingModule[_LMGenState]):
             return tokens, all_hidden_layers
         else:
             return tokens
-

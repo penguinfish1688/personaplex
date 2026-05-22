@@ -16,6 +16,7 @@ from huggingface_hub import hf_hub_download
 from moshi.offline import run_batch_inference, _get_voice_prompt_dir
 from moshi.models import loaders
 from moshi.models.lm import SILENCE_TOKENS
+from moshi.modules.attention_suppression import load_interrupt_timesteps
 from moshi.persona_vector.mode_class import extract_normal_vector
 
 
@@ -329,6 +330,14 @@ def inference(
     save_hidden: bool = False,
     payload_target_layer: Optional[int] = None,
     resume: int = 0,
+    limit: Optional[int] = None,
+    attention_suppression_enabled: bool = False,
+    suppression_k: int = 10,
+    suppression_n: int = 30,
+    suppression_lambda: float = 0.2,
+    suppression_layers: list[int] | str | None = None,
+    input_timing_path: Optional[str] = None,
+    attention_suppression_stats_path: Optional[str] = None,
 ) -> None:
     """
     Take root_dir as input there will be <root_dir>/*/input.wav file
@@ -342,6 +351,11 @@ def inference(
         raise FileNotFoundError(f"No files matched pattern {root_dir}/*/input.wav")
 
     input_paths = _apply_resume_index(input_paths, resume, root_dir)
+    if limit is not None:
+        limit_i = int(limit)
+        if limit_i <= 0:
+            raise ValueError(f"--limit must be > 0 when provided, got {limit_i}")
+        input_paths = input_paths[:limit_i]
 
     voice_prompt_dir = _get_voice_prompt_dir(None, loaders.DEFAULT_REPO)
     if voice_prompt_dir is None:
@@ -355,6 +369,42 @@ def inference(
     output_wavs = [str(path.with_name("output.wav")) for path in input_paths]
     output_texts = [str(path.with_name("output.json")) for path in input_paths]
     output_hiddens = [str(path.with_name("output_hidden.pt")) for path in input_paths]
+    attention_suppression_configs: Optional[list[Optional[dict[str, Any]]]] = None
+    if attention_suppression_enabled:
+        if suppression_layers is None:
+            suppression_layers = [23]
+        timing_by_id: dict[str, int] = {}
+        if input_timing_path is not None:
+            timing_by_id = load_interrupt_timesteps(input_timing_path, token_rate_hz=12.5)
+        attention_suppression_configs = []
+        for path in input_paths:
+            example_id = path.parent.name
+            if input_timing_path is None:
+                timing_file = path.parent / "input_timing.json"
+                if not timing_file.exists():
+                    raise FileNotFoundError(f"Missing timing file: {timing_file}")
+                timing_by_id_one = load_interrupt_timesteps(timing_file, token_rate_hz=12.5)
+                if example_id not in timing_by_id_one:
+                    raise KeyError(f"Timing loader did not return example id '{example_id}' for {timing_file}")
+                interrupt_timestep = timing_by_id_one[example_id]
+            else:
+                if example_id not in timing_by_id:
+                    raise KeyError(
+                        f"Example id '{example_id}' not found in timing file {input_timing_path}. "
+                        f"Available ids: {sorted(timing_by_id.keys())[:10]}"
+                    )
+                interrupt_timestep = timing_by_id[example_id]
+            attention_suppression_configs.append(
+                {
+                    "enabled": True,
+                    "example_id": example_id,
+                    "interrupt_timestep": int(interrupt_timestep),
+                    "k_post_interrupt": int(suppression_k),
+                    "n_pre_interrupt": int(suppression_n),
+                    "lambda_suppression": float(suppression_lambda),
+                    "layers": suppression_layers,
+                }
+            )
 
     SYSTEM_PROMPT = (
         "You are an intelligent, articulate, and highly factual AI assistant. "
@@ -392,6 +442,8 @@ def inference(
             save_hidden_payload=bool(save_hidden),
             output_hiddens=output_hiddens if save_hidden else None,
             payload_target_layer=payload_target_layer,
+            attention_suppression_configs=attention_suppression_configs,
+            attention_suppression_stats_path=attention_suppression_stats_path,
         )
     if save_hidden:
         print(
@@ -1907,6 +1959,12 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional maximum number of examples to run during default inference.",
+    )
+    parser.add_argument(
         "--steer-attn-only",
         action="store_true",
         help=(
@@ -1934,6 +1992,47 @@ def main() -> None:
         type=int,
         default=0,
         help="Number of token steps to force PAD/silence after interrupt_start when using --inference-force-pad.",
+    )
+    parser.add_argument(
+        "--attention-suppression",
+        action="store_true",
+        help="Enable pre-interruption attention-logit suppression during inference.",
+    )
+    parser.add_argument(
+        "--input-timing-path",
+        type=str,
+        default=None,
+        help="Optional root-level timing JSON. Defaults to root-dir/*/input_timing.json.",
+    )
+    parser.add_argument(
+        "--suppression-k",
+        type=int,
+        default=10,
+        help="Number of post-interruption query timesteps to suppress.",
+    )
+    parser.add_argument(
+        "--suppression-n",
+        type=int,
+        default=30,
+        help="Number of pre-interruption key timesteps to suppress.",
+    )
+    parser.add_argument(
+        "--suppression-lambda",
+        type=float,
+        default=0.2,
+        help="Unnormalized attention weight multiplier in (0, 1].",
+    )
+    parser.add_argument(
+        "--suppression-layers",
+        nargs="+",
+        default=["23"],
+        help="Main transformer layer indices to apply PIAS to, or 'all'. Default: 23.",
+    )
+    parser.add_argument(
+        "--attention-suppression-stats-path",
+        type=str,
+        default=None,
+        help="Optional JSONL path for attention suppression stats.",
     )
 
     args = parser.parse_args()
@@ -2032,11 +2131,29 @@ def main() -> None:
         )
         return
 
+    if len(args.suppression_layers) == 1 and str(args.suppression_layers[0]).lower() == "all":
+        suppression_layers: list[int] | str = "all"
+    elif len(args.suppression_layers) == 1:
+        max_suppression_layer = int(args.suppression_layers[0])
+        if max_suppression_layer < 0:
+            parser.error("--suppression-layers must be 'all' or a non-negative layer index")
+        suppression_layers = list(range(max_suppression_layer + 1))
+    else:
+        suppression_layers = [int(x) for x in args.suppression_layers]
+
     inference(
         args.root_dir,
         save_hidden=args.save_hidden,
         payload_target_layer=args.payload_target_layer,
         resume=args.resume,
+        limit=args.limit,
+        attention_suppression_enabled=bool(args.attention_suppression),
+        suppression_k=int(args.suppression_k),
+        suppression_n=int(args.suppression_n),
+        suppression_lambda=float(args.suppression_lambda),
+        suppression_layers=suppression_layers,
+        input_timing_path=args.input_timing_path,
+        attention_suppression_stats_path=args.attention_suppression_stats_path,
     )
 
 
