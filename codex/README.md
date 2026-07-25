@@ -8,7 +8,15 @@ checkout and connect local Codex TUIs through SSH tunnels.
 Each invocation starts one new server and stays in the foreground:
 
 ```bash
-bash ~/personaplex/personaplex/codex/start_remote_server.sh
+bash ~/personaplex/codex/start_remote_server.sh
+```
+
+The private Git checkout stores these scripts at
+`~/personaplex/personaplex/codex`. Expose them at the aggregate workspace root
+once so the launcher uses `~/personaplex` as its default workdir:
+
+```bash
+ln -s personaplex/codex ~/personaplex/codex
 ```
 
 Run the command in another ORCD terminal for every additional server/agent you
@@ -17,8 +25,8 @@ want. The script selects a free port and prints its unique server id.
 List live server leases (use `status-all` for stale diagnostics):
 
 ```bash
-bash ~/personaplex/personaplex/codex/start_remote_server.sh status
-bash ~/personaplex/personaplex/codex/start_remote_server.sh status-all
+bash ~/personaplex/codex/start_remote_server.sh status
+bash ~/personaplex/codex/start_remote_server.sh status-all
 ```
 
 ## Connect from penguinfish
@@ -27,7 +35,7 @@ The default selector chooses the newest live server not already used by another
 local connector:
 
 ```bash
-cd ~/personaplex/personaplex
+cd ~/personaplex
 bash codex/connect_remote.sh
 ```
 
@@ -89,15 +97,15 @@ left in place as backups; no old database is merged into a live database.
 Validate or rerun history migration on ORCD:
 
 ```bash
-bash ~/personaplex/personaplex/codex/start_remote_server.sh doctor
-bash ~/personaplex/personaplex/codex/start_remote_server.sh migrate-history
+bash ~/personaplex/codex/start_remote_server.sh doctor
+bash ~/personaplex/codex/start_remote_server.sh migrate-history
 ```
 
 Stopped per-server SQLite runtimes are retained for seven days by default and
 then pruned on a later server start. To prune eligible runtimes immediately:
 
 ```bash
-bash ~/personaplex/personaplex/codex/start_remote_server.sh prune
+bash ~/personaplex/codex/start_remote_server.sh prune
 ```
 
 ## Useful overrides
